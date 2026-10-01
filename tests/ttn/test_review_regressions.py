@@ -151,8 +151,22 @@ def test_online_psi_step_learns_transition_under_no_grad_with_fixed_slow_weights
             _, write = context.token_masks(6)
             _, weights = correct(context.predicted[:, anchor.index], k, v, beta, write)
             fixed_features.append((k, v, weights, write))
+        frozen_prediction = context.predicted.clone()
+        old_psi = context.psi.clone()
         runtime.commit_chunk(context)
         assert runtime.transition_fast.norm() > 0
+        # Adapt is lagged: committing cannot alter this chunk's prediction.
+        assert torch.equal(context.predicted, frozen_prediction)
+        assert torch.equal(context.psi, old_psi)
+        next_context = runtime.begin_chunk(system, poses, intrinsics, torch.tensor([[2, 3]]),
+                                           torch.ones(1, 2, dtype=torch.bool), 100, 100)
+        next_expected = CayleyFactors(system.generators.u, system.generators.v,
+                                      next_context.cbase + config.delta_psi * runtime.transition_fast.tanh()).right(
+                                          runtime.world_state)
+        next_unadapted = CayleyFactors(system.generators.u, system.generators.v,
+                                       next_context.cbase).right(runtime.world_state)
+        assert torch.allclose(next_context.predicted, next_expected, atol=1e-7, rtol=1e-6)
+        assert (next_context.predicted - next_unadapted).norm() > 0
         adapted = CayleyFactors(system.generators.u, system.generators.v,
                                 context.cbase + config.delta_psi * runtime.transition_fast.tanh()).right(previous_state)
         for index, (k, v, weights, write) in enumerate(fixed_features):

@@ -56,6 +56,9 @@ class TTNRuntimeState:
     transition_fast is psi: fast coefficients of the nonlinear Cayley
     transition, not an extra MLP's dense weight matrix. The analytic gradient
     trains these coefficients on the pre-Correct innovation loss at test time.
+    Predict/Correct/Read use the old psi throughout a chunk. A successful clean
+    commit installs the updated psi for the NEXT chunk's Predict; it does not
+    recompute the current output. S and psi are separate recurrent states.
     """
     config: TTNConfig
     world_state: torch.Tensor
@@ -163,7 +166,8 @@ class TTNRuntimeState:
             if indices.numel():
                 previous_pose[b] = context.poses[b, indices[-1]].detach().float()
                 committed[b].update(context.frame_ids[b, indices].tolist())
-        # Assign only after every validation/computation succeeds.
+        # Assign only after every validation/computation succeeds. The context
+        # keeps its old prediction/psi; the new psi is consumed next chunk.
         self.world_state = new_state
         self.transition_fast = psi
         self.previous_committed_pose = previous_pose

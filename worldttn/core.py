@@ -48,7 +48,12 @@ class Rank2Generators(nn.Module):
 
 
 class CayleyFactors:
-    """R=I+P L P^T. The only solve has size 2M; no inverse of a dxd matrix."""
+    """R=I+P L P^T. The only solve has size 2M; no inverse of a dxd matrix.
+
+    Per head, factor construction costs O(d M^2 + M^3); right-multiplying
+    a dxd state costs O(d^2 M + d M^2). Neither depends on token count.
+    This excludes token projections, Correct/Read, and the local psi gradient.
+    """
 
     def __init__(self, u, v, c):
         # Stack [..., M, 2, D], then interleave generators on the column axis.
@@ -85,6 +90,12 @@ def write_weights(beta, mask, eps):
 
 
 def correct(pred, k, v, beta, mask, alpha_s=.5, eps=1e-6):
+    """One normalized, weighted least-squares step from the predicted state.
+
+    With zero prediction and uniform write weights this reduces to a scaled
+    K^T V memory. Persistence alone does not distinguish it from recurrent
+    linear attention; the camera-conditioned transition is a separate operation.
+    """
     w = write_weights(beta, mask, eps)
     denom = eps + (w * k.square().sum(-1)).sum(-1)
     residual = v - k @ pred
@@ -109,6 +120,8 @@ def analytic_psi_gradient(prev, k, value, w, mask, u, v, cbase, psi, delta_psi):
     while count.ndim < k.ndim - 2:
         count = count.unsqueeze(-1)
     h = k.transpose(-1, -2) @ (w[..., None] * (k @ pred - value)) / (count[..., None, None] * k.shape[-1])
+    # The reference local gradient includes this dense O(d^3) product per
+    # head/clean chunk; the 2M solve is not its entire computational cost.
     j = prev.transpose(-1, -2) @ h
     f = factors.right(j.transpose(-1, -2), inverse_b=True).transpose(-1, -2)
     f = factors.right(f, inverse_b=True, transpose=True)
