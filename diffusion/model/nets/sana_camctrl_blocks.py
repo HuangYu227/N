@@ -1,0 +1,523 @@
+# Copyright 2024 NVIDIA CORPORATION & AFFILIATES
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Camera-control utility helpers for the Sana-WM bidirectional path.
+
+Only the helpers needed by ``BidirectionalGDNUCPESinglePathLiteLABothTriton``
+and ``BidirectionalSoftmaxUCPESinglePathLiteLA`` are kept here.  The model uses
+the UCPE (Unified Camera Pose Embedding) formulation, which builds per-pixel
+ray transformation matrices from camera poses + intrinsics and applies them to
+Q/K/V via block-diagonal projection.
+
+Public surface
+--------------
+* ``_maybe_drop_cam_branch`` -- inference / training-time camera dropout helper.
+* ``_process_camera_conditions_ucpe`` -- builds raymats + 3-channel absmap from
+  the raw (B, F, 20) camera-condition tensor.
+* ``prepare_prope_fns`` -- precomputes Q/K/V apply functions to share across
+  blocks. Only the UCPE branch is implemented.
+* ``_prepare_ray_apply_fns`` -- inner helper used by the fused Triton kernels.
+* ``compute_fov_from_fx_xi``, ``ucm_unproject_grid_fov``, ``world_to_ray_mats``
+  -- imported by fused-camera-GDN ops.
+"""
+
+import os
+from functools import partial
+from typing import Callable, List, Optional, Tuple, Union
+
+import torch
+import torch.nn.functional as F
+from einops import rearrange, repeat
+
+_COMPILE_DISABLE = os.environ.get("GDN_DISABLE_COMPILE", "0") not in ("0", "false")
+
+
+# ---------------------------------------------------------------------------
+# Camera-branch dropout
+# ---------------------------------------------------------------------------
+
+
+def _maybe_drop_cam_branch(camera_conditions, cam_branch_drop_prob, training, device):
+    """Optionally zero-out the camera branch during training (drop-path style)."""
+    if camera_conditions is None:
+        return None
+    if not training:
+        return camera_conditions
+    if not cam_branch_drop_prob:
+        return camera_conditions
+    if cam_branch_drop_prob >= 1.0:
+        return None
+    if torch.rand((), device=device) < cam_branch_drop_prob:
+        return None
+    return camera_conditions
+
+
+# ---------------------------------------------------------------------------
+# UCM (Unified Camera Model) projection / unprojection
+# ---------------------------------------------------------------------------
+
+
+def create_grid(
+    height: int,
+    width: int,
+    batch: Optional[int] = None,
+    dtype: torch.dtype = torch.float32,
+    device: torch.device = torch.device("cpu"),
+) -> torch.Tensor:
+    """Create a pixel coordinate grid of shape ``(H, W, 3)`` or ``(B, H, W, 3)``."""
+    if device.type == "cpu":
+        assert dtype in (torch.float32, torch.float64), (
+            f"ERR: {dtype} is not supported by {device.type}\n" "If device is `cpu`, use float32 or float64"
+        )
+    _xs = torch.linspace(0, width - 1, width, dtype=dtype, device=device)
+    _ys = torch.linspace(0, height - 1, height, dtype=dtype, device=device)
+    ys, xs = torch.meshgrid([_ys, _xs], indexing="ij")
+    zs = torch.ones_like(xs, dtype=dtype, device=device)
+    grid = torch.stack((xs, ys, zs), dim=2)
+    if batch is not None:
+        grid = repeat(grid, "... -> b ...", b=batch)
+    return grid
+
+
+def ucm_unproject_grid(
+    height: int,
+    width: int,
+    fx: Union[float, torch.Tensor],
+    fy: Union[float, torch.Tensor],
+    cx: Union[float, torch.Tensor],
+    cy: Union[float, torch.Tensor],
+    xi: Union[float, torch.Tensor],
+    dtype: torch.dtype = torch.float32,
+    device: torch.device = torch.device("cpu"),
+    y_down: bool = True,
+) -> torch.Tensor:
+    """Unproject pixel grid into a camera-frame direction vector using the UCM."""
+    fx_, fy_, cx_, cy_, xi_ = fx, fy, cx, cy, xi
+
+    def to_tensor_flatten(x):
+        if torch.is_tensor(x):
+            return x.to(device=device, dtype=dtype).reshape(-1)
+        return torch.tensor([x], dtype=dtype, device=device)
+
+    fx, fy, cx, cy, xi = map(to_tensor_flatten, (fx, fy, cx, cy, xi))
+    B = max(fx.shape[0], fy.shape[0], cx.shape[0], cy.shape[0], xi.shape[0])
+    fx = fx.expand(B)
+    fy = fy.expand(B)
+    cx = cx.expand(B)
+    cy = cy.expand(B)
+    xi = xi.expand(B)
+
+    grid = create_grid(height=height, width=width, batch=B, dtype=dtype, device=device)
+    u = grid[..., 0]
+    v = grid[..., 1]
+    fx = fx[:, None, None]
+    fy = fy[:, None, None]
+    cx = cx[:, None, None]
+    cy = cy[:, None, None]
+    xi = xi[:, None, None]
+    x = (u - cx) / fx
+    y = (v - cy) / fy
+    if not y_down:
+        y = -y
+    r2 = x * x + y * y
+    alpha = xi + torch.sqrt(1 + (1 - xi * xi) * r2)
+    gamma = alpha / (1 + r2)
+    X = gamma * x
+    Y = gamma * y
+    Z = gamma - xi
+    d_cam = torch.stack([X, Y, Z], dim=-1)
+    is_scalar_input = all(not torch.is_tensor(p) for p in (fx_, fy_, cx_, cy_, xi_))
+    if is_scalar_input:
+        return d_cam[0]
+    else:
+        return d_cam
+
+
+def compute_fx_from_fov_xi(
+    x_fov: Union[torch.Tensor, float],
+    xi: Union[torch.Tensor, float],
+    width: int,
+    device: Union[torch.device, str] = "cpu",
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Recover focal length ``fx`` from horizontal FoV (degrees) + UCM xi."""
+
+    def to_tensor_flatten(x):
+        if torch.is_tensor(x):
+            return x.to(device=device, dtype=dtype).view(-1)
+        return torch.tensor([x], dtype=dtype, device=device)
+
+    x_fov = to_tensor_flatten(x_fov)
+    xi = to_tensor_flatten(xi)
+    B = max(x_fov.shape[0], xi.shape[0])
+    x_fov = x_fov.expand(B)
+    xi = xi.expand(B)
+    theta = torch.deg2rad(0.5 * x_fov)
+    eps = torch.finfo(dtype).eps
+    denom = torch.sin(theta).clamp_min(eps)
+    fx = (width * 0.5) * (torch.cos(theta) + xi) / denom
+    return fx
+
+
+def compute_fov_from_fx_xi(
+    fx: Union[torch.Tensor, float],
+    xi: Union[torch.Tensor, float],
+    width: int,
+    device="cpu",
+    dtype=torch.float32,
+):
+    """Inverse of :func:`compute_fx_from_fov_xi`."""
+
+    def to_tensor_1d(x):
+        if torch.is_tensor(x):
+            return x.to(device=device, dtype=dtype)
+        return torch.tensor([x], dtype=dtype, device=device)
+
+    fx = to_tensor_1d(fx).reshape(-1)
+    xi = to_tensor_1d(xi).reshape(-1)
+    B = max(fx.shape[0], xi.shape[0])
+    fx = fx.expand(B)
+    xi = xi.expand(B)
+    A = 2.0 * fx / width
+    phi = torch.atan(1.0 / A)
+    denom = torch.sqrt(A * A + 1.0)
+    ratio = (xi / denom).clamp(-1.0, 1.0)
+    theta = torch.asin(ratio) + phi
+    x_fov = torch.rad2deg(2.0 * theta)
+    return x_fov
+
+
+def ucm_unproject_grid_fov(
+    x_fov: Union[float, torch.Tensor],
+    y_fov: Union[float, torch.Tensor],
+    xi: Union[float, torch.Tensor],
+    height: int,
+    width: int,
+    cx: Union[float, torch.Tensor],
+    cy: Union[float, torch.Tensor],
+    device: Union[torch.device, str] = "cpu",
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Unproject grid with intrinsics expressed as FoV (degrees) + xi."""
+    is_batched = any(torch.is_tensor(p) and p.numel() > 1 for p in [x_fov, y_fov, xi, cx, cy])
+    fx = compute_fx_from_fov_xi(x_fov, xi, width, device, dtype)
+    fy = compute_fx_from_fov_xi(y_fov, xi, height, device, dtype)
+    d_cam = ucm_unproject_grid(
+        height=height,
+        width=width,
+        fx=fx,
+        fy=fy,
+        cx=cx,
+        cy=cy,
+        xi=xi if torch.is_tensor(xi) else torch.tensor([xi], dtype=dtype, device=device),
+        dtype=dtype,
+        device=device,
+        y_down=True,
+    )
+    if not is_batched:
+        d_cam = d_cam[0]
+    return d_cam
+
+
+def project_ucm_points(X, Y, Z, fx, fy, cx, cy, xi):
+    """Project 3D points in camera frame to UCM image plane."""
+    r = torch.sqrt(X * X + Y * Y + Z * Z)
+
+    def reshape_param(p, target):
+        if torch.is_tensor(p):
+            if p.numel() == 1:
+                return p
+            if p.ndim == 1 and target.ndim == 4:
+                return p.view(target.shape[0], target.shape[1], 1, 1)
+            while p.ndim < target.ndim:
+                p = p.unsqueeze(-1)
+        return p
+
+    xi = reshape_param(xi, X)
+    fx = reshape_param(fx, X)
+    fy = reshape_param(fy, X)
+    cx = reshape_param(cx, X)
+    cy = reshape_param(cy, X)
+
+    alpha = Z + xi * r
+    du = fx * (X / alpha) + cx
+    dv = fy * (Y / alpha) + cy
+    return du, dv
+
+
+def project_ucm_points_fov(X, Y, Z, x_fov, y_fov, xi, height, width, cx, cy):
+    """Project 3D points in camera frame to UCM image plane using FoV-based intrinsics."""
+    fx = compute_fx_from_fov_xi(x_fov, xi, width, X.device, X.dtype)
+    fy = compute_fx_from_fov_xi(y_fov, xi, height, X.device, X.dtype)
+    return project_ucm_points(X, Y, Z, fx, fy, cx, cy, xi)
+
+
+# ---------------------------------------------------------------------------
+# Per-pixel ray transformation (world <-> ray) used by UCPE
+# ---------------------------------------------------------------------------
+
+
+from worldttn.geometry import world_to_ray_mats
+
+
+def compute_up_lat_map(
+    R: torch.Tensor,
+    x_fov: torch.Tensor,
+    y_fov: torch.Tensor,
+    xi: torch.Tensor,
+    height: int,
+    width: int,
+    cx: torch.Tensor,
+    cy: torch.Tensor,
+    device: torch.device = torch.device("cpu"),
+    delta: float = 0.1,
+):
+    """Compute UCPE absolute embedding maps ``(up_map, lat_map)``.
+
+    ``up_map`` is a 2-channel projected up-direction; ``lat_map`` is a 1-channel
+    latitude. Concatenated they form the 3-channel absmap consumed by the
+    camera branch.
+    """
+    B, T, _, _ = R.shape
+    dtype = R.dtype
+    R = R.float()
+    d_cam = ucm_unproject_grid_fov(
+        x_fov=x_fov,
+        y_fov=y_fov,
+        xi=xi,
+        height=height,
+        width=width,
+        cx=cx,
+        cy=cy,
+        device=device,
+        dtype=torch.float32,
+    )
+
+    if d_cam.ndim == 3:
+        d_cam_exp = repeat(d_cam, "H W C -> B T H W C", B=B, T=T)
+    elif d_cam.ndim == 4:
+        if d_cam.shape[0] == B * T:
+            d_cam_exp = d_cam.view(B, T, height, width, 3)
+        else:
+            d_cam_exp = repeat(d_cam, "B H W C -> B T H W C", T=T)
+    else:
+        d_cam_exp = d_cam
+
+    mask_exp = d_cam_exp.isnan().any(dim=-1, keepdim=True)
+    d_world = torch.einsum("btij,bthwj->bthwi", R, d_cam_exp)
+    d_world = d_world / torch.clamp_min(d_world.norm(dim=-1, keepdim=True), 1e-8)
+    Xw, Yw, Zw = d_world[..., 0], d_world[..., 1], d_world[..., 2]
+    lat_map = torch.atan2(-Yw, torch.sqrt(Xw**2 + Zw**2)).unsqueeze(-1)
+    v = d_world
+    up_world = torch.tensor([0, -1, 0], device=device, dtype=torch.float32)
+    k = torch.cross(v, up_world.unsqueeze(0).unsqueeze(0).unsqueeze(0).expand_as(v), dim=-1)
+    k = k / torch.clamp_min(k.norm(dim=-1, keepdim=True), 1e-8)
+    delta_t = torch.tensor(delta, device=device, dtype=torch.float32)
+    cos_eps = torch.cos(delta_t)
+    sin_eps = torch.sin(delta_t)
+    v_rot = (
+        v * cos_eps + torch.cross(k, v, dim=-1) * sin_eps + k * (k * (v * 1).sum(dim=-1, keepdim=True)) * (1 - cos_eps)
+    )
+    dirs_cam = torch.einsum("btij,bthwj->bthwi", R.transpose(-1, -2), v_rot)
+    Xs, Ys, Zs = dirs_cam[..., 0], dirs_cam[..., 1], dirs_cam[..., 2]
+    du, dv = project_ucm_points_fov(
+        Xs,
+        Ys,
+        Zs,
+        x_fov=x_fov.float(),
+        y_fov=y_fov.float(),
+        xi=xi.float(),
+        height=height,
+        width=width,
+        cx=cx.float(),
+        cy=cy.float(),
+    )
+    grid = create_grid(
+        height=height,
+        width=width,
+        batch=B,
+        dtype=torch.float32,
+        device=device,
+    )
+    grid_x = grid[..., 0].unsqueeze(1)
+    grid_y = grid[..., 1].unsqueeze(1)
+    up_map = torch.stack((du - grid_x, dv - grid_y), dim=-1)
+    up_map = up_map / torch.clamp_min(up_map.norm(dim=-1, keepdim=True), 1e-8)
+    up_map = up_map.to(dtype=dtype)
+    lat_map = lat_map.to(dtype=dtype)
+    up_map = up_map.masked_fill(mask_exp, 0.0)
+    lat_map = lat_map.masked_fill(mask_exp, 0.0)
+    return up_map, lat_map
+
+
+def _process_camera_conditions_ucpe(camera_conditions, B, HW, patch_size):
+    """Convert ``(B, F, 20)`` camera conditions (C2W flat + fx,fy,cx,cy) into
+    ``(raymats, absmap)``.
+
+    ``raymats`` is ``(B, F, H, W, 4, 4)`` ``ray<-world`` transforms; ``absmap``
+    is ``(B, F, H, W, 3)`` (up_map 2-ch + lat_map 1-ch).
+    """
+    F_dim = camera_conditions.shape[1]
+    c2w_flat = camera_conditions[..., :16]
+    C_to_W = c2w_flat.view(B, F_dim, 4, 4)
+
+    fx = camera_conditions[..., 16]
+    fy = camera_conditions[..., 17]
+    cx = camera_conditions[..., 18]
+    cy = camera_conditions[..., 19]
+    H_dim, W_dim = HW[1], HW[2]
+    image_width = W_dim * patch_size[2]
+    image_height = H_dim * patch_size[1]
+
+    # xi is fixed at 0 (pinhole) in this stack.
+    xi = torch.zeros((B, F_dim), device=camera_conditions.device, dtype=camera_conditions.dtype)
+    x_fov = compute_fov_from_fx_xi(
+        fx, xi, image_width, device=camera_conditions.device, dtype=camera_conditions.dtype
+    ).view(B, F_dim)
+    y_fov = compute_fov_from_fx_xi(
+        fy, xi, image_height, device=camera_conditions.device, dtype=camera_conditions.dtype
+    ).view(B, F_dim)
+
+    d_cam = ucm_unproject_grid_fov(
+        x_fov,
+        y_fov,
+        xi,
+        H_dim,
+        W_dim,
+        cx / patch_size[2],
+        cy / patch_size[1],
+        device=camera_conditions.device,
+        dtype=camera_conditions.dtype,
+    )
+    if d_cam.ndim == 4 and d_cam.shape[0] == B * F_dim:
+        d_cam = d_cam.view(B, F_dim, H_dim, W_dim, 3)
+
+    raymats = world_to_ray_mats(d_cam, C_to_W)  # [B, F, H, W, 4, 4]
+
+    up_map, lat_map = compute_up_lat_map(
+        R=C_to_W[..., :3, :3],
+        x_fov=x_fov,
+        y_fov=y_fov,
+        xi=xi,
+        height=image_height,
+        width=image_width,
+        cx=cx,
+        cy=cy,
+        device=camera_conditions.device,
+    )
+    absmap = torch.cat([up_map, lat_map], dim=-1)  # (B, F, H, W, 3)
+
+    return raymats, absmap
+
+
+# ---------------------------------------------------------------------------
+# Block-diagonal apply primitives shared by camera and main branches
+# ---------------------------------------------------------------------------
+
+
+from worldttn.geometry import (
+    apply_ray_projmat, apply_complex_rope, apply_block_diagonal,
+    invert_se3, prepare_ray_apply_fns as _shared_prepare_ray_apply_fns,
+)
+
+_apply_ray_projmat = torch.compile(apply_ray_projmat, disable=_COMPILE_DISABLE)
+_apply_complex_rope = torch.compile(apply_complex_rope, disable=_COMPILE_DISABLE)
+_apply_block_diagonal = apply_block_diagonal
+_invert_SE3 = invert_se3
+
+def _prepare_ray_apply_fns(*args, **kwargs):
+    return _shared_prepare_ray_apply_fns(
+        *args, **kwargs, ray_apply=_apply_ray_projmat, rope_apply=_apply_complex_rope
+    )
+
+
+def _slice_rope_for_cam(
+    rotary_emb: Optional[torch.Tensor],
+    head_dim: int,
+    rope_dim: int,
+) -> Optional[torch.Tensor]:
+    """Re-slice WAN RoPE frequencies for a smaller rope_dim using the same (T, H, W) split."""
+    if rotary_emb is None:
+        return None
+    orig_t_size = head_dim // 2 - 2 * (head_dim // 6)
+    orig_h_size = head_dim // 6
+    new_t_size = rope_dim // 2 - 2 * (rope_dim // 6)
+    new_h_size = rope_dim // 6
+    new_w_size = rope_dim // 6
+    t_part = rotary_emb[..., :new_t_size]
+    h_part = rotary_emb[..., orig_t_size : orig_t_size + new_h_size]
+    w_part = rotary_emb[..., orig_t_size + orig_h_size : orig_t_size + orig_h_size + new_w_size]
+    return torch.cat([t_part, h_part, w_part], dim=-1)
+
+
+def prepare_prope_fns(
+    camctrl_type: str,
+    head_dim: int,
+    camera_conditions: torch.Tensor,
+    HW: Tuple[int, int, int],
+    patch_size: Tuple[int, int, int],
+    rotary_emb: Optional[torch.Tensor] = None,
+    **kwargs,
+) -> Tuple[Callable, Callable, Callable]:
+    """Precompute UCPE apply functions once for a batch (shared across all blocks).
+
+    Only ``camctrl_type == "UCPE"`` is supported.  Accepts either precomputed
+    matrices (``cam_pos_embeds`` dict with ``P``, ``P_inv``, ``pos_embeds_cam``)
+    or raw camera conditions + optional raymats.
+    """
+    if camctrl_type != "UCPE":
+        raise ValueError(f"Unsupported camctrl_type for prepare_prope_fns: {camctrl_type}")
+
+    B = camera_conditions.shape[0]
+
+    # Priority 1: use precomputed matrices.
+    if "cam_pos_embeds" in kwargs and kwargs["cam_pos_embeds"] is not None:
+        cam_pos_embeds = kwargs["cam_pos_embeds"]
+        P = cam_pos_embeds.get("P")
+        P_inv = cam_pos_embeds.get("P_inv")
+        rotary_emb_cam = cam_pos_embeds.get("pos_embeds_cam")
+
+        if P is not None and P_inv is not None:
+            if P.ndim == 3:
+                P = P.unsqueeze(0).repeat(B, 1, 1, 1)
+            if P_inv.ndim == 3:
+                P_inv = P_inv.unsqueeze(0).repeat(B, 1, 1, 1)
+
+            P_T = P.transpose(-1, -2)
+
+            if rotary_emb_cam is not None and rotary_emb_cam.ndim == 3:
+                rotary_emb_cam = rotary_emb_cam.unsqueeze(0).repeat(B, 1, 1, 1)
+            elif rotary_emb_cam is None and rotary_emb is not None:
+                rotary_emb_cam = _slice_rope_for_cam(rotary_emb, head_dim, head_dim // 2)
+            elif rotary_emb_cam is None:
+                rotary_emb_cam = rotary_emb
+
+            return _prepare_ray_apply_fns(head_dim, P, P_T, P_inv, rotary_emb=rotary_emb_cam)
+
+    # Priority 2: online path.
+    if "raymats" in kwargs and kwargs["raymats"] is not None:
+        raymats = kwargs["raymats"]
+    else:
+        raymats, _ = _process_camera_conditions_ucpe(camera_conditions, B, HW, patch_size)
+    raymats = raymats.reshape(B, -1, 4, 4)
+
+    P = raymats
+    P_T = P.transpose(-1, -2)
+    P_inv = _invert_SE3(P)
+
+    rotary_emb_cam = _slice_rope_for_cam(rotary_emb, head_dim, head_dim // 2) if rotary_emb is not None else None
+
+    return _prepare_ray_apply_fns(head_dim=head_dim, P=P, P_T=P_T, P_inv=P_inv, rotary_emb=rotary_emb_cam)
