@@ -36,6 +36,7 @@ def se3_log(t):
 
 
 class TransitionController(nn.Module):
+    """Camera-only slow network; no hidden/latent/timestep inputs are accepted."""
 
     def __init__(self, config):
         super().__init__()
@@ -50,6 +51,8 @@ class TransitionController(nn.Module):
     def features(self, poses, intrinsics, previous_pose, new_mask, width, height):
         if poses.ndim != 4 or poses.shape[-2:] != (4, 4) or intrinsics.shape != (*poses.shape[:2], 4):
             raise ValueError("poses [B,F,4,4], intrinsics [B,F,4] required")
+        if previous_pose.shape != (poses.shape[0], 4, 4) or new_mask.shape != poses.shape[:2]:
+            raise ValueError("previous_pose [B,4,4] and new_mask [B,F] required; broadcasting is not allowed")
         poses = poses.float()
         intrinsics = intrinsics.float()
         previous_pose = previous_pose.float()
@@ -58,9 +61,13 @@ class TransitionController(nn.Module):
         prior = previous_pose
         motions = []
         for f in range(poses.shape[1]):
-            motions.append(se3_log(invert_se3(prior) @ poses[:, f]))
-            prior = torch.where(new_mask[:, f, None, None], poses[:, f], prior)
+            # Select before geometry/MLP: multiplying a masked NaN by zero
+            # would still contaminate the pooled features and gradients.
+            current = torch.where(new_mask[:, f, None, None], poses[:, f], prior)
+            motions.append(se3_log(invert_se3(prior) @ current))
+            prior = current
         motion = torch.stack(motions, 1)
+        # f/F counts valid new frames (1..F_new), not absolute video time.
         tau = new_mask.cumsum(-1).float() / count[:, None]
         frequencies = 2**torch.arange(4, device=poses.device, dtype=poses.dtype) * torch.pi
         phases = tau[..., None] * frequencies
@@ -68,7 +75,8 @@ class TransitionController(nn.Module):
         local = (self.local(local_in) * new_mask[..., None]).sum(1) / count[:, None]
         global_features = self.global_path(se3_log(invert_se3(previous_pose) @ prior))
         scale = intrinsics.new_tensor([width, height, width, height])
-        intr = (intrinsics / scale * new_mask[..., None]).sum(1) / count[:, None]
+        intrinsics = torch.where(new_mask[..., None], intrinsics, 0.)
+        intr = (intrinsics / scale).sum(1) / count[:, None]
         return torch.cat((local, global_features, intr), -1)
 
     def forward(self, poses, intrinsics, previous_pose, new_mask, width, height):

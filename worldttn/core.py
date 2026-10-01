@@ -11,6 +11,10 @@ BASE_REVISION = "f9178744c096dcf2a2ea773da183e341bcbeb044"
 
 @dataclass(frozen=True)
 class TTNConfig:
+    """A: identity Predict + Correct/Read; B: learned Predict + Correct/Read;
+    C: B plus a detached, per-clean-chunk first-order update of psi.
+    All stages train the five replacement anchors' projections/Norms/gates/beta.
+    """
     heads: int = 20
     head_dim: int = 112
     generators: int = 16

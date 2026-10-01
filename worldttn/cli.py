@@ -352,7 +352,9 @@ def main():
     parser.add_argument("--sana-config")
     parser.add_argument("--base-weights", help="local mirror of the specified SANA teacher, or hf:// URI")
     parser.add_argument("--adapter", help="TTN checkpoint; stage comes from --stage or reference config")
-    parser.add_argument("--stage", choices=("A", "B", "C"))
+    parser.add_argument("--stage", choices=("A", "B", "C"),
+                        help="A: identity Predict + Correct/Read; B: camera-conditioned Predict + Correct/Read; "
+                             "C: B plus per-clean-chunk psi adaptation")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=3407)
     parser.add_argument("--output", default="output/worldttn")

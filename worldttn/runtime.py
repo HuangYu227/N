@@ -51,6 +51,12 @@ class TTNChunkContext:
 
 @dataclass
 class TTNRuntimeState:
+    """Per-episode S and psi, separate from offline model weights.
+
+    transition_fast is psi: fast coefficients of the nonlinear Cayley
+    transition, not an extra MLP's dense weight matrix. The analytic gradient
+    trains these coefficients on the pre-Correct innovation loss at test time.
+    """
     config: TTNConfig
     world_state: torch.Tensor
     transition_fast: torch.Tensor
