@@ -269,8 +269,11 @@ class SanaWMZipLatentDataset(Dataset):
         npz = np.load(io.BytesIO(raw), allow_pickle=False)
         latent = npz["z"] if hasattr(npz, "files") else npz
         latent = torch.from_numpy(np.asarray(latent)).float()
-        if self.num_frames is not None and latent.shape[1] > self.num_frames:
-            latent = latent[:, : self.num_frames]
+        if self.num_frames is not None:
+            # num_frames counts raw video/camera frames; causal VAE keeps frame 0
+            # then one latent per temporal stride (97 raw frames -> 13 latents).
+            latent_frames = (self.num_frames - 1) // self.vae_time_stride + 1
+            latent = latent[:, :latent_frames]
         return latent
 
     def _read_info(self, item: dict) -> dict:
