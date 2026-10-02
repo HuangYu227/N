@@ -25,7 +25,8 @@ def worker_setup(tmp_path):
         "import json, os, sys\nfrom pathlib import Path\n"
         "names = ('ROOT', 'HF_HOME', 'PIP_CACHE_DIR', 'TORCH_HOME', 'PYTHON', 'CUDA_VISIBLE_DEVICES', "
         "'TORCHINDUCTOR_CACHE_DIR', 'TRITON_CACHE_DIR', 'TORCH_EXTENSIONS_DIR', 'CUDA_CACHE_PATH', "
-        "'TORCHINDUCTOR_COMPILE_THREADS', 'TMPDIR', 'TMP', 'TEMP', 'PYTHONPYCACHEPREFIX')\n"
+        "'TORCHINDUCTOR_COMPILE_THREADS', 'TMPDIR', 'TMP', 'TEMP', 'PYTHONPYCACHEPREFIX', "
+        "'GDN_DISABLE_COMPILE', 'GDN_DISABLE_COMPLEX_COMPILE', 'CUDA_LAUNCH_BLOCKING')\n"
         "record = {k: os.environ[k] for k in names}\n"
         "for k in ('TMPDIR', 'PYTHONPYCACHEPREFIX', 'TORCHINDUCTOR_CACHE_DIR', 'TRITON_CACHE_DIR', 'TORCH_EXTENSIONS_DIR', 'CUDA_CACHE_PATH'):\n"
         "    p = Path(record[k]); assert p.is_dir(); (p / 'generated.py').write_text('compile scratch')\n"
@@ -53,6 +54,8 @@ def worker_setup(tmp_path):
                TMPDIR="/shared/old/tmp", TMP="/shared/old/tmp", TEMP="/shared/old/tmp",
                PYTHONPYCACHEPREFIX="/shared/old/pycache")
     env.pop("TORCHINDUCTOR_COMPILE_THREADS", None)
+    for name in ("GDN_DISABLE_COMPILE", "GDN_DISABLE_COMPLEX_COMPILE", "CUDA_LAUNCH_BLOCKING"):
+        env.pop(name, None)
     # Use Git Bash's native path conversion so Windows Python can inspect the
     # temporary directories created under its /tmp alias.
     env.pop("MSYS2_ENV_CONV_EXCL", None)
@@ -80,6 +83,8 @@ def test_worker_uses_fresh_local_compile_files_and_preserves_exit_status(worker_
     for name in ("ROOT", "HF_HOME", "PIP_CACHE_DIR", "TORCH_HOME", "PYTHON", "CUDA_VISIBLE_DEVICES"):
         assert exported[name] == env[name]
     assert exported["TORCHINDUCTOR_COMPILE_THREADS"] == "1"
+    for name in ("GDN_DISABLE_COMPILE", "GDN_DISABLE_COMPLEX_COMPILE", "CUDA_LAUNCH_BLOCKING"):
+        assert exported[name] == "0" and f"{name}=0" in result.stdout
     assert exported["TMP"] == exported["TEMP"] == exported["TMPDIR"]
     parents = {Path(exported[k]).parent for k in (
         "TMPDIR", "PYTHONPYCACHEPREFIX", "TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR",
@@ -89,6 +94,21 @@ def test_worker_uses_fresh_local_compile_files_and_preserves_exit_status(worker_
     assert scratch.name.startswith(f"worldttn-423009-rank{rank}.")
     assert not scratch.exists(), "compile scratch must be cleaned after success and failure"
     assert "[TTN compile]" in result.stdout and f"rank={rank}" in result.stdout
+
+
+@pytest.mark.parametrize("mode", ["compiled", "eager", "complex-eager"])
+def test_worker_passes_compile_and_synchronous_debug_policy_before_python(worker_setup, mode):
+    bash, script, capture, writer, personal, env = worker_setup
+    env.update(GDN_DISABLE_COMPILE="1" if mode == "eager" else "0",
+               GDN_DISABLE_COMPLEX_COMPILE="1" if mode == "complex-eager" else "0",
+               CUDA_LAUNCH_BLOCKING="1")
+    result = subprocess.run([str(bash), str(script), "distributed-smoke", "--stages", "A"],
+                            env=env, capture_output=True, text=True,
+                            encoding="utf-8", errors="replace", timeout=30)
+    assert result.returncode == 0, result.stderr
+    exported = json.loads(capture.read_text())["env"]
+    for name in ("GDN_DISABLE_COMPILE", "GDN_DISABLE_COMPLEX_COMPILE", "CUDA_LAUNCH_BLOCKING"):
+        assert exported[name] == env[name] and f"{name}={env[name]}" in result.stdout
 
 
 def test_concurrent_workers_have_separate_local_scratch(worker_setup):

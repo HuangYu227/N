@@ -49,6 +49,8 @@ RMSNorm = get_rmsnorm_class()
 # ``GDN_DISABLE_COMPILE``.  When set to anything other than ``"0"`` / ``"false"``,
 # compile is disabled (useful for debugging / parity work).
 _COMPILE_DISABLE = os.environ.get("GDN_DISABLE_COMPILE", "0") not in ("0", "false")
+# Selective fallback for complex RoPE; real-valued gates retain compilation.
+_COMPLEX_COMPILE_DISABLE = _COMPILE_DISABLE or os.environ.get("GDN_DISABLE_COMPLEX_COMPILE", "0") not in ("0", "false")
 
 _SDPA_D112_DIRECT = os.environ.get("SANA_WM_SDPA_D112_DIRECT", "").strip().lower() in {
     "1",
@@ -138,7 +140,7 @@ def _compute_frame_gates(
     return beta, decay
 
 
-@torch.compile(disable=_COMPILE_DISABLE)
+@torch.compile(disable=_COMPLEX_COMPILE_DISABLE)
 def _apply_rotary_emb(
     hidden_states: torch.Tensor,
     freqs: torch.Tensor,

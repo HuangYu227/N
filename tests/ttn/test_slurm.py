@@ -327,6 +327,9 @@ def test_check_reports_actual_python_and_cache_environment(monkeypatch):
     monkeypatch.setenv("HF_HOME", "/shared/personal/.cache/huggingface")
     monkeypatch.setenv("TMPDIR", "/tmp/worldttn-123-rank0.example/tmp")
     monkeypatch.setenv("TORCHINDUCTOR_COMPILE_THREADS", "1")
+    monkeypatch.setenv("GDN_DISABLE_COMPILE", "1")
+    monkeypatch.setenv("GDN_DISABLE_COMPLEX_COMPILE", "0")
+    monkeypatch.setenv("CUDA_LAUNCH_BLOCKING", "1")
     monkeypatch.setattr(distributed.dist, "is_initialized", lambda: False)
     report = distributed.check_distributed("cpu")
     record = report["ranks"][0]
@@ -337,6 +340,8 @@ def test_check_reports_actual_python_and_cache_environment(monkeypatch):
     assert record["cache"]["HF_HOME"] == "/shared/personal/.cache/huggingface"
     assert record["cache"]["TMPDIR"] == "/tmp/worldttn-123-rank0.example/tmp"
     assert record["compile_threads"] == "1"
+    assert record["compile"] == {"gdn_disable_compile": "1", "gdn_disable_complex_compile": "0",
+                                 "cuda_launch_blocking": "1"}
 
 
 @pytest.mark.parametrize("command", ["distributed-check", "distributed-smoke", "train"])

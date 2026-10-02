@@ -14,6 +14,13 @@
 # sbatch --nodes=... --time=... . The script needs no Accelerate configuration.
 # COMMAND=distributed-check sbatch tools/ttn_slurm_train.sbatch
 # COMMAND=distributed-smoke TBPTT=1 sbatch tools/ttn_slurm_train.sbatch
+# Geometry/rotary backward A/B (same model, four-node DDP and CPU offload):
+# GDN_DISABLE_COMPILE=1 CUDA_LAUNCH_BLOCKING=1 COMMAND=distributed-smoke STAGES=A TBPTT=1 sbatch tools/ttn_slurm_train.sbatch
+# GDN_DISABLE_COMPILE=0 CUDA_LAUNCH_BLOCKING=1 COMMAND=distributed-smoke STAGES=A TBPTT=1 sbatch tools/ttn_slurm_train.sbatch
+# After eager succeeds, test only the two complex/RoPE wrappers eagerly:
+# GDN_DISABLE_COMPILE=0 GDN_DISABLE_COMPLEX_COMPILE=1 COMMAND=distributed-smoke STAGES=A TBPTT=1 sbatch tools/ttn_slurm_train.sbatch
+# These import-time switches never change the underlying Tensor mathematics;
+# they do not disable handwritten Triton/FLA kernels. Run the comparisons serially.
 # DATASET_ROOT=/shared/data/sana-wm-example STAGE=A sbatch tools/ttn_slurm_train.sbatch
 set -euo pipefail
 : "${SLURM_JOB_ID:?Submit this script with sbatch}"

@@ -24,7 +24,7 @@ def apply_complex_rope(
     freqs: torch.Tensor,
     inverse: bool = False,
 ) -> torch.Tensor:
-    """Apply complex RoPE (compiled: fuses fp64 cast + view_as_complex + multiply chain)."""
+    """Apply complex RoPE; SANA optionally compiles this same pure Tensor function."""
     x_real = hidden_states.to(torch.float64)
     if x_real.stride(-1) != 1:
         x_real = x_real.contiguous()

@@ -43,6 +43,7 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 
 _COMPILE_DISABLE = os.environ.get("GDN_DISABLE_COMPILE", "0") not in ("0", "false")
+_COMPLEX_COMPILE_DISABLE = _COMPILE_DISABLE or os.environ.get("GDN_DISABLE_COMPLEX_COMPILE", "0") not in ("0", "false")
 
 
 # ---------------------------------------------------------------------------
@@ -434,7 +435,7 @@ from worldttn.geometry import (
 )
 
 _apply_ray_projmat = torch.compile(apply_ray_projmat, disable=_COMPILE_DISABLE)
-_apply_complex_rope = torch.compile(apply_complex_rope, disable=_COMPILE_DISABLE)
+_apply_complex_rope = torch.compile(apply_complex_rope, disable=_COMPLEX_COMPILE_DISABLE)
 _apply_block_diagonal = apply_block_diagonal
 _invert_SE3 = invert_se3
 

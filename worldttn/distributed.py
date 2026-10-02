@@ -178,6 +178,9 @@ def check_distributed(device):
                   "TMPDIR", "TMP", "TEMP", "PYTHONPYCACHEPREFIX", "TORCH_EXTENSIONS_DIR",
                   "TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR", "CUDA_CACHE_PATH")},
               "compile_threads": os.environ.get("TORCHINDUCTOR_COMPILE_THREADS"),
+              "compile": {"gdn_disable_compile": os.environ.get("GDN_DISABLE_COMPILE", "0"),
+                          "gdn_disable_complex_compile": os.environ.get("GDN_DISABLE_COMPLEX_COMPILE", "0"),
+                          "cuda_launch_blocking": os.environ.get("CUDA_LAUNCH_BLOCKING", "0")},
               "torch": str(torch.__version__), "cuda": torch.version.cuda,
               "gpu_name": torch.cuda.get_device_name(device) if device.type == "cuda" else None,
               "nccl": torch.cuda.nccl.version() if device.type == "cuda" else None}
