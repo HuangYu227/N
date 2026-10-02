@@ -87,5 +87,7 @@ if [[ "${RESUME:-0}" == 1 ]]; then
   [[ "$command" == train ]] || { echo 'RESUME=1 is only supported for train' >&2; exit 2; }
   args+=(--resume)
 fi
+# Set local TMPDIR and compilation caches inside each worker, after the shared
+# cache helper above. Do not initialize a single directory on the batch node.
 exec srun --mpi=none --kill-on-bad-exit=1 --distribution=block --ntasks="$SLURM_NTASKS" --ntasks-per-node=1 \
-  --gres=gpu:1 --chdir="$project_root" "$PYTHON" -u -m worldttn.cli "${args[@]}" "$@"
+  --gres=gpu:1 --chdir="$project_root" bash "$project_root/tools/ttn_slurm_worker.sh" "${args[@]}" "$@"

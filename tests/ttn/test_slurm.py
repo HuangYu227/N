@@ -320,6 +320,8 @@ def test_check_reports_actual_python_and_cache_environment(monkeypatch):
     install_environment(monkeypatch, {})
     monkeypatch.setenv("ROOT", "/shared/personal")
     monkeypatch.setenv("HF_HOME", "/shared/personal/.cache/huggingface")
+    monkeypatch.setenv("TMPDIR", "/tmp/worldttn-123-rank0.example/tmp")
+    monkeypatch.setenv("TORCHINDUCTOR_COMPILE_THREADS", "1")
     monkeypatch.setattr(distributed.dist, "is_initialized", lambda: False)
     report = distributed.check_distributed("cpu")
     record = report["ranks"][0]
@@ -328,6 +330,8 @@ def test_check_reports_actual_python_and_cache_environment(monkeypatch):
     assert record["torch"] == str(torch.__version__)
     assert record["cache"]["ROOT"] == "/shared/personal"
     assert record["cache"]["HF_HOME"] == "/shared/personal/.cache/huggingface"
+    assert record["cache"]["TMPDIR"] == "/tmp/worldttn-123-rank0.example/tmp"
+    assert record["compile_threads"] == "1"
 
 
 @pytest.mark.parametrize("command", ["distributed-check", "distributed-smoke", "train"])
@@ -349,6 +353,7 @@ def test_sbatch_executes_one_srun_with_shared_master_and_preserves_gpu_mask(tmp_
     (project / "worldttn/cli.py").touch()
     (project / "tools").mkdir()
     shutil.copyfile(root / "tools/ttn_cache_env.sh", project / "tools/ttn_cache_env.sh")
+    shutil.copyfile(root / "tools/ttn_slurm_worker.sh", project / "tools/ttn_slurm_worker.sh")
     personal_root = tmp_path / "personal shared root" if custom_root else project.parent
     python = personal_root / "envs/worldttn/bin/python"
     python.parent.mkdir(parents=True)
@@ -409,7 +414,9 @@ def test_sbatch_executes_one_srun_with_shared_master_and_preserves_gpu_mask(tmp_
     args, exported = record["args"], record["env"]
     assert "--ntasks=3" in args and "--ntasks-per-node=1" in args and "--gres=gpu:1" in args
     assert "--mpi=none" in args and "--kill-on-bad-exit=1" in args
-    assert args[args.index("-m") + 1:args.index("-m") + 4] == ["worldttn.cli", command, "--parallel"]
+    worker_index = args.index("bash") + 1
+    assert args[worker_index].endswith("/tools/ttn_slurm_worker.sh")
+    assert args[worker_index + 1:worker_index + 3] == [command, "--parallel"]
     assert args[args.index("--parallel") + 1] == "ddp"
     assert exported["MASTER_ADDR"] == "10.0.0.1" and exported["MASTER_PORT"] == "27345"
     assert "master_node=ltu-hpc-1" in result.stdout

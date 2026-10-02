@@ -175,7 +175,9 @@ def check_distributed(device):
               "python": sys.executable, "python_version": sys.version.split()[0],
               "cache": {name: os.environ.get(name) for name in (
                   "ROOT", "PIP_CACHE_DIR", "HF_HOME", "HF_HUB_CACHE", "HF_DATASETS_CACHE", "TORCH_HOME",
-                  "TORCH_EXTENSIONS_DIR", "TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR", "CUDA_CACHE_PATH")},
+                  "TMPDIR", "TMP", "TEMP", "PYTHONPYCACHEPREFIX", "TORCH_EXTENSIONS_DIR",
+                  "TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR", "CUDA_CACHE_PATH")},
+              "compile_threads": os.environ.get("TORCHINDUCTOR_COMPILE_THREADS"),
               "torch": str(torch.__version__), "cuda": torch.version.cuda,
               "gpu_name": torch.cuda.get_device_name(device) if device.type == "cuda" else None,
               "nccl": torch.cuda.nccl.version() if device.type == "cuda" else None}

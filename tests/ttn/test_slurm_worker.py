@@ -1,0 +1,128 @@
+"""Exercise the actual shell worker without CUDA or a Slurm allocation."""
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+import pytest
+
+
+@pytest.fixture
+def worker_setup(tmp_path):
+    bash = Path("D:/Git/bin/bash.exe")
+    if not bash.exists():
+        candidate = shutil.which("bash")
+        if not candidate: pytest.skip("Bash not installed")
+        bash = Path(candidate)
+    root = Path(__file__).resolve().parents[2]
+    script = root / "tools/ttn_slurm_worker.sh"
+    assert script.exists(), "per-node compile setup is missing"
+    capture = tmp_path / "worker.json"
+    writer = tmp_path / "capture.py"
+    writer.write_text(
+        "import json, os, sys\nfrom pathlib import Path\n"
+        "names = ('ROOT', 'HF_HOME', 'PIP_CACHE_DIR', 'TORCH_HOME', 'PYTHON', 'CUDA_VISIBLE_DEVICES', "
+        "'TORCHINDUCTOR_CACHE_DIR', 'TRITON_CACHE_DIR', 'TORCH_EXTENSIONS_DIR', 'CUDA_CACHE_PATH', "
+        "'TORCHINDUCTOR_COMPILE_THREADS', 'TMPDIR', 'TMP', 'TEMP', 'PYTHONPYCACHEPREFIX')\n"
+        "record = {k: os.environ[k] for k in names}\n"
+        "for k in ('TMPDIR', 'PYTHONPYCACHEPREFIX', 'TORCHINDUCTOR_CACHE_DIR', 'TRITON_CACHE_DIR', 'TORCH_EXTENSIONS_DIR', 'CUDA_CACHE_PATH'):\n"
+        "    p = Path(record[k]); assert p.is_dir(); (p / 'generated.py').write_text('compile scratch')\n"
+        "import tempfile\n"
+        "assert Path(tempfile.gettempdir()) == Path(record['TMPDIR'])\n"
+        "with tempfile.TemporaryDirectory() as td:\n"
+        "    p = Path(td); assert p.parent == Path(record['TMPDIR']); (p / '__pycache__').mkdir()\n"
+        "    (p / '__pycache__/kernel.pyc').write_bytes(b'compile scratch')\n"
+        "Path(os.environ['CAPTURE']).write_text(json.dumps({'args': sys.argv[1:], 'env': record}))\n"
+        "sys.exit(int(os.environ['EXIT_CODE']))\n", encoding="utf-8")
+    python = tmp_path / "python"
+    python.write_text('#!/usr/bin/env bash\nexec "$REAL_PYTHON" "$CAPTURE_WRITER" "$@"\n',
+                      encoding="utf-8", newline="\n")
+    python.chmod(0o755)
+    personal = tmp_path / "shared personal root"
+    env = {k: v for k, v in os.environ.items() if not k.startswith("SLURM_")}
+    env.update(ROOT=personal.as_posix(), HF_HOME=(personal / ".cache/huggingface").as_posix(),
+               PIP_CACHE_DIR=(personal / ".cache/pip").as_posix(),
+               TORCH_HOME=(personal / ".cache/torch").as_posix(), PYTHON=python.as_posix(),
+               REAL_PYTHON=Path(sys.executable).as_posix(), CAPTURE_WRITER=writer.as_posix(),
+               CAPTURE=capture.as_posix(), EXIT_CODE="0", CUDA_VISIBLE_DEVICES="GPU-slurm-mask",
+               SLURM_JOB_ID="423009", SLURM_PROCID="0", SLURM_LOCALID="0",
+               TORCHINDUCTOR_CACHE_DIR="/shared/old/inductor", TRITON_CACHE_DIR="/shared/old/triton",
+               TORCH_EXTENSIONS_DIR="/shared/old/extensions", CUDA_CACHE_PATH="/shared/old/cuda",
+               TMPDIR="/shared/old/tmp", TMP="/shared/old/tmp", TEMP="/shared/old/tmp",
+               PYTHONPYCACHEPREFIX="/shared/old/pycache")
+    env.pop("TORCHINDUCTOR_COMPILE_THREADS", None)
+    # Use Git Bash's native path conversion so Windows Python can inspect the
+    # temporary directories created under its /tmp alias.
+    env.pop("MSYS2_ENV_CONV_EXCL", None)
+    env.pop("MSYS_NO_PATHCONV", None)
+    if os.name == "nt":
+        # Git Bash maps /tmp using Windows TEMP during startup. Keep that
+        # bootstrap mapping valid; Python's preferred TMPDIR is still stale.
+        env["TMP"] = os.environ["TEMP"]
+        env["TEMP"] = os.environ["TEMP"]
+    return bash, script, capture, writer, personal, env
+
+
+@pytest.mark.parametrize("rank", [0, 1, 2])
+@pytest.mark.parametrize("exit_code", [0, 7])
+def test_worker_uses_fresh_local_compile_files_and_preserves_exit_status(worker_setup, rank, exit_code):
+    bash, script, capture, writer, personal, env = worker_setup
+    env.update(SLURM_PROCID=str(rank), EXIT_CODE=str(exit_code))
+    args = ["distributed-smoke", "--stages", "A", "--output", (personal / "output").as_posix()]
+    result = subprocess.run([str(bash), str(script), *args], env=env, capture_output=True, text=True,
+                            encoding="utf-8", errors="replace", timeout=30)
+    assert result.returncode == exit_code, result.stderr
+    record = json.loads(capture.read_text())
+    assert record["args"] == ["-u", "-m", "worldttn.cli", *args]
+    exported = record["env"]
+    for name in ("ROOT", "HF_HOME", "PIP_CACHE_DIR", "TORCH_HOME", "PYTHON", "CUDA_VISIBLE_DEVICES"):
+        assert exported[name] == env[name]
+    assert exported["TORCHINDUCTOR_COMPILE_THREADS"] == "1"
+    assert exported["TMP"] == exported["TEMP"] == exported["TMPDIR"]
+    parents = {Path(exported[k]).parent for k in (
+        "TMPDIR", "PYTHONPYCACHEPREFIX", "TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR",
+        "TORCH_EXTENSIONS_DIR", "CUDA_CACHE_PATH")}
+    assert len(parents) == 1
+    scratch = parents.pop()
+    assert scratch.name.startswith(f"worldttn-423009-rank{rank}.")
+    assert not scratch.exists(), "compile scratch must be cleaned after success and failure"
+    assert "[TTN compile]" in result.stdout and f"rank={rank}" in result.stdout
+
+
+def test_concurrent_workers_have_separate_local_scratch(worker_setup):
+    bash, script, capture, writer, personal, env = worker_setup
+    writer.write_text(writer.read_text().replace("sys.exit(int", "import time; time.sleep(1)\nsys.exit(int"),
+                      encoding="utf-8")
+    processes = []
+    for rank in range(3):
+        rank_env = {**env, "SLURM_PROCID": str(rank), "CAPTURE": str(capture.with_name(f"rank-{rank}.json"))}
+        processes.append(subprocess.Popen([str(bash), str(script), "distributed-check"], env=rank_env,
+                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                          encoding="utf-8", errors="replace"))
+    scratch_dirs = set()
+    for rank, process in enumerate(processes):
+        stdout, stderr = process.communicate(timeout=30)
+        assert process.returncode == 0, stderr
+        record = json.loads(capture.with_name(f"rank-{rank}.json").read_text())
+        scratch = Path(record["env"]["TMPDIR"]).parent
+        assert f"rank={rank}" in stdout and not scratch.exists()
+        scratch_dirs.add(scratch)
+    assert len(scratch_dirs) == 3
+
+
+def test_worker_forwards_term_and_cleans_its_scratch(worker_setup):
+    bash, script, capture, writer, personal, env = worker_setup
+    writer.write_text(writer.read_text().replace("sys.exit(int", "import time; time.sleep(60)\nsys.exit(int"),
+                      encoding="utf-8")
+    env["WORKER"] = script.as_posix()
+    shell = ('bash "$WORKER" distributed-check & worker=$!; '
+             'for attempt in {1..100}; do [[ ! -s "$CAPTURE" ]] || break; sleep 0.1; done; '
+             'if [[ ! -s "$CAPTURE" ]]; then kill -TERM "$worker"; wait "$worker"; exit 99; fi; '
+             'kill -TERM "$worker"; wait "$worker"')
+    result = subprocess.run([str(bash), "-c", shell], env=env, capture_output=True, text=True,
+                            encoding="utf-8", errors="replace", timeout=30)
+    assert result.returncode == 143, result.stderr
+    record = json.loads(capture.read_text())
+    assert not Path(record["env"]["TMPDIR"]).parent.exists()
