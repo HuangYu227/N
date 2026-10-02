@@ -96,6 +96,7 @@ def build(args, stage=None, sana_path=None):
 
 
 def train_update(model, config, batch, optimizer, k, parallel=None, *, activation_offload="none", memory_trace=False):
+    from .cuda_debug import cuda_diagnostics
     from train_video_scripts.train_sana_wm_stage1 import _build_timesteps, _build_time_sampler
     clean = batch["clean_latents"].float()
     sampler = _build_time_sampler(config, clean.shape[2], clean.device)
@@ -123,7 +124,8 @@ def train_update(model, config, batch, optimizer, k, parallel=None, *, activatio
         # Explicit per-rank diagnostics; ordinary training metrics remain rank 0.
         print("[TTN memory] " + json.dumps(record), flush=True)
     try:
-        with torch.autocast(device_type=clean.device.type, dtype=torch.bfloat16, enabled=clean.device.type == "cuda"):
+        with cuda_diagnostics(os.environ.get("TTN_CUDA_TRACE_DIR"), clean.device), torch.autocast(
+                device_type=clean.device.type, dtype=torch.bfloat16, enabled=clean.device.type == "cuda"):
             result = train_clip(model, clean, batch["y"], batch["camera_conditions"], optimizer,
                                 parallel.loss_fn if parallel else SANAFlowLoss(config), timesteps, noise,
                                 width=batch["width"], height=batch["height"], mask=batch.get("mask"),
@@ -503,9 +505,42 @@ def distributed_check_command(args):
         print(json.dumps(args.launch), flush=True)
 
 
+def diagnose_update_command(args):
+    """Exactly one distributed-smoke training update, including its rank-local seeds."""
+    from .distributed import ParallelTraining, rank_world
+    rank, world = rank_world()
+    if args.frames < 4 or args.frames % 3 != 1: raise ValueError("diagnosis uses 1+3n latent frames")
+    seed_everything(args.seed)
+    model, config, settings = build(args)
+    parallel = ParallelTraining(model, SANAFlowLoss(config), args.parallel,
+                                activation_offload=args.activation_offload, memory_trace=args.memory_trace)
+    optimizer = make_optimizer(model, settings.get("learning_rate", 1e-5))
+    seed_everything(args.seed + rank)  # Match distributed-smoke rank0 on the single-card test.
+    batch = load_bundle(args.batch_file.replace("{rank}", str(rank)), args.device) if args.batch_file else (
+        synthetic_bundle(config, args.device, args.frames, args.latent_height, args.latent_width))
+    if batch["clean_latents"].shape[0] != 1: raise ValueError("diagnosis uses one clip per rank")
+    k = args.tbptt or settings.get("tbptt", 2)
+    result, timing = timed_cuda(lambda: train_update(model, config, batch, optimizer, k, parallel))
+    expected = len(chunk_ranges(batch["clean_latents"].shape[2])) + 1
+    runtime = result["runtime"]
+    if runtime.commit_count != expected or runtime.predict_count != expected:
+        raise AssertionError("training state counters disagree")
+    gradients = [p.grad for p in model.parameters() if p.requires_grad and p.grad is not None]
+    if not gradients or not all(bool(torch.isfinite(g).all()) for g in gradients):
+        raise AssertionError("invalid training gradients")
+    report = {"stage": model.ttn_system.config.stage, "tbptt": k, "seed": args.seed,
+              "synthetic_inputs": not bool(args.batch_file), "distributed": args.launch,
+              "train": _training_record(model, result, timing, parallel)}
+    if rank == 0:
+        output = Path(args.output)
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "update.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+        print(json.dumps(report), flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("train", "infer", "smoke", "distributed-smoke", "distributed-check"))
+    parser.add_argument("command", choices=("train", "infer", "smoke", "distributed-smoke", "distributed-check", "diagnose-update"))
     parser.add_argument("--parallel", choices=("auto", "single", "ddp", "fsdp2"), default="auto",
                         help="auto: single with one process, DDP under Slurm, otherwise native FSDP2")
     parser.add_argument("--distributed-timeout", type=int, default=600,
@@ -514,6 +549,8 @@ def main():
                         help="store backward saved tensors in pinned host RAM; single/DDP only, no forward replay")
     parser.add_argument("--memory-trace", action="store_true",
                         help="print per-rank prefill/noisy/clean/backward/optimizer memory diagnostics")
+    parser.add_argument("--cuda-trace", action="store_true",
+                        help="synchronized ATen/autograd layout logs in OUTPUT/cuda-trace; use eager mode and blocking=1")
     parser.add_argument("--dataset-root", help="root for SANA-config relative raw data and VAE cache paths")
     parser.add_argument("--data-dir", help="override the single configured raw zip dataset directory")
     parser.add_argument("--vae-cache-dir", help="override the latent cache directory")
@@ -544,6 +581,13 @@ def main():
     args = parser.parse_args()
     os.environ.setdefault("DISABLE_XFORMERS", "1")
     os.environ["SANA_LOG_GLOBAL_RANK_ONLY"] = "1"
+    if args.cuda_trace:
+        if os.environ.get("CUDA_LAUNCH_BLOCKING") != "1": parser.error("--cuda-trace requires CUDA_LAUNCH_BLOCKING=1 before Python starts")
+        if os.environ.get("GDN_DISABLE_COMPILE", "0") in ("0", "false"):
+            parser.error("--cuda-trace requires GDN_DISABLE_COMPILE=1; operator tracing is an eager-only diagnostic")
+        os.environ["TTN_CUDA_TRACE_DIR"] = str(Path(args.output) / "cuda-trace")
+    else:
+        os.environ.pop("TTN_CUDA_TRACE_DIR", None)
     if args.resume and not args.adapter: parser.error("--resume requires --adapter")
     from .distributed import initialize, resolve_launch_environment, check_distributed, rank_world
     try:
@@ -570,7 +614,8 @@ def main():
         if world > 1 and args.command != "distributed-check" and rank_world()[0] == 0:
             print(json.dumps({"distributed": args.launch}), flush=True)
         {"train": train_command, "infer": infer_command, "smoke": smoke_command,
-         "distributed-smoke": distributed_smoke_command, "distributed-check": distributed_check_command}[args.command](args)
+         "distributed-smoke": distributed_smoke_command, "distributed-check": distributed_check_command,
+         "diagnose-update": diagnose_update_command}[args.command](args)
     finally:
         if torch.distributed.is_initialized(): torch.distributed.destroy_process_group()
 

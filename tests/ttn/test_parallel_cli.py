@@ -111,7 +111,7 @@ def test_parallel_cli_help_does_not_import_cuda_sana():
     result = subprocess.run([sys.executable, "-m", "worldttn.cli", "--help"], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     for option in ("--parallel", "--dataset-root", "--text-encoder-device", "distributed-smoke",
-                   "distributed-check", "--distributed-timeout", "--activation-offload", "--memory-trace"):
+                   "distributed-check", "diagnose-update", "--cuda-trace", "--distributed-timeout", "--activation-offload", "--memory-trace"):
         assert option in result.stdout
 
 

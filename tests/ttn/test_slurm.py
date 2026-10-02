@@ -197,7 +197,7 @@ def test_slurm_launcher_contract_and_local_launcher_guard():
     assert script.exists(), "Slurm sbatch entrypoint is missing"
     content = script.read_text()
     for token in ("--nodes=4", "--mem=128G", "--ntasks-per-node=1", "--gres=gpu:1", "--mpi=none", "--kill-on-bad-exit=1",
-                  "SLURM_SUBMIT_DIR", "SLURM_JOB_ID", "distributed-check", "--parallel ddp"):
+                  "SLURM_SUBMIT_DIR", "SLURM_JOB_ID", "distributed-check", "parallel=ddp", '--parallel "$parallel"'):
         assert token in content
     assert "CUDA_VISIBLE_DEVICES=" not in content
     assert "accelerate.commands.launch" not in content and "torchrun" not in content
@@ -344,7 +344,7 @@ def test_check_reports_actual_python_and_cache_environment(monkeypatch):
                                  "cuda_launch_blocking": "1"}
 
 
-@pytest.mark.parametrize("command", ["distributed-check", "distributed-smoke", "train"])
+@pytest.mark.parametrize("command", ["distributed-check", "distributed-smoke", "train", "diagnose-update", "diagnose-single"])
 @pytest.mark.parametrize("custom_root", [False, True])
 @pytest.mark.parametrize("python_mode", ["valid", "missing", "base"])
 def test_sbatch_executes_one_srun_with_shared_master_and_preserves_gpu_mask(tmp_path, command, custom_root, python_mode):
@@ -352,6 +352,8 @@ def test_sbatch_executes_one_srun_with_shared_master_and_preserves_gpu_mask(tmp_
     import shutil
     import subprocess
     import sys
+    tasks = 1 if command == "diagnose-single" else 3
+    command = "diagnose-update" if command == "diagnose-single" else command
     bash = Path("D:/Git/bin/bash.exe")
     if not bash.exists():
         candidate = shutil.which("bash")
@@ -396,7 +398,7 @@ def test_sbatch_executes_one_srun_with_shared_master_and_preserves_gpu_mask(tmp_
                                                          "DISTRIBUTED_TIMEOUT", "NCCL_SOCKET_FAMILY", "ROOT")}
     env.update({name: "/home/ad/z2zhang/stale-cache" for name in cache_names})
     if custom_root: env["ROOT"] = personal_root.as_posix()
-    env.update(SLURM_JOB_ID="12345", SLURM_NTASKS="3", SLURM_JOB_NODELIST="ltu-hpc-[1-3]",
+    env.update(SLURM_JOB_ID="12345", SLURM_NTASKS=str(tasks), SLURM_JOB_NODELIST="ltu-hpc-[1-3]",
                SLURM_SUBMIT_DIR=project.as_posix(), PROJECT_ROOT=project.as_posix(), COMMAND=command,
                SLURM_STEP_NODELIST="ltu-hpc-2", SLURM_STEP_NUM_NODES="1",
                REAL_PYTHON=Path(sys.executable).as_posix(),
@@ -408,6 +410,7 @@ def test_sbatch_executes_one_srun_with_shared_master_and_preserves_gpu_mask(tmp_
     if python_mode == "base": env["PYTHON"] = "/data/group/zhaolab/project/miniconda/bin/python"
     if command == "train":
         env.update(DATASET_ROOT=(tmp_path / "shared data").as_posix(), ADAPTER=(tmp_path / "last.pt").as_posix(), RESUME="1")
+    if command == "diagnose-update": env["CUDA_TRACE"] = "1"
     shell = ('export MSYS_NO_PATHCONV=1; export MSYS2_ENV_CONV_EXCL="*"; '
              'export PATH="$(cd "$MOCK_BIN" && pwd):$PATH"; '
              'if [[ "$PYTHON_MODE" == valid ]]; then '
@@ -422,16 +425,19 @@ def test_sbatch_executes_one_srun_with_shared_master_and_preserves_gpu_mask(tmp_
     assert result.returncode == 0, result.stderr
     record = json.loads(capture.read_text())
     args, exported = record["args"], record["env"]
-    assert "--ntasks=3" in args and "--ntasks-per-node=1" in args and "--gres=gpu:1" in args
+    assert f"--ntasks={tasks}" in args and "--ntasks-per-node=1" in args and "--gres=gpu:1" in args
     assert "--mpi=none" in args and "--kill-on-bad-exit=1" in args
     worker_index = args.index("bash") + 1
     assert args[worker_index].endswith("/tools/ttn_slurm_worker.sh")
     assert args[worker_index + 1:worker_index + 3] == [command, "--parallel"]
-    assert args[args.index("--parallel") + 1] == "ddp"
-    if command in ("train", "distributed-smoke"):
+    assert args[args.index("--parallel") + 1] == ("single" if tasks == 1 else "ddp")
+    if command in ("train", "distributed-smoke", "diagnose-update"):
         assert args[args.index("--activation-offload") + 1] == "cpu" and "--memory-trace" in args
     else:
         assert "--activation-offload" not in args and "--memory-trace" not in args
+    if command == "diagnose-update":
+        assert "--cuda-trace" in args and args[args.index("--frames") + 1] == "13"
+        assert args[args.index("--tbptt") + 1] == "1" and args[args.index("--stage") + 1] == "C"
     assert exported["MASTER_ADDR"] == "10.0.0.1" and exported["MASTER_PORT"] == "27345"
     assert "master_node=ltu-hpc-1" in result.stdout
     assert "--distribution=block" in args

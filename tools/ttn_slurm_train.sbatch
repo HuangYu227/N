@@ -14,6 +14,8 @@
 # sbatch --nodes=... --time=... . The script needs no Accelerate configuration.
 # COMMAND=distributed-check sbatch tools/ttn_slurm_train.sbatch
 # COMMAND=distributed-smoke TBPTT=1 sbatch tools/ttn_slurm_train.sbatch
+# Single-card, one-update CUDA diagnosis (keep the existing prefix environment):
+# COMMAND=diagnose-update STAGE=A CUDA_TRACE=1 GDN_DISABLE_COMPILE=1 CUDA_LAUNCH_BLOCKING=1 sbatch --nodes=1 --ntasks=1 --ntasks-per-node=1 tools/ttn_slurm_train.sbatch
 # Geometry/rotary backward A/B (same model, four-node DDP and CPU offload):
 # GDN_DISABLE_COMPILE=1 CUDA_LAUNCH_BLOCKING=1 COMMAND=distributed-smoke STAGES=A TBPTT=1 sbatch tools/ttn_slurm_train.sbatch
 # GDN_DISABLE_COMPILE=0 CUDA_LAUNCH_BLOCKING=1 COMMAND=distributed-smoke STAGES=A TBPTT=1 sbatch tools/ttn_slurm_train.sbatch
@@ -57,12 +59,15 @@ export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 export NCCL_SOCKET_FAMILY="${NCCL_SOCKET_FAMILY:-AF_INET}"
 # Keep Slurm's GPU mask and NCCL's network selection; user NIC overrides propagate.
 command="${COMMAND:-train}"
+parallel=ddp
+# A one-card diagnostic must not create a process group or wrap the model in DDP.
+if [[ "$command" == diagnose-update && "$SLURM_NTASKS" == 1 ]]; then parallel=single; fi
 default_timeout=600
 [[ "$command" != distributed-check ]] || default_timeout=120
 printf '[TTN Slurm] job=%s nodes=%s master_node=%s MASTER_ADDR=%s MASTER_PORT=%s command=%s\n' \
   "$SLURM_JOB_ID" "$node_list" "${master_node:-explicit}" "$MASTER_ADDR" "$MASTER_PORT" "$command"
 export OUTPUT="${OUTPUT:-$project_root/output/worldttn/slurm-${SLURM_JOB_ID}-${STAGE:-A}}"
-args=("$command" --parallel ddp --distributed-timeout "${DISTRIBUTED_TIMEOUT:-$default_timeout}"
+args=("$command" --parallel "$parallel" --distributed-timeout "${DISTRIBUTED_TIMEOUT:-$default_timeout}"
       --seed "${SEED:-3407}" --output "$OUTPUT")
 case "$command" in
   train)
@@ -81,11 +86,17 @@ case "$command" in
     [[ -z "${BATCH_FILE:-}" ]] || args+=(--batch-file "$BATCH_FILE")
     ;;
   distributed-check) ;;
+  diagnose-update)
+    args+=(--stage "${STAGE:-A}" --tbptt "${TBPTT:-1}" --frames "${FRAMES:-13}"
+           --latent-height "${LATENT_HEIGHT:-22}" --latent-width "${LATENT_WIDTH:-40}")
+    [[ -z "${BATCH_FILE:-}" ]] || args+=(--batch-file "$BATCH_FILE")
+    ;;
   *) echo "Unsupported COMMAND: $command" >&2; exit 2 ;;
 esac
-if [[ "$command" == train || "$command" == distributed-smoke ]]; then
+if [[ "$command" == train || "$command" == distributed-smoke || "$command" == diagnose-update ]]; then
   args+=(--activation-offload "${ACTIVATION_OFFLOAD:-cpu}")
   [[ "${MEMORY_TRACE:-1}" == 0 ]] || args+=(--memory-trace)
+  [[ "${CUDA_TRACE:-0}" == 0 ]] || args+=(--cuda-trace)
 fi
 [[ -z "${CONFIG:-}" ]] || args+=(--config "$CONFIG")
 [[ -z "${DATA_DIR:-}" ]] || args+=(--data-dir "$DATA_DIR")

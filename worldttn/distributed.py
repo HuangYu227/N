@@ -178,6 +178,7 @@ def check_distributed(device):
                   "TMPDIR", "TMP", "TEMP", "PYTHONPYCACHEPREFIX", "TORCH_EXTENSIONS_DIR",
                   "TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR", "CUDA_CACHE_PATH")},
               "compile_threads": os.environ.get("TORCHINDUCTOR_COMPILE_THREADS"),
+              "cuda_trace_dir": os.environ.get("TTN_CUDA_TRACE_DIR"),
               "compile": {"gdn_disable_compile": os.environ.get("GDN_DISABLE_COMPILE", "0"),
                           "gdn_disable_complex_compile": os.environ.get("GDN_DISABLE_COMPLEX_COMPILE", "0"),
                           "cuda_launch_blocking": os.environ.get("CUDA_LAUNCH_BLOCKING", "0")},

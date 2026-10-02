@@ -3,6 +3,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field
 import torch
 from .session import TTNSession, carry_cache
+from .cuda_debug import trace_backward
 
 
 def activation_storage(mode):
@@ -214,7 +215,8 @@ def train_clip(model,
         with sync, activation_storage(activation_offload):
             loss = runner(episode, first, last, on_prediction=on_prediction)
             _memory_phase(memory_callback, "backward_begin", first=first, last=last)
-            loss.backward()
+            with trace_backward(loss):
+                loss.backward()
             _memory_phase(memory_callback, "backward_end", first=first, last=last)
         runtime.detach()
         episode.cache = carry_cache(episode.cache)
