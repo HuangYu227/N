@@ -17,12 +17,14 @@
 # This file is modified from https://github.com/PixArt-alpha/PixArt-sigma
 import math
 import os
+from contextlib import nullcontext
 from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from einops import rearrange
 from timm.models.vision_transformer import Attention as Attention_
 from timm.models.vision_transformer import Mlp
@@ -75,9 +77,22 @@ class MultiHeadCrossAttention(nn.Module):
             self.q_norm = nn.Identity()
             self.k_norm = nn.Identity()
         self.use_xformers = _xformers_available if use_xformers is None else bool(use_xformers and _xformers_available)
+        self.sdpa_backend = None  # Execution policy only; never part of the state dict.
+
+    def set_sdpa_backend(self, backend: str) -> None:
+        """Restrict this text SDPA call only; auto preserves native dispatch."""
+        choices = {"auto": None, "math": SDPBackend.MATH, "flash": SDPBackend.FLASH_ATTENTION,
+                   "efficient": SDPBackend.EFFICIENT_ATTENTION}
+        if backend not in choices:
+            raise ValueError(f"unknown text SDPA backend: {backend}")
+        if backend != "auto" and self.use_xformers:
+            raise ValueError("text SDPA selection requires xFormers disabled")
+        self.sdpa_backend = choices[backend]
 
     def set_use_xformers(self, enabled: bool) -> None:
         """Select the xFormers backend independently for text cross-attention."""
+        if enabled and _xformers_available and self.sdpa_backend is not None:
+            raise ValueError("reset text SDPA backend to auto before enabling xFormers")
         self.use_xformers = bool(enabled and _xformers_available)
 
     def forward(self, x, cond, mask=None):
@@ -102,7 +117,10 @@ class MultiHeadCrossAttention(nn.Module):
             if mask is not None and mask.ndim == 2:
                 mask = (1 - mask.to(q.dtype)) * -10000.0
                 mask = mask[:, None, None].repeat(1, self.num_heads, 1, 1)
-            x = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False)
+            # Forward dispatch also selects its backward implementation. Restore the
+            # surrounding policy immediately; do not alter Q/K/V or gradient layouts.
+            with sdpa_kernel(self.sdpa_backend) if self.sdpa_backend is not None else nullcontext():
+                x = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False)
             x = x.transpose(1, 2)
 
         x = x.reshape(B, -1, C)

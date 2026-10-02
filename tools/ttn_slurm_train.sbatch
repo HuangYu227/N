@@ -16,6 +16,8 @@
 # COMMAND=distributed-smoke TBPTT=1 sbatch tools/ttn_slurm_train.sbatch
 # Single-card, one-update CUDA diagnosis (keep the existing prefix environment):
 # COMMAND=diagnose-update STAGE=A CUDA_TRACE=1 GDN_DISABLE_COMPILE=1 CUDA_LAUNCH_BLOCKING=1 sbatch --nodes=1 --ntasks=1 --ntasks-per-node=1 tools/ttn_slurm_train.sbatch
+# Text SDPA backend A/B: add CROSS_ATTN_BACKEND=math, then flash after math passes.
+# This scopes backend selection to text cross-attention and preserves tensor layouts/offload.
 # Geometry/rotary backward A/B (same model, four-node DDP and CPU offload):
 # GDN_DISABLE_COMPILE=1 CUDA_LAUNCH_BLOCKING=1 COMMAND=distributed-smoke STAGES=A TBPTT=1 sbatch tools/ttn_slurm_train.sbatch
 # GDN_DISABLE_COMPILE=0 CUDA_LAUNCH_BLOCKING=1 COMMAND=distributed-smoke STAGES=A TBPTT=1 sbatch tools/ttn_slurm_train.sbatch
@@ -94,7 +96,7 @@ case "$command" in
   *) echo "Unsupported COMMAND: $command" >&2; exit 2 ;;
 esac
 if [[ "$command" == train || "$command" == distributed-smoke || "$command" == diagnose-update ]]; then
-  args+=(--activation-offload "${ACTIVATION_OFFLOAD:-cpu}")
+  args+=(--activation-offload "${ACTIVATION_OFFLOAD:-cpu}" --cross-attn-backend "${CROSS_ATTN_BACKEND:-auto}")
   [[ "${MEMORY_TRACE:-1}" == 0 ]] || args+=(--memory-trace)
   [[ "${CUDA_TRACE:-0}" == 0 ]] || args+=(--cuda-trace)
 fi

@@ -76,7 +76,7 @@ def synthetic_bundle(config, device, frames=13, height=22, width=40):
 
 
 def build(args, stage=None, sana_path=None):
-    from .sana import load_sana_config, build_sana
+    from .sana import load_sana_config, build_sana, configure_cross_attention
     ttn, settings = read_reference(args.config, stage or args.stage)
     source = sana_path or args.sana_config or settings["sana_config"]
     source = Path(source)
@@ -92,6 +92,9 @@ def build(args, stage=None, sana_path=None):
         config.data.data_dir = {names[0]: str(Path(args.data_dir).resolve())}
     if getattr(args, "vae_cache_dir", None): config.data.vae_cache_dir = str(Path(args.vae_cache_dir).resolve())
     model = build_sana(config, ttn, args.base_weights, device=args.device)
+    policy = configure_cross_attention(model, getattr(args, "cross_attn_backend", "auto"))
+    from .distributed import rank_world
+    if rank_world()[0] == 0: print("[TTN SDPA] " + json.dumps(policy), flush=True)
     return model, config, settings
 
 
@@ -259,7 +262,8 @@ def _training_record(model, result, timing, parallel):
             "outer_grad_norm": result["outer_grad_norm"], "ranks": ranks,
             "seconds": max(record["seconds"] for record in ranks),
             "world_size": parallel.world, "global_batch": parallel.world, "parallel": parallel.mode,
-            "config": model.ttn_system.config.to_dict(), "base": model.base_load_report}
+            "config": model.ttn_system.config.to_dict(), "base": model.base_load_report,
+            "cross_attention": getattr(model, "cross_attention_report", None)}
 
 
 def train_command(args):
@@ -551,6 +555,8 @@ def main():
                         help="print per-rank prefill/noisy/clean/backward/optimizer memory diagnostics")
     parser.add_argument("--cuda-trace", action="store_true",
                         help="synchronized ATen/autograd layout logs in OUTPUT/cuda-trace; use eager mode and blocking=1")
+    parser.add_argument("--cross-attn-backend", choices=("auto", "math", "flash", "efficient"), default="auto",
+                        help="backend for the standard text cross-attention SDPA call only; forced choices have no fallback")
     parser.add_argument("--dataset-root", help="root for SANA-config relative raw data and VAE cache paths")
     parser.add_argument("--data-dir", help="override the single configured raw zip dataset directory")
     parser.add_argument("--vae-cache-dir", help="override the latent cache directory")

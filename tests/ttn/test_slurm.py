@@ -410,7 +410,10 @@ def test_sbatch_executes_one_srun_with_shared_master_and_preserves_gpu_mask(tmp_
     if python_mode == "base": env["PYTHON"] = "/data/group/zhaolab/project/miniconda/bin/python"
     if command == "train":
         env.update(DATASET_ROOT=(tmp_path / "shared data").as_posix(), ADAPTER=(tmp_path / "last.pt").as_posix(), RESUME="1")
-    if command == "diagnose-update": env["CUDA_TRACE"] = "1"
+    env.pop("CROSS_ATTN_BACKEND", None)
+    if command == "diagnose-update":
+        env["CUDA_TRACE"] = "1"
+        env["CROSS_ATTN_BACKEND"] = "flash" if custom_root else "math"
     shell = ('export MSYS_NO_PATHCONV=1; export MSYS2_ENV_CONV_EXCL="*"; '
              'export PATH="$(cd "$MOCK_BIN" && pwd):$PATH"; '
              'if [[ "$PYTHON_MODE" == valid ]]; then '
@@ -433,6 +436,7 @@ def test_sbatch_executes_one_srun_with_shared_master_and_preserves_gpu_mask(tmp_
     assert args[args.index("--parallel") + 1] == ("single" if tasks == 1 else "ddp")
     if command in ("train", "distributed-smoke", "diagnose-update"):
         assert args[args.index("--activation-offload") + 1] == "cpu" and "--memory-trace" in args
+        assert args[args.index("--cross-attn-backend") + 1] == env.get("CROSS_ATTN_BACKEND", "auto")
     else:
         assert "--activation-offload" not in args and "--memory-trace" not in args
     if command == "diagnose-update":

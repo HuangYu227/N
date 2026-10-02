@@ -75,3 +75,17 @@ def build_sana(config, ttn_config, base_weights=None, device="cuda", dtype=torch
         "sha256": digest.hexdigest()
     }
     return model
+
+
+def configure_cross_attention(model, backend="auto"):
+    """Select the standard text cross-attention call site, never visual/camera SDPA."""
+    from diffusion.model.nets.sana_blocks import MultiHeadCrossAttention
+    targets = [(name, module) for name, module in model.named_modules()
+               if name.endswith(".cross_attn") and type(module) is MultiHeadCrossAttention]
+    if backend != "auto" and not targets:
+        raise ValueError("no standard SANA text cross-attention modules for --cross-attn-backend")
+    for _, module in targets:
+        module.set_sdpa_backend(backend)
+    model.cross_attention_report = {"backend": backend, "modules": [name for name, _ in targets],
+                                    "call_site": "MultiHeadCrossAttention.forward/native_sdpa"}
+    return model.cross_attention_report
