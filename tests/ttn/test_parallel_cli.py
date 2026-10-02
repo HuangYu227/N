@@ -111,8 +111,53 @@ def test_parallel_cli_help_does_not_import_cuda_sana():
     result = subprocess.run([sys.executable, "-m", "worldttn.cli", "--help"], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     for option in ("--parallel", "--dataset-root", "--text-encoder-device", "distributed-smoke",
-                   "distributed-check", "--distributed-timeout"):
+                   "distributed-check", "--distributed-timeout", "--activation-offload", "--memory-trace"):
         assert option in result.stdout
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_real_cli_update_uses_offload_and_reports_memory_phases(monkeypatch, capsys, fail):
+    from types import ModuleType, SimpleNamespace
+    from test_training import TinyWorldModel, inputs
+    from worldttn import cli
+    from worldttn.distributed import ParallelTraining
+    from worldttn.training import linear_flow_loss
+    from worldttn.checkpoint import make_optimizer
+    # Isolate optional SANA imports only; exercise the actual CLI/update/window.
+    source = ModuleType("train_video_scripts.train_sana_wm_stage1")
+    source._build_time_sampler = lambda *args: None
+    source._build_timesteps = lambda config, clean, frames, *args, **kwargs: (
+        torch.ones(clean.shape[0], 1, frames) * 500, None)
+    monkeypatch.setitem(sys.modules, source.__name__, source)
+    model = TinyWorldModel("C")
+    clean, noise, t, camera = inputs()
+    def loss_fn(*args, **kwargs):
+        if fail: raise torch.OutOfMemoryError("memory probe")
+        return linear_flow_loss(*args, **kwargs)
+    engine = ParallelTraining(model, loss_fn, activation_offload="cpu", memory_trace=True)
+    batch = {"clean_latents": clean, "y": torch.zeros(1, 1, 2, 8), "camera_conditions": camera,
+             "width": 100, "height": 100}
+    if fail:
+        with pytest.raises(torch.OutOfMemoryError, match="memory probe"):
+            cli.train_update(model, SimpleNamespace(), batch, make_optimizer(model), 2, engine)
+        records = [json.loads(line.removeprefix("[TTN memory] ")) for line in capsys.readouterr().out.splitlines()]
+        assert records[-1]["phase"] == "oom" and records[-1]["failed_after"] == "noisy_begin"
+    else:
+        result = cli.train_update(model, SimpleNamespace(), batch, make_optimizer(model), 2, engine)
+        assert result["activation_offload"] == "cpu"
+        records = result["memory_phases"]
+        assert records[0]["phase"] == "prefill_begin" and records[-1]["phase"] == "optimizer_end"
+        assert len(capsys.readouterr().out.splitlines()) == len(records)
+    assert all(record["rank"] == 0 and record["activation_offload"] == "cpu" for record in records)
+
+
+def test_offload_policy_validation_precedes_parallel_initialization():
+    from test_training import TinyWorldModel
+    from worldttn.distributed import ParallelTraining
+    from worldttn.training import linear_flow_loss, activation_storage
+    with pytest.raises(ValueError, match="none or cpu"): activation_storage("disk")
+    with pytest.raises(ValueError, match="single/DDP"):
+        ParallelTraining(TinyWorldModel(), linear_flow_loss, "fsdp2", activation_offload="cpu")
 
 
 def test_resume_without_adapter_fails_before_cuda_or_teacher_initialization():

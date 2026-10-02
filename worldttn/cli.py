@@ -95,30 +95,47 @@ def build(args, stage=None, sana_path=None):
     return model, config, settings
 
 
-def train_update(model, config, batch, optimizer, k, parallel=None):
+def train_update(model, config, batch, optimizer, k, parallel=None, *, activation_offload="none", memory_trace=False):
     from train_video_scripts.train_sana_wm_stage1 import _build_timesteps, _build_time_sampler
     clean = batch["clean_latents"].float()
     sampler = _build_time_sampler(config, clean.shape[2], clean.device)
     timesteps, _ = _build_timesteps(config, clean, clean.shape[2], True, time_sampler=sampler)
     noise = torch.randn_like(clean)
     extras = {"chunk_plucker": batch["chunk_plucker"]} if "chunk_plucker" in batch else {}
-    with torch.autocast(device_type=clean.device.type, dtype=torch.bfloat16, enabled=clean.device.type == "cuda"):
-        return train_clip(model,
-                          clean,
-                          batch["y"],
-                          batch["camera_conditions"],
-                          optimizer,
-                          parallel.loss_fn if parallel else SANAFlowLoss(config),
-                          timesteps,
-                          noise,
-                          width=batch["width"],
-                          height=batch["height"],
-                          mask=batch.get("mask"),
-                          data_info=batch.get("data_info"),
-                          extras=extras,
-                          valid_mask=batch.get("frame_valid_mask"),
-                          tbptt=k,
-                          parallel=parallel)
+    if parallel is not None:
+        activation_offload, memory_trace = parallel.activation_offload, parallel.memory_trace
+    memory_records = []
+    def trace(phase, **info):
+        from .distributed import rank_world
+        record = {"phase": phase, "rank": rank_world()[0], "activation_offload": activation_offload, **info}
+        if clean.device.type == "cuda":
+            record.update(allocated_bytes=torch.cuda.memory_allocated(clean.device),
+                          reserved_bytes=torch.cuda.memory_reserved(clean.device),
+                          peak_allocated_bytes=torch.cuda.max_memory_allocated(clean.device),
+                          peak_reserved_bytes=torch.cuda.max_memory_reserved(clean.device))
+        try:
+            for line in Path("/proc/self/status").read_text().splitlines():
+                if line.startswith("VmRSS:"):
+                    record["host_rss_bytes"] = int(line.split()[1]) * 1024
+                    break
+        except OSError: pass  # Optional Linux diagnostic; also runs in local Windows tests.
+        memory_records.append(record)
+        # Explicit per-rank diagnostics; ordinary training metrics remain rank 0.
+        print("[TTN memory] " + json.dumps(record), flush=True)
+    try:
+        with torch.autocast(device_type=clean.device.type, dtype=torch.bfloat16, enabled=clean.device.type == "cuda"):
+            result = train_clip(model, clean, batch["y"], batch["camera_conditions"], optimizer,
+                                parallel.loss_fn if parallel else SANAFlowLoss(config), timesteps, noise,
+                                width=batch["width"], height=batch["height"], mask=batch.get("mask"),
+                                data_info=batch.get("data_info"), extras=extras,
+                                valid_mask=batch.get("frame_valid_mask"), tbptt=k, parallel=parallel,
+                                activation_offload=activation_offload,
+                                memory_callback=trace if memory_trace else None)
+    except torch.OutOfMemoryError:
+        trace("oom", failed_after=memory_records[-1]["phase"] if memory_records else "unknown")
+        raise
+    result.update(activation_offload=activation_offload, memory_phases=memory_records)
+    return result
 
 
 @torch.no_grad()
@@ -232,7 +249,8 @@ def _training_identity(args, config, settings, k):
 def _training_record(model, result, timing, parallel):
     local = {"rank": parallel.rank, "loss": result["loss"], "outer_grad_norm": result["outer_grad_norm"],
              "commits": result["runtime"].commit_count, "predictions": result["runtime"].predict_count,
-             "chunks": result["chunks"], **timing}
+             "chunks": result["chunks"], "activation_offload": result.get("activation_offload", "none"),
+             "memory_phases": result.get("memory_phases", []), **timing}
     from .distributed import gather_records
     ranks = gather_records(local)
     return {"loss": sum(record["loss"] for record in ranks) / parallel.world,
@@ -257,7 +275,9 @@ def train_command(args):
     elif args.resume and mode != "single":
         raise ValueError("multi-GPU resume requires optimizer shards; use --adapter without --resume for initialization")
     if payload: model.load_state_dict(payload["adapter"], strict=False)
-    parallel = ParallelTraining(model, SANAFlowLoss(config), mode)
+    parallel = ParallelTraining(model, SANAFlowLoss(config), mode,
+                                activation_offload=getattr(args, "activation_offload", "none"),
+                                memory_trace=getattr(args, "memory_trace", False))
     # FSDP2 optimizer must be constructed AFTER parameters become DTensors.
     optimizer = make_optimizer(model, settings.get("learning_rate", 1e-5))
     step, cursor = 0, None
@@ -354,7 +374,8 @@ def smoke_command(args):
         batch = load_bundle(args.batch_file, args.device) if args.batch_file else synthetic_bundle(
             config, args.device, args.frames, args.latent_height, args.latent_width)
         result, train_timing = timed_cuda(
-            lambda: train_update(model, config, batch, optimizer, args.tbptt or settings.get("tbptt", 2)))
+            lambda: train_update(model, config, batch, optimizer, args.tbptt or settings.get("tbptt", 2),
+                                 activation_offload=args.activation_offload, memory_trace=args.memory_trace))
         gradients = {
             name: float(p.grad.float().norm())
             for name, p in model.named_parameters() if p.requires_grad and p.grad is not None
@@ -381,6 +402,8 @@ def smoke_command(args):
                 "outer_grad_norm": result["outer_grad_norm"],
                 "grad_norms": gradients,
                 "chunks": result["chunks"],
+                "activation_offload": result["activation_offload"],
+                "memory_phases": result["memory_phases"],
                 **train_timing
             },
             "rollout": {
@@ -418,7 +441,8 @@ def distributed_smoke_command(args):
         seed_everything(args.seed)
         model, config, settings = build(args, stage)
         if previous: load_checkpoint(previous, model)
-        parallel = ParallelTraining(model, SANAFlowLoss(config), args.parallel)
+        parallel = ParallelTraining(model, SANAFlowLoss(config), args.parallel,
+                                    activation_offload=args.activation_offload, memory_trace=args.memory_trace)
         optimizer = make_optimizer(model, settings.get("learning_rate", 1e-5))
         seed_everything(args.seed + rank)
         batch = load_bundle(args.batch_file.replace("{rank}", str(rank)), args.device) if args.batch_file else (
@@ -486,6 +510,10 @@ def main():
                         help="auto: single with one process, DDP under Slurm, otherwise native FSDP2")
     parser.add_argument("--distributed-timeout", type=int, default=600,
                         help="process group timeout in seconds (default: 600)")
+    parser.add_argument("--activation-offload", choices=("none", "cpu"), default="none",
+                        help="store backward saved tensors in pinned host RAM; single/DDP only, no forward replay")
+    parser.add_argument("--memory-trace", action="store_true",
+                        help="print per-rank prefill/noisy/clean/backward/optimizer memory diagnostics")
     parser.add_argument("--dataset-root", help="root for SANA-config relative raw data and VAE cache paths")
     parser.add_argument("--data-dir", help="override the single configured raw zip dataset directory")
     parser.add_argument("--vae-cache-dir", help="override the latent cache directory")

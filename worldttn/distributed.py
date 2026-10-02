@@ -196,10 +196,15 @@ def check_distributed(device):
 
 
 class ParallelTraining:
-    def __init__(self, model, loss_fn, mode="single"):
+    def __init__(self, model, loss_fn, mode="single", *, activation_offload="none", memory_trace=False):
+        if activation_offload not in ("none", "cpu"): raise ValueError("activation_offload must be none or cpu")
+        if mode == "fsdp2" and activation_offload != "none":
+            raise ValueError("CPU activation offload currently supports single/DDP; use none with FSDP2")
         self.model = model
         self.loss_fn = loss_fn
         self.mode = mode
+        self.activation_offload = activation_offload
+        self.memory_trace = memory_trace
         self.rank, self.world = rank_world()
         self.window = TTNTrainingWindow(model, loss_fn)
         if mode == "ddp":

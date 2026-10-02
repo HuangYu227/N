@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=ttn-ddp
 #SBATCH --partition=short
-#SBATCH --nodes=3
+#SBATCH --nodes=4
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
+#SBATCH --mem=128G
 #SBATCH --time=00:30:00
 #SBATCH --output=slurm-%x-%j.out
 
@@ -76,6 +76,10 @@ case "$command" in
   distributed-check) ;;
   *) echo "Unsupported COMMAND: $command" >&2; exit 2 ;;
 esac
+if [[ "$command" == train || "$command" == distributed-smoke ]]; then
+  args+=(--activation-offload "${ACTIVATION_OFFLOAD:-cpu}")
+  [[ "${MEMORY_TRACE:-1}" == 0 ]] || args+=(--memory-trace)
+fi
 [[ -z "${CONFIG:-}" ]] || args+=(--config "$CONFIG")
 [[ -z "${DATA_DIR:-}" ]] || args+=(--data-dir "$DATA_DIR")
 [[ -z "${VAE_CACHE_DIR:-}" ]] || args+=(--vae-cache-dir "$VAE_CACHE_DIR")

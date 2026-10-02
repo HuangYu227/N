@@ -196,7 +196,7 @@ def test_slurm_launcher_contract_and_local_launcher_guard():
     script = root / "tools/ttn_slurm_train.sbatch"
     assert script.exists(), "Slurm sbatch entrypoint is missing"
     content = script.read_text()
-    for token in ("--nodes=3", "--ntasks-per-node=1", "--gres=gpu:1", "--mpi=none", "--kill-on-bad-exit=1",
+    for token in ("--nodes=4", "--mem=128G", "--ntasks-per-node=1", "--gres=gpu:1", "--mpi=none", "--kill-on-bad-exit=1",
                   "SLURM_SUBMIT_DIR", "SLURM_JOB_ID", "distributed-check", "--parallel ddp"):
         assert token in content
     assert "CUDA_VISIBLE_DEVICES=" not in content
@@ -206,7 +206,7 @@ def test_slurm_launcher_contract_and_local_launcher_guard():
         assert local.index("SLURM_PROCID") < local.index("export CUDA_VISIBLE_DEVICES")
 
 
-def _three_rank_slurm_worker(rank, world, master, port, output):
+def _slurm_training_worker(rank, world, master, port, output, activation_offload):
     import contextlib
     import json
     from argparse import Namespace
@@ -238,7 +238,9 @@ def _three_rank_slurm_worker(rank, world, master, port, output):
             clean = batch["clean_latents"]
             noise = torch.randn_like(clean)
             result = train_clip(model, clean, batch["y"], batch["camera_conditions"], optimizer, linear_flow_loss,
-                                torch.ones(1, 1, 13) * 500, noise, width=100, height=100, tbptt=k, parallel=parallel)
+                                torch.ones(1, 1, 13) * 500, noise, width=100, height=100, tbptt=k, parallel=parallel,
+                                activation_offload=parallel.activation_offload)
+            result["activation_offload"] = parallel.activation_offload
             captured.append({"state": {key: value.detach().cpu().clone() for key, value in model.state_dict().items()},
                              "noise": noise, "loss": result["loss"], "norm": result["outer_grad_norm"],
                              "S": result["runtime"].world_state.detach().cpu(),
@@ -255,7 +257,7 @@ def _three_rank_slurm_worker(rank, world, master, port, output):
                     "width": 100, "height": 100}, root / f"batch-{rank}.pt")
         args = Namespace(parallel=mode, seed=3407, batch_file=str(root / "batch-{rank}.pt"), device="cpu",
                          adapter=None, resume=False, output=str(root / "resumed"), max_steps=1,
-                         save_every=1, tbptt=2, launch=launch)
+                         save_every=1, tbptt=2, launch=launch, activation_offload=activation_offload)
         with (root / f"stdout-{rank}.txt").open("w") as handle, contextlib.redirect_stdout(handle):
             cli.train_command(args)
             args.adapter, args.resume, args.max_steps = str(Path(args.output) / "last.pt"), True, 2
@@ -270,6 +272,7 @@ def _three_rank_slurm_worker(rank, world, master, port, output):
             records = [json.loads(line) for line in (root / "resumed/train.jsonl").read_text().splitlines()]
             assert [row["step"] for row in records] == [1, 2]
             assert all(row["global_batch"] == world and len(row["ranks"]) == world for row in records)
+            assert all(local["activation_offload"] == activation_offload for row in records for local in row["ranks"])
             payload = torch.load(root / "resumed/last.pt", weights_only=False)
             folder = root / "resumed" / payload["distributed"]["resume_dir"]
             assert len(list(folder.glob("rank-*.pt"))) == world
@@ -278,7 +281,8 @@ def _three_rank_slurm_worker(rank, world, master, port, output):
         dist.destroy_process_group()
 
 
-def test_three_slurm_ranks_initialize_train_save_resume_and_keep_state_local(tmp_path):
+@pytest.mark.parametrize("world,activation_offload", [(3, "none"), (4, "cpu")])
+def test_slurm_ranks_initialize_train_save_resume_and_keep_state_local(tmp_path, world, activation_offload):
     import socket
     import json
     from test_training import TinyWorldModel
@@ -286,32 +290,33 @@ def test_three_slurm_ranks_initialize_train_save_resume_and_keep_state_local(tmp
     from worldttn.training import train_clip, linear_flow_loss
     from worldttn.checkpoint import make_optimizer
     port = int(_init_uri().split(":")[-1].split("?")[0])
-    torch.multiprocessing.spawn(_three_rank_slurm_worker,
-                                args=(3, socket.gethostname(), port, str(tmp_path)), nprocs=3)
-    ranks = [torch.load(tmp_path / f"rank-{rank}.pt", weights_only=False) for rank in range(3)]
+    torch.multiprocessing.spawn(_slurm_training_worker,
+                                args=(world, socket.gethostname(), port, str(tmp_path), activation_offload), nprocs=world)
+    ranks = [torch.load(tmp_path / f"rank-{rank}.pt", weights_only=False) for rank in range(world)]
     torch.manual_seed(17)
     model = TinyWorldModel("C")
-    batches = [_rank_inputs(rank) for rank in range(3)]
+    batches = [_rank_inputs(rank) for rank in range(world)]
     clean = torch.cat([batch[0] for batch in batches])
     camera = torch.cat([batch[3] for batch in batches])
     noise = torch.cat([rank["first"]["noise"] for rank in ranks])
-    result = train_clip(model, clean, torch.zeros(3, 1, 2, 8), camera, make_optimizer(model), linear_flow_loss,
-                        torch.ones(3, 1, 13) * 500, noise, width=100, height=100, tbptt=2)
+    result = train_clip(model, clean, torch.zeros(world, 1, 2, 8), camera, make_optimizer(model), linear_flow_loss,
+                        torch.ones(world, 1, 13) * 500, noise, width=100, height=100, tbptt=2)
+    checksum = world * (world + 1) // 2
     for rank in ranks:
-        assert rank["launch"]["all_reduce_sum"] == 6
+        assert rank["launch"]["all_reduce_sum"] == checksum
         assert rank["launch"]["backend"] == "gloo"
-        assert [row["local_rank"] for row in rank["launch"]["ranks"]] == [0, 0, 0]
+        assert [row["local_rank"] for row in rank["launch"]["ranks"]] == [0] * world
         assert rank["first"]["commits"] == 5
         assert rank["first"]["norm"] == pytest.approx(result["outer_grad_norm"], rel=3e-5)
         for name, value in model.state_dict().items():
             torch.testing.assert_close(rank["first"]["state"][name], value, atol=3e-7, rtol=3e-5)
-    assert sum(rank["first"]["loss"] for rank in ranks) / 3 == pytest.approx(result["loss"], rel=3e-6)
+    assert sum(rank["first"]["loss"] for rank in ranks) / world == pytest.approx(result["loss"], rel=3e-6)
     assert not torch.equal(ranks[0]["first"]["S"], ranks[1]["first"]["S"])
     assert not torch.equal(ranks[1]["first"]["psi"], ranks[2]["first"]["psi"])
     assert (tmp_path / "stdout-0.txt").read_text()
-    assert not (tmp_path / "stdout-1.txt").read_text() and not (tmp_path / "stdout-2.txt").read_text()
+    assert all(not (tmp_path / f"stdout-{rank}.txt").read_text() for rank in range(1, world))
     run = json.loads((tmp_path / "resumed/run_config.json").read_text())
-    assert run["launch"]["all_reduce_sum"] == 6
+    assert run["launch"]["all_reduce_sum"] == checksum
 
 
 def test_check_reports_actual_python_and_cache_environment(monkeypatch):
@@ -418,6 +423,10 @@ def test_sbatch_executes_one_srun_with_shared_master_and_preserves_gpu_mask(tmp_
     assert args[worker_index].endswith("/tools/ttn_slurm_worker.sh")
     assert args[worker_index + 1:worker_index + 3] == [command, "--parallel"]
     assert args[args.index("--parallel") + 1] == "ddp"
+    if command in ("train", "distributed-smoke"):
+        assert args[args.index("--activation-offload") + 1] == "cpu" and "--memory-trace" in args
+    else:
+        assert "--activation-offload" not in args and "--memory-trace" not in args
     assert exported["MASTER_ADDR"] == "10.0.0.1" and exported["MASTER_PORT"] == "27345"
     assert "master_node=ltu-hpc-1" in result.stdout
     assert "--distribution=block" in args

@@ -5,6 +5,17 @@ import torch
 from .session import TTNSession, carry_cache
 
 
+def activation_storage(mode):
+    """Change saved-tensor storage only; never replay a stateful TTN forward."""
+    if mode == "none": return nullcontext()
+    if mode == "cpu": return torch.autograd.graph.save_on_cpu(pin_memory=True)
+    raise ValueError("activation_offload must be none or cpu")
+
+
+def _memory_phase(callback, phase, **info):
+    if callback is not None: callback(phase, **info)
+
+
 def chunk_ranges(frames, chunk_size=3):
     if frames < 1 or chunk_size < 1: raise ValueError("positive frame count/chunk size required")
     starts = [0]
@@ -96,6 +107,7 @@ class ClipTrainingContext:
     data_info: object = None
     records: list = field(default_factory=list)
     total_loss: float = 0.
+    memory_callback: object = None
 
 
 class TTNTrainingWindow(torch.nn.Module):
@@ -114,7 +126,9 @@ class TTNTrainingWindow(torch.nn.Module):
     def forward(self, episode, first=0, last=0, *, prefill=False, on_prediction=None):
         session = episode.session
         if prefill:
+            _memory_phase(episode.memory_callback, "prefill_begin")
             session.prefill(episode.clean[:, :, :1], episode.y, episode.mask, episode.data_info)
+            _memory_phase(episode.memory_callback, "prefill_end")
             return episode.clean.new_zeros(())
         losses_in_window = []
         for index in range(first, last):
@@ -122,6 +136,7 @@ class TTNTrainingWindow(torch.nn.Module):
             context = session.begin_chunk(start, end)
             lm = episode.loss_valid[:, None, start:end, None, None].to(torch.float32)
             callback = (lambda output, i=index: on_prediction(i, output)) if on_prediction else None
+            _memory_phase(episode.memory_callback, "noisy_begin", chunk=index, start=start, end=end)
             losses = self.loss_fn(session, episode.clean[:, :, start:end], episode.timesteps[:, :, start:end],
                                   episode.noise[:, :, start:end], episode.y, context, episode.cache, start, end,
                                   episode.mask, episode.data_info, lm, callback)
@@ -129,10 +144,13 @@ class TTNTrainingWindow(torch.nn.Module):
             if not torch.isfinite(loss): raise FloatingPointError("nonfinite flow loss")
             losses_in_window.append(loss)
             episode.total_loss += float(loss.detach())
+            _memory_phase(episode.memory_callback, "noisy_end", chunk=index, start=start, end=end)
             # The current GT clean chunk becomes history only AFTER its noisy prediction.
+            _memory_phase(episode.memory_callback, "clean_begin", chunk=index, start=start, end=end)
             _, episode.cache = session.clean_forward(episode.clean[:, :, start:end], episode.y, context,
                                                       episode.cache, start, end, episode.mask, episode.data_info)
             episode.records.append(dict(session.runtime.last_stats))
+            _memory_phase(episode.memory_callback, "clean_end", chunk=index, start=start, end=end)
         return torch.stack(losses_in_window).sum()
 
 
@@ -156,8 +174,13 @@ def train_clip(model,
                outer_clip=.5,
                on_prediction=None,
                window_model=None,
-               parallel=None):
+               parallel=None,
+               activation_offload="none",
+               memory_callback=None):
     if tbptt not in (1, 2, 4): raise ValueError("reference TBPTT supports K=1,2,4")
+    if activation_offload not in ("none", "cpu"): raise ValueError("activation_offload must be none or cpu")
+    if activation_offload == "cpu" and parallel is not None and parallel.mode == "fsdp2":
+        raise ValueError("CPU activation offload currently supports single/DDP; use none with FSDP2")
     b, _, frames, _, _ = clean.shape
     if timesteps.ndim == 1: timesteps = timesteps[:, None, None].expand(b, 1, frames).clone()
     if timesteps.shape != (b, 1, frames) or noise.shape != clean.shape:
@@ -174,7 +197,8 @@ def train_clip(model,
     optimizer.zero_grad(set_to_none=True)
     model.eval()  # disables stochastic conditioning; does NOT disable differentiation
     episode = ClipTrainingContext(session, clean, y, timesteps, noise, loss_valid, total,
-                                  chunk_ranges(frames, chunk_size), [[None] * 10 for _ in model.blocks], mask, data_info)
+                                  chunk_ranges(frames, chunk_size), [[None] * 10 for _ in model.blocks], mask, data_info,
+                                  memory_callback=memory_callback)
     runner = parallel.window if parallel else window_model
     if runner is None: runner = TTNTrainingWindow(model, loss_fn)
     if parallel: parallel.validate_schedule(frames, tbptt, len(episode.ranges), b)
@@ -185,14 +209,20 @@ def train_clip(model,
     for first in range(0, len(episode.ranges), tbptt):
         last = min(first + tbptt, len(episode.ranges))
         sync = parallel.accumulation(last == len(episode.ranges)) if parallel else nullcontext()
-        with sync:  # DDP no_sync must enclose BOTH forward and backward.
+        # DDP no_sync still encloses both forward and backward. CPU storage
+        # preserves the full window's S graph and detached inner updates.
+        with sync, activation_storage(activation_offload):
             loss = runner(episode, first, last, on_prediction=on_prediction)
+            _memory_phase(memory_callback, "backward_begin", first=first, last=last)
             loss.backward()
+            _memory_phase(memory_callback, "backward_end", first=first, last=last)
         runtime.detach()
         episode.cache = carry_cache(episode.cache)
     params = [p for p in model.parameters() if p.requires_grad]
     grad_norm = parallel.clip_grad_norm(outer_clip) if parallel else torch.nn.utils.clip_grad_norm_(
         params, outer_clip, error_if_nonfinite=True)
+    _memory_phase(memory_callback, "optimizer_begin")
     optimizer.step()  # slow parameters stay fixed throughout every clip's windows
+    _memory_phase(memory_callback, "optimizer_end")
     return {"loss": episode.total_loss, "outer_grad_norm": float(grad_norm), "runtime": runtime,
             "chunks": episode.records}
