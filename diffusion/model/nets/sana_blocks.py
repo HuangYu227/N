@@ -78,6 +78,7 @@ class MultiHeadCrossAttention(nn.Module):
             self.k_norm = nn.Identity()
         self.use_xformers = _xformers_available if use_xformers is None else bool(use_xformers and _xformers_available)
         self.sdpa_backend = None  # Execution policy only; never part of the state dict.
+        self.diagnostic_unmask_all_valid = False
 
     def set_sdpa_backend(self, backend: str) -> None:
         """Restrict this text SDPA call only; auto preserves native dispatch."""
@@ -114,6 +115,13 @@ class MultiHeadCrossAttention(nn.Module):
             x = xformers.ops.memory_efficient_attention(q, k, v, p=self.attn_drop.p, attn_bias=attn_bias)
         else:
             q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+            if self.diagnostic_unmask_all_valid and mask is not None:
+                # Keep the upstream caption mask intact. Only this SDPA call may
+                # omit a verified zero additive bias during a synthetic diagnosis.
+                if (mask.ndim != 2 or mask.shape != (q.shape[0], k.shape[-2])
+                        or mask.numel() == 0 or mask.requires_grad or not bool((mask == 1).all())):
+                    raise ValueError("diagnostic unmask requires a nonempty all-one [B, text_tokens] mask; padding/bias masks must be preserved")
+                mask = None
             if mask is not None and mask.ndim == 2:
                 mask = (1 - mask.to(q.dtype)) * -10000.0
                 mask = mask[:, None, None].repeat(1, self.num_heads, 1, 1)

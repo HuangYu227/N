@@ -18,6 +18,8 @@
 # COMMAND=diagnose-update STAGE=A CUDA_TRACE=1 GDN_DISABLE_COMPILE=1 CUDA_LAUNCH_BLOCKING=1 sbatch --nodes=1 --ntasks=1 --ntasks-per-node=1 tools/ttn_slurm_train.sbatch
 # Text SDPA backend A/B: add CROSS_ATTN_BACKEND=math, then flash after math passes.
 # This scopes backend selection to text cross-attention and preserves tensor layouts/offload.
+# For synthetic diagnose-update only: DIAGNOSTIC_UNMASK_ALL_VALID=1 lets FLASH
+# receive None after each text mask is checked to be all ones; padding is rejected.
 # Geometry/rotary backward A/B (same model, four-node DDP and CPU offload):
 # GDN_DISABLE_COMPILE=1 CUDA_LAUNCH_BLOCKING=1 COMMAND=distributed-smoke STAGES=A TBPTT=1 sbatch tools/ttn_slurm_train.sbatch
 # GDN_DISABLE_COMPILE=0 CUDA_LAUNCH_BLOCKING=1 COMMAND=distributed-smoke STAGES=A TBPTT=1 sbatch tools/ttn_slurm_train.sbatch
@@ -100,6 +102,7 @@ if [[ "$command" == train || "$command" == distributed-smoke || "$command" == di
   [[ "${MEMORY_TRACE:-1}" == 0 ]] || args+=(--memory-trace)
   [[ "${CUDA_TRACE:-0}" == 0 ]] || args+=(--cuda-trace)
 fi
+[[ "${DIAGNOSTIC_UNMASK_ALL_VALID:-0}" == 0 ]] || args+=(--diagnostic-unmask-all-valid)
 [[ -z "${CONFIG:-}" ]] || args+=(--config "$CONFIG")
 [[ -z "${DATA_DIR:-}" ]] || args+=(--data-dir "$DATA_DIR")
 [[ -z "${VAE_CACHE_DIR:-}" ]] || args+=(--vae-cache-dir "$VAE_CACHE_DIR")

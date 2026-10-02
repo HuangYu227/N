@@ -218,11 +218,13 @@ def test_actual_slurm_single_diagnosis_skips_process_group_and_binds_only_cuda_z
     seen = []
     monkeypatch.setattr(cli, "diagnose_update_command", seen.append)
     monkeypatch.setattr(sys, "argv", ["worldttn", "diagnose-update", "--cuda-trace", "--parallel", "single",
-                                      "--output", str(tmp_path), "--stage", "A", "--tbptt", "1", "--frames", "13"])
+                                      "--output", str(tmp_path), "--stage", "A", "--tbptt", "1", "--frames", "13",
+                                      "--diagnostic-unmask-all-valid", "--cross-attn-backend", "flash"])
     cli.main()
     assert bindings == [0] and len(seen) == 1
     args = seen[0]
     assert args.parallel == "single" and args.device == "cuda:0"
     assert args.stage == "A" and args.tbptt == 1 and args.frames == 13
+    assert args.diagnostic_unmask_all_valid and args.cross_attn_backend == "flash"
     import os
     assert os.environ["TTN_CUDA_TRACE_DIR"] == str(tmp_path / "cuda-trace")

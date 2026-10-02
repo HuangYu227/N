@@ -411,9 +411,11 @@ def test_sbatch_executes_one_srun_with_shared_master_and_preserves_gpu_mask(tmp_
     if command == "train":
         env.update(DATASET_ROOT=(tmp_path / "shared data").as_posix(), ADAPTER=(tmp_path / "last.pt").as_posix(), RESUME="1")
     env.pop("CROSS_ATTN_BACKEND", None)
+    env.pop("DIAGNOSTIC_UNMASK_ALL_VALID", None)
     if command == "diagnose-update":
         env["CUDA_TRACE"] = "1"
         env["CROSS_ATTN_BACKEND"] = "flash" if custom_root else "math"
+        env["DIAGNOSTIC_UNMASK_ALL_VALID"] = "1" if custom_root else "0"
     shell = ('export MSYS_NO_PATHCONV=1; export MSYS2_ENV_CONV_EXCL="*"; '
              'export PATH="$(cd "$MOCK_BIN" && pwd):$PATH"; '
              'if [[ "$PYTHON_MODE" == valid ]]; then '
@@ -442,6 +444,7 @@ def test_sbatch_executes_one_srun_with_shared_master_and_preserves_gpu_mask(tmp_
     if command == "diagnose-update":
         assert "--cuda-trace" in args and args[args.index("--frames") + 1] == "13"
         assert args[args.index("--tbptt") + 1] == "1" and args[args.index("--stage") + 1] == "C"
+    assert ("--diagnostic-unmask-all-valid" in args) == (command == "diagnose-update" and custom_root)
     assert exported["MASTER_ADDR"] == "10.0.0.1" and exported["MASTER_PORT"] == "27345"
     assert "master_node=ltu-hpc-1" in result.stdout
     assert "--distribution=block" in args

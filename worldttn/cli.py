@@ -92,7 +92,8 @@ def build(args, stage=None, sana_path=None):
         config.data.data_dir = {names[0]: str(Path(args.data_dir).resolve())}
     if getattr(args, "vae_cache_dir", None): config.data.vae_cache_dir = str(Path(args.vae_cache_dir).resolve())
     model = build_sana(config, ttn, args.base_weights, device=args.device)
-    policy = configure_cross_attention(model, getattr(args, "cross_attn_backend", "auto"))
+    policy = configure_cross_attention(model, getattr(args, "cross_attn_backend", "auto"),
+                                       diagnostic_unmask_all_valid=getattr(args, "diagnostic_unmask_all_valid", False))
     from .distributed import rank_world
     if rank_world()[0] == 0: print("[TTN SDPA] " + json.dumps(policy), flush=True)
     return model, config, settings
@@ -557,6 +558,8 @@ def main():
                         help="synchronized ATen/autograd layout logs in OUTPUT/cuda-trace; use eager mode and blocking=1")
     parser.add_argument("--cross-attn-backend", choices=("auto", "math", "flash", "efficient"), default="auto",
                         help="backend for the standard text cross-attention SDPA call only; forced choices have no fallback")
+    parser.add_argument("--diagnostic-unmask-all-valid", action="store_true",
+                        help="synthetic diagnose-update only: omit verified all-one text masks at SDPA, retaining upstream masks")
     parser.add_argument("--dataset-root", help="root for SANA-config relative raw data and VAE cache paths")
     parser.add_argument("--data-dir", help="override the single configured raw zip dataset directory")
     parser.add_argument("--vae-cache-dir", help="override the latent cache directory")
@@ -585,6 +588,8 @@ def main():
     parser.add_argument("--latent-height", type=int, default=22)
     parser.add_argument("--latent-width", type=int, default=40)
     args = parser.parse_args()
+    if args.diagnostic_unmask_all_valid and (args.command != "diagnose-update" or args.batch_file):
+        parser.error("--diagnostic-unmask-all-valid requires synthetic diagnose-update without --batch-file")
     os.environ.setdefault("DISABLE_XFORMERS", "1")
     os.environ["SANA_LOG_GLOBAL_RANK_ONLY"] = "1"
     if args.cuda_trace:
