@@ -101,7 +101,7 @@ def get_logger(name, log_file=None, log_level=logging.INFO, timezone="UTC"):
     if dist.is_available() and dist.is_initialized():
         rank = dist.get_rank()
     else:
-        rank = 0
+        rank = int(os.environ.get("RANK", 0)) if os.environ.get("SANA_LOG_GLOBAL_RANK_ONLY") == "1" else 0
 
     # only rank 0 will add a FileHandler
     if rank == 0 and log_file is not None:
@@ -118,8 +118,10 @@ def get_logger(name, log_file=None, log_level=logging.INFO, timezone="UTC"):
         handler.setLevel(log_level)
         logger.addHandler(handler)
 
-    # only rank0 for each node will print logs
-    log_level = log_level if is_local_master() else logging.ERROR
+    # TTN uses global rank zero, including spawned data workers. Other SANA
+    # entrypoints retain their existing per-node logging policy.
+    master = rank == 0 if os.environ.get("SANA_LOG_GLOBAL_RANK_ONLY") == "1" else is_local_master()
+    log_level = log_level if master else logging.ERROR
     logger.setLevel(log_level)
 
     logger_initialized[name] = True

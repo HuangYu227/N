@@ -1,0 +1,12 @@
+# Accelerate launches two processes. worldttn owns native DDP/FSDP2 wrapping
+# to preserve the FP32 TTN path and the clean-state backward hook contract.
+compute_environment: LOCAL_MACHINE
+distributed_type: MULTI_GPU
+num_machines: 1
+num_processes: 2
+machine_rank: 0
+mixed_precision: 'no'
+main_training_function: main
+rdzv_backend: static
+same_network: true
+use_cpu: false

@@ -36,10 +36,13 @@ def find_model(model_name):
         return download_model(model_name)
 
     # Load a custom Sana checkpoint:
-    print(colored(f"[Sana] Loading model from {model_name}", attrs=["bold"]))
+    log_master = os.environ.get("SANA_LOG_GLOBAL_RANK_ONLY") != "1" or int(os.environ.get("RANK", 0)) == 0
+    if log_master:
+        print(colored(f"[Sana] Loading model from {model_name}", attrs=["bold"]))
     model_name = hf_download_or_fpath(model_name)
     assert os.path.isfile(model_name), f"Could not find Sana checkpoint at {model_name}"
-    print(colored(f"[Sana] Loaded model from {model_name}", attrs=["bold"]))
+    if log_master:
+        print(colored(f"[Sana] Loaded model from {model_name}", attrs=["bold"]))
     if model_name.endswith(".safetensors"):
         import safetensors
 

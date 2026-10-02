@@ -1,7 +1,21 @@
 """Lazy construction of the cached SANA teacher and the TTN adapter."""
 import hashlib
+from pathlib import Path
 import torch
 from .anchor import install_ttn
+
+
+def resolve_data_paths(config, root):
+    """Resolve configured relative raw/cache paths against an explicit dataset root."""
+    root = Path(root).expanduser().resolve()
+    def resolve(path):
+        path = Path(path).expanduser()
+        return str(path if path.is_absolute() else root / path)
+    data = config.data.data_dir
+    config.data.data_dir = {k: resolve(v) for k, v in data.items()} if isinstance(data, dict) else (
+        resolve(data) if isinstance(data, str) else [resolve(v) for v in data])
+    if config.data.vae_cache_dir: config.data.vae_cache_dir = resolve(config.data.vae_cache_dir)
+    config.data.hf_dataset_local_dir = str(root)
 
 
 def load_sana_config(path):

@@ -36,23 +36,23 @@ def restore_rng(state):
         np.random.set_state(state["numpy"])
 
 
-def save_checkpoint(path, model, optimizer, step):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
+def checkpoint_payload(model, adapter, optimizer, step):
+    return {
         "format": "TTN-SANA-WM-v0.1",
         "base_revision": BASE_REVISION,
         "base_sha256": getattr(model, "base_load_report", {}).get("sha256"),
         "config": model.ttn_system.config.to_dict(),
         "stage": model.ttn_system.config.stage,
-        "adapter": {
-            k: v.detach().cpu()
-            for k, v in adapter_state_dict(model).items()
-        },
+        "adapter": adapter,
         "optimizer": optimizer.state_dict() if optimizer else None,
         "step": step,
         "rng": rng_state()
     }
+
+
+def atomic_save(payload, path):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     handle, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
     os.close(handle)
     try:
@@ -62,7 +62,12 @@ def save_checkpoint(path, model, optimizer, step):
         if os.path.exists(temporary): os.unlink(temporary)
 
 
-def load_checkpoint(path, model, optimizer=None, resume=False):
+def save_checkpoint(path, model, optimizer, step):
+    adapter = {k: v.detach().cpu() for k, v in adapter_state_dict(model).items()}
+    atomic_save(checkpoint_payload(model, adapter, optimizer, step), path)
+
+
+def read_checkpoint(path, model, resume=False):
     payload = torch.load(path, map_location="cpu", weights_only=False)
     if payload.get("format") != "TTN-SANA-WM-v0.1" or payload.get("base_revision") != BASE_REVISION:
         raise ValueError("not a compatible TTN reference checkpoint")
@@ -80,6 +85,12 @@ def load_checkpoint(path, model, optimizer=None, resume=False):
     actual = payload["adapter"]
     if expected.keys() != actual.keys() or any(expected[k].shape != actual[k].shape for k in expected):
         raise ValueError("checkpoint adapter keys/shapes mismatch")
+    return payload
+
+
+def load_checkpoint(path, model, optimizer=None, resume=False):
+    payload = read_checkpoint(path, model, resume)
+    actual = payload["adapter"]
     # All validation happens before loading any parameter.
     if resume and (optimizer is None or payload.get("optimizer") is None):
         raise ValueError("resume requires optimizer state")

@@ -1,14 +1,14 @@
-"""Single-card server entrypoints. --help does not import the CUDA SANA stack."""
+"""Single-card inference and causal DDP/FSDP2 training; --help needs no CUDA SANA imports."""
 import argparse
 import json
 import os
 import random
 import time
 from pathlib import Path
-from dataclasses import replace
+from dataclasses import replace, asdict
 import torch
 from .core import TTNConfig, BASE_ID, ANCHORS
-from .checkpoint import make_optimizer, save_checkpoint, load_checkpoint
+from .checkpoint import make_optimizer, save_checkpoint, load_checkpoint, read_checkpoint
 from .training import train_clip, SANAFlowLoss, chunk_ranges
 from .session import TTNSession
 
@@ -82,11 +82,20 @@ def build(args, stage=None, sana_path=None):
     source = Path(source)
     if not source.is_absolute(): source = ROOT / source
     config = load_sana_config(source)
+    root = getattr(args, "dataset_root", None)
+    if root:
+        from .sana import resolve_data_paths
+        resolve_data_paths(config, root)
+    if getattr(args, "data_dir", None):
+        names = list(config.data.data_dir) if isinstance(config.data.data_dir, dict) else ["sekai_game"]
+        if len(names) != 1: raise ValueError("--data-dir requires a single named dataset in the SANA config")
+        config.data.data_dir = {names[0]: str(Path(args.data_dir).resolve())}
+    if getattr(args, "vae_cache_dir", None): config.data.vae_cache_dir = str(Path(args.vae_cache_dir).resolve())
     model = build_sana(config, ttn, args.base_weights, device=args.device)
     return model, config, settings
 
 
-def train_update(model, config, batch, optimizer, k):
+def train_update(model, config, batch, optimizer, k, parallel=None):
     from train_video_scripts.train_sana_wm_stage1 import _build_timesteps, _build_time_sampler
     clean = batch["clean_latents"].float()
     sampler = _build_time_sampler(config, clean.shape[2], clean.device)
@@ -99,7 +108,7 @@ def train_update(model, config, batch, optimizer, k):
                           batch["y"],
                           batch["camera_conditions"],
                           optimizer,
-                          SANAFlowLoss(config),
+                          parallel.loss_fn if parallel else SANAFlowLoss(config),
                           timesteps,
                           noise,
                           width=batch["width"],
@@ -108,7 +117,8 @@ def train_update(model, config, batch, optimizer, k):
                           data_info=batch.get("data_info"),
                           extras=extras,
                           valid_mask=batch.get("frame_valid_mask"),
-                          tbptt=k)
+                          tbptt=k,
+                          parallel=parallel)
 
 
 @torch.no_grad()
@@ -185,73 +195,120 @@ def timed_cuda(call):
     }
 
 
+def _dataset_batch(raw, config, args, tokenizer=None, encoder=None, encoder_device=None):
+    from train_video_scripts.train_sana_wm_stage1 import _extract_batch, _encode_prompts
+    clean, y, mask, info, camera, plucker = _extract_batch(
+        raw, args.device, torch.float32, config.data.load_text_feat,
+        getattr(config.data, "return_chunk_plucker", False))
+    if not config.data.load_text_feat:
+        with torch.no_grad():
+            y, mask = _encode_prompts(y, tokenizer, encoder, config, encoder_device)
+        y, mask = y.to(args.device), mask.to(args.device)
+    if camera is None: raise ValueError("TTN training requires camera_conditions from dataset")
+    batch = {"clean_latents": clean, "y": y, "mask": mask,
+             "data_info": to_device(info, args.device), "camera_conditions": camera.float(),
+             "width": clean.shape[-1], "height": clean.shape[-2]}
+    if plucker is not None: batch["chunk_plucker"] = plucker
+    return batch
+
+
+def _training_identity(args, config, settings, k):
+    def section(name):
+        value = getattr(config, name, None)
+        return asdict(value) if value is not None else None
+    train = getattr(config, "train", None)
+    return {"tbptt": k, "seed": args.seed, "per_rank_batch": 1,
+            "learning_rate": settings.get("learning_rate", 1e-5),
+            "scheduler": asdict(config.scheduler),
+            "task": getattr(config, "task", None), "sana_model": section("model"),
+            "text_encoder": section("text_encoder"),
+            "text_encoder_device": getattr(args, "text_encoder_device", "auto"),
+            "timestep": {name: getattr(train, name, None) for name in (
+                "chunk_sampling_strategy", "same_timestep_prob", "chunk_mixture_probs", "noise_multiplier")},
+            "batch_file": args.batch_file,
+            "data": None if args.batch_file else asdict(config.data)}
+
+
+def _training_record(model, result, timing, parallel):
+    local = {"rank": parallel.rank, "loss": result["loss"], "outer_grad_norm": result["outer_grad_norm"],
+             "commits": result["runtime"].commit_count, "predictions": result["runtime"].predict_count,
+             "chunks": result["chunks"], **timing}
+    from .distributed import gather_records
+    ranks = gather_records(local)
+    return {"loss": sum(record["loss"] for record in ranks) / parallel.world,
+            "outer_grad_norm": result["outer_grad_norm"], "ranks": ranks,
+            "seconds": max(record["seconds"] for record in ranks),
+            "world_size": parallel.world, "global_batch": parallel.world, "parallel": parallel.mode,
+            "config": model.ttn_system.config.to_dict(), "base": model.base_load_report}
+
+
 def train_command(args):
+    from .distributed import ParallelTraining, save_training_checkpoint, restore_training_checkpoint, rank_world
+    from .parallel_checkpoint import validate_training_checkpoint
+    from .parallel_data import ResumableBatchStream
     model, config, settings = build(args)
+    mode = getattr(args, "parallel", "single")
+    rank, world = rank_world()
+    k = args.tbptt or settings.get("tbptt", 2)
+    identity = _training_identity(args, config, settings, k)
+    payload = read_checkpoint(args.adapter, model, resume=args.resume) if args.adapter else None
+    if args.resume and payload.get("distributed"):
+        validate_training_checkpoint(payload, mode, world, identity)
+    elif args.resume and mode != "single":
+        raise ValueError("multi-GPU resume requires optimizer shards; use --adapter without --resume for initialization")
+    if payload: model.load_state_dict(payload["adapter"], strict=False)
+    parallel = ParallelTraining(model, SANAFlowLoss(config), mode)
+    # FSDP2 optimizer must be constructed AFTER parameters become DTensors.
     optimizer = make_optimizer(model, settings.get("learning_rate", 1e-5))
-    step = load_checkpoint(args.adapter, model, optimizer, args.resume) if args.adapter else 0
+    step, cursor = 0, None
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
+    stream = None
+    tokenizer = encoder = None
+    encoder_device = None
     if args.batch_file:
-        batch = load_bundle(args.batch_file, args.device)
-        batches = (batch for _ in range(args.max_steps))
+        bundle_path = args.batch_file.replace("{rank}", str(rank))
+        batch = load_bundle(bundle_path, args.device)
+        if batch["clean_latents"].shape[0] != 1: raise ValueError("reference training uses one clip per rank")
     else:
-        from train_video_scripts.train_sana_wm_stage1 import _build_dataloader, _extract_batch, _encode_prompts
+        from train_video_scripts.train_sana_wm_stage1 import _build_dataloader
         from diffusion.model.builder import get_tokenizer_and_text_encoder
         config.train.train_batch_size = 1
-        loader = _build_dataloader(config, config.text_encoder.model_max_length, 1, 0)
-        tokenizer = encoder = None
+        # Dataset construction may shuffle its internal item list. Use identical
+        # seeds on all ranks before constructing it, then separate training RNGs.
+        seed_everything(args.seed)
+        loader = _build_dataloader(config, config.text_encoder.model_max_length, world, rank)
         if not config.data.load_text_feat:
-            tokenizer, encoder = get_tokenizer_and_text_encoder(config.text_encoder.text_encoder_name, args.device)
+            requested = getattr(args, "text_encoder_device", "auto")
+            encoder_device = ("cpu" if world > 1 else args.device) if requested == "auto" else requested
+            if encoder_device == "cuda": encoder_device = args.device
+            tokenizer, encoder = get_tokenizer_and_text_encoder(config.text_encoder.text_encoder_name, encoder_device)
             encoder.eval().requires_grad_(False)
-
-        def dataset_batches():
-            while True:
-                seen = False
-                for raw in loader:
-                    seen = True
-                    clean, y, mask, info, camera, plucker = _extract_batch(
-                        raw, args.device, torch.float32, config.data.load_text_feat,
-                        getattr(config.data, "return_chunk_plucker", False))
-                    if not config.data.load_text_feat:
-                        with torch.no_grad():
-                            y, mask = _encode_prompts(y, tokenizer, encoder, config, args.device)
-                    if camera is None: raise ValueError("TTN training requires camera_conditions from dataset")
-                    b = {
-                        "clean_latents": clean,
-                        "y": y,
-                        "mask": mask,
-                        "data_info": to_device(info, args.device),
-                        "camera_conditions": camera,
-                        "width": clean.shape[-1],
-                        "height": clean.shape[-2]
-                    }
-                    if plucker is not None: b["chunk_plucker"] = plucker
-                    yield b
-                if not seen: raise ValueError("empty training dataset")
-
-        batches = dataset_batches()
-    k = args.tbptt or settings.get("tbptt", 2)
-    for batch in batches:
-        if step >= args.max_steps: break
-        result, timing = timed_cuda(lambda: train_update(model, config, batch, optimizer, k))
+    seed_everything(args.seed + rank)
+    if args.resume:
+        if payload.get("distributed"):
+            step, cursor = restore_training_checkpoint(args.adapter, parallel, optimizer, identity)
+        else:
+            step = load_checkpoint(args.adapter, model, optimizer, resume=True)
+    if not args.batch_file:
+        stream = ResumableBatchStream(loader, seed=args.seed, rank=rank, world=world, state=cursor)
+    if rank == 0:
+        run = {"arguments": vars(args), "parallel": mode, "world_size": world, "global_batch": world,
+               "training": identity, "base": model.base_load_report, "torch": torch.__version__,
+               "launch": getattr(args, "launch", None)}
+        (output / "run_config.json").write_text(json.dumps(run, indent=2), encoding="utf-8")
+    while step < args.max_steps:
+        if stream is not None: batch = _dataset_batch(next(stream), config, args, tokenizer, encoder, encoder_device)
+        result, timing = timed_cuda(lambda: train_update(model, config, batch, optimizer, k, parallel))
         step += 1
-        record = {
-            "step": step,
-            "stage": model.ttn_system.config.stage,
-            "loss": result["loss"],
-            "outer_grad_norm": result["outer_grad_norm"],
-            "commits": result["runtime"].commit_count,
-            "predictions": result["runtime"].predict_count,
-            "chunks": result["chunks"],
-            "tbptt": k,
-            "config": model.ttn_system.config.to_dict(),
-            "base": model.base_load_report,
-            **timing
-        }
-        json_record(output / "train.jsonl", record)
-        print(json.dumps(record))
+        record = {"step": step, "stage": model.ttn_system.config.stage, "tbptt": k,
+                  **_training_record(model, result, timing, parallel)}
+        if rank == 0:
+            json_record(output / "train.jsonl", record)
+            print(json.dumps(record), flush=True)
         if step % args.save_every == 0 or step == args.max_steps:
-            save_checkpoint(output / "last.pt", model, optimizer, step)
+            save_training_checkpoint(output / "last.pt", parallel, optimizer, step,
+                                     stream.state_dict() if stream is not None else {}, identity)
 
 
 def infer_command(args):
@@ -345,9 +402,95 @@ def smoke_command(args):
     (output / "summary.json").write_text(json.dumps(all_reports, indent=2), encoding="utf-8")
 
 
+def distributed_smoke_command(args):
+    """A/B/C two-rank updates, plain checkpoint exports and rank-zero CFG rollouts."""
+    import gc
+    from torch import distributed as dist
+    from .distributed import ParallelTraining, save_training_checkpoint, rank_world
+    rank, world = rank_world()
+    if world < 2: raise ValueError("distributed-smoke requires at least two processes")
+    if args.frames < 4 or args.frames % 3 != 1: raise ValueError("smoke uses 1+3n latent frames")
+    output = Path(args.output)
+    output.mkdir(parents=True, exist_ok=True)
+    previous = None
+    reports = []
+    for stage in args.stages:
+        seed_everything(args.seed)
+        model, config, settings = build(args, stage)
+        if previous: load_checkpoint(previous, model)
+        parallel = ParallelTraining(model, SANAFlowLoss(config), args.parallel)
+        optimizer = make_optimizer(model, settings.get("learning_rate", 1e-5))
+        seed_everything(args.seed + rank)
+        batch = load_bundle(args.batch_file.replace("{rank}", str(rank)), args.device) if args.batch_file else (
+            synthetic_bundle(config, args.device, args.frames, args.latent_height, args.latent_width))
+        if batch["clean_latents"].shape[0] != 1: raise ValueError("smoke training uses one clip per rank")
+        k = args.tbptt or settings.get("tbptt", 2)
+        result, timing = timed_cuda(lambda: train_update(model, config, batch, optimizer, k, parallel))
+        expected = len(chunk_ranges(batch["clean_latents"].shape[2])) + 1
+        if result["runtime"].commit_count != expected or result["runtime"].predict_count != expected:
+            raise AssertionError("training state counters disagree")
+        if any(len(ids) != batch["clean_latents"].shape[2] for ids in result["runtime"].committed_frame_ids):
+            raise AssertionError("training duplicate/missing writes")
+        gradients = [p.grad.to_local() if hasattr(p.grad, "to_local") else p.grad
+                     for p in model.parameters() if p.requires_grad and p.grad is not None]
+        if not gradients or not all(bool(torch.isfinite(g).all()) for g in gradients):
+            raise AssertionError("invalid training gradients")
+        train_record = _training_record(model, result, timing, parallel)
+        previous = output / stage / "last.pt"
+        save_training_checkpoint(previous, parallel, optimizer, 1, {}, {"tbptt": k, "seed": args.seed})
+        # Release the training model before rebuilding a plain inference model;
+        # otherwise a rank-zero rollout could double the model memory footprint.
+        del model, parallel, optimizer, result, batch, gradients
+        gc.collect()
+        torch.cuda.empty_cache()
+        dist.barrier()
+        if rank == 0:
+            seed_everything(args.seed)
+            model, config, _ = build(args, stage)
+            load_checkpoint(previous, model)
+            batch = load_bundle(args.batch_file.replace("{rank}", "0"), args.device) if args.batch_file else (
+                synthetic_bundle(config, args.device, args.frames, args.latent_height, args.latent_width))
+            sampled, timing = timed_cuda(lambda: rollout(model, config, batch, args.steps, args.cfg_scale,
+                                                         args.cached_blocks))
+            latents, runtime, chunks = sampled
+            report = {"stage": stage, "parallel": args.parallel, "world_size": world, "seed": args.seed,
+                      "synthetic_inputs": not bool(args.batch_file), "tbptt": k, "steps": args.steps,
+                      "cfg_scale": args.cfg_scale, "train": train_record,
+                      "rollout": {"finite": bool(torch.isfinite(latents).all()), "commits": runtime.commit_count,
+                                  "predictions": runtime.predict_count, "chunks": chunks,
+                                  "branch_state_norms": runtime.world_state.flatten(1).norm(dim=-1).tolist(), **timing}}
+            (output / stage / "summary.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+            torch.save({"latents": latents.cpu()}, output / stage / "rollout.pt")
+            reports.append(report)
+            print(json.dumps(report), flush=True)
+            del model, batch, sampled, latents, runtime
+            gc.collect()
+            torch.cuda.empty_cache()
+        dist.barrier()
+    if rank == 0: (output / "summary.json").write_text(json.dumps(reports, indent=2), encoding="utf-8")
+
+
+def distributed_check_command(args):
+    from .distributed import rank_world
+    if rank_world()[0] == 0:
+        output = Path(args.output)
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "distributed.json").write_text(json.dumps(args.launch, indent=2), encoding="utf-8")
+        print(json.dumps(args.launch), flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("train", "infer", "smoke"))
+    parser.add_argument("command", choices=("train", "infer", "smoke", "distributed-smoke", "distributed-check"))
+    parser.add_argument("--parallel", choices=("auto", "single", "ddp", "fsdp2"), default="auto",
+                        help="auto: single with one process, DDP under Slurm, otherwise native FSDP2")
+    parser.add_argument("--distributed-timeout", type=int, default=600,
+                        help="process group timeout in seconds (default: 600)")
+    parser.add_argument("--dataset-root", help="root for SANA-config relative raw data and VAE cache paths")
+    parser.add_argument("--data-dir", help="override the single configured raw zip dataset directory")
+    parser.add_argument("--vae-cache-dir", help="override the latent cache directory")
+    parser.add_argument("--text-encoder-device", choices=("auto", "cpu", "cuda"), default="auto",
+                        help="auto keeps the frozen text encoder on CPU for multi-GPU training")
     parser.add_argument("--config", default=str(ROOT / "configs/worldttn/reference.json"))
     parser.add_argument("--sana-config")
     parser.add_argument("--base-weights", help="local mirror of the specified SANA teacher, or hf:// URI")
@@ -358,7 +501,7 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=3407)
     parser.add_argument("--output", default="output/worldttn")
-    parser.add_argument("--batch-file", help="precomputed tensor bundle; see docs/ttn/RUNNING.md")
+    parser.add_argument("--batch-file", help="precomputed tensor bundle; optional {rank} expands per process")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--max-steps", type=int, default=1)
     parser.add_argument("--save-every", type=int, default=50)
@@ -372,16 +515,36 @@ def main():
     parser.add_argument("--latent-width", type=int, default=40)
     args = parser.parse_args()
     os.environ.setdefault("DISABLE_XFORMERS", "1")
+    os.environ["SANA_LOG_GLOBAL_RANK_ONLY"] = "1"
     if args.resume and not args.adapter: parser.error("--resume requires --adapter")
+    from .distributed import initialize, resolve_launch_environment, check_distributed, rank_world
+    try:
+        launch = resolve_launch_environment()
+    except ValueError as error:
+        parser.error(str(error))
     if torch.device(args.device).type != "cuda" or not torch.cuda.is_available():
         parser.error("server entrypoints require CUDA; local CPU validation is python -m pytest tests/ttn")
     if min(args.steps, args.max_steps, args.save_every) < 1: parser.error("step counts must be positive")
-    if int(os.environ.get("WORLD_SIZE", "1")) != 1 or int(os.environ.get("SANA_CP_SIZE", "1")) > 1:
-        parser.error("TTN v0.1 reference is single-card, CP=1, without FSDP")
-    torch.cuda.set_device(
-        torch.device(args.device) if torch.device(args.device).index is not None else torch.cuda.current_device())
+    if int(os.environ.get("SANA_CP_SIZE", "1")) > 1: parser.error("TTN reference requires CP=1")
+    world = launch["world_size"]
+    if args.command in ("infer", "smoke") and (world > 1 or args.parallel not in ("auto", "single")):
+        parser.error("infer/smoke are single-card; use distributed-smoke for multi-rank training checks")
+    if args.command in ("distributed-smoke", "distributed-check") and (world < 2 or args.parallel == "single"):
+        parser.error(f"{args.command} requires srun, accelerate launch or torchrun with at least two processes")
+    try:
+        args.parallel, device = initialize(args.parallel, args.device, timeout_seconds=args.distributed_timeout)
+    except ValueError as error:
+        parser.error(str(error))
+    args.device = str(device)
     seed_everything(args.seed)
-    {"train": train_command, "infer": infer_command, "smoke": smoke_command}[args.command](args)
+    try:
+        args.launch = check_distributed(device)
+        if world > 1 and args.command != "distributed-check" and rank_world()[0] == 0:
+            print(json.dumps({"distributed": args.launch}), flush=True)
+        {"train": train_command, "infer": infer_command, "smoke": smoke_command,
+         "distributed-smoke": distributed_smoke_command, "distributed-check": distributed_check_command}[args.command](args)
+    finally:
+        if torch.distributed.is_initialized(): torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__": main()

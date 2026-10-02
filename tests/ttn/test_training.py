@@ -9,6 +9,22 @@ from worldttn.training import train_clip, linear_flow_loss
 from worldttn.checkpoint import save_checkpoint, load_checkpoint, make_optimizer
 
 
+class TinyBlock(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.attn = ProjectionContract(2, 8)
+        self.ffn = nn.Linear(16, 16)
+
+    def forward(self, z, cache, context, hw, save):
+        if isinstance(self.attn, TTNAnchor):
+            result, cache = self.attn(z, HW=hw, ttn_chunk_context=context, kv_cache=cache)
+            z = z + .02 * result
+        z = z + .01 * self.ffn(z)
+        cache = list(cache)
+        if save: cache[9] = z[:, -1:].detach()
+        return z, cache
+
+
 class TinyWorldModel(nn.Module):
     """Small functional model exercising the real adapter and session contracts on CPU."""
 
@@ -16,10 +32,7 @@ class TinyWorldModel(nn.Module):
         super().__init__()
         self.blocks = nn.ModuleList()
         for _ in range(20):
-            block = nn.Module()
-            block.attn = ProjectionContract(2, 8)
-            block.ffn = nn.Linear(16, 16)
-            self.blocks.append(block)
+            self.blocks.append(TinyBlock())
         install_ttn(self, TTNConfig(heads=2, head_dim=8, generators=3, stage=stage))
         self.saved_features = []
 
@@ -28,12 +41,7 @@ class TinyWorldModel(nn.Module):
         z = x.permute(0, 2, 3, 4, 1).reshape(b, -1, c)
         caches = []
         for block, cache in zip(self.blocks, kv_cache):
-            if isinstance(block.attn, TTNAnchor):
-                result, cache = block.attn(z, HW=(f, h, w), ttn_chunk_context=ttn_chunk_context, kv_cache=cache)
-                z = z + .02 * result
-            z = z + .01 * block.ffn(z)
-            cache = list(cache)
-            if save_kv_cache: cache[9] = z[:, -1:].detach()
+            z, cache = block(z, cache, ttn_chunk_context, (f, h, w), save_kv_cache)
             caches.append(cache)
         if ttn_chunk_context.clean_mode:
             self.saved_features.append(ttn_chunk_context.candidates[0][0])
