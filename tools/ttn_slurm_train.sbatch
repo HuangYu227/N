@@ -22,11 +22,14 @@ project_root="$(cd "${PROJECT_ROOT:-${SLURM_SUBMIT_DIR:?Shared project root is r
 [[ -f "$project_root/worldttn/cli.py" ]] || { echo "Not a TTN checkout: $project_root" >&2; exit 2; }
 cd "$project_root"
 
+# The batch shell has no current training step. A STEP_NODELIST inherited
+# from the submitting interactive session can belong to a different job.
+node_list="${SLURM_JOB_NODELIST:?Slurm allocation node list is required}"
 if [[ -z "${MASTER_ADDR:-}" ]]; then
-  node_list="${SLURM_STEP_NODELIST:-${SLURM_JOB_NODELIST:?Slurm node list is required}}"
   hostnames="$(scontrol show hostnames "$node_list")"
-  MASTER_ADDR="${hostnames%%$'\n'*}"
-  [[ -n "$MASTER_ADDR" ]] || { echo 'scontrol returned an empty node list' >&2; exit 2; }
+  master_node="${hostnames%%$'\n'*}"
+  [[ -n "$master_node" ]] || { echo 'scontrol returned an empty node list' >&2; exit 2; }
+  MASTER_ADDR="$("${PYTHON:-python}" -c 'import socket, sys; print(socket.gethostbyname(sys.argv[1]))' "$master_node")"
 fi
 export MASTER_ADDR
 export MASTER_PORT="${MASTER_PORT:-$((15000 + SLURM_JOB_ID % 40000))}"
@@ -36,10 +39,15 @@ export DISABLE_XFORMERS=1
 export SANA_CP_SIZE=1
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-${SLURM_CPUS_PER_TASK:-8}}"
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
+export NCCL_SOCKET_FAMILY="${NCCL_SOCKET_FAMILY:-AF_INET}"
 # Keep Slurm's GPU mask and NCCL's network selection; user NIC overrides propagate.
 command="${COMMAND:-train}"
+default_timeout=600
+[[ "$command" != distributed-check ]] || default_timeout=120
+printf '[TTN Slurm] job=%s nodes=%s master_node=%s MASTER_ADDR=%s MASTER_PORT=%s command=%s\n' \
+  "$SLURM_JOB_ID" "$node_list" "${master_node:-explicit}" "$MASTER_ADDR" "$MASTER_PORT" "$command"
 export OUTPUT="${OUTPUT:-$project_root/output/worldttn/slurm-${SLURM_JOB_ID}-${STAGE:-A}}"
-args=("$command" --parallel ddp --distributed-timeout "${DISTRIBUTED_TIMEOUT:-600}"
+args=("$command" --parallel ddp --distributed-timeout "${DISTRIBUTED_TIMEOUT:-$default_timeout}"
       --seed "${SEED:-3407}" --output "$OUTPUT")
 case "$command" in
   train)
@@ -71,5 +79,5 @@ if [[ "${RESUME:-0}" == 1 ]]; then
   [[ "$command" == train ]] || { echo 'RESUME=1 is only supported for train' >&2; exit 2; }
   args+=(--resume)
 fi
-exec srun --mpi=none --kill-on-bad-exit=1 --ntasks="$SLURM_NTASKS" --ntasks-per-node=1 \
+exec srun --mpi=none --kill-on-bad-exit=1 --distribution=block --ntasks="$SLURM_NTASKS" --ntasks-per-node=1 \
   --gres=gpu:1 --chdir="$project_root" "${PYTHON:-python}" -u -m worldttn.cli "${args[@]}" "$@"

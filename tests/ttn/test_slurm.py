@@ -38,13 +38,24 @@ def test_slurm_step_nodes_and_explicit_master_port(monkeypatch):
         calls.append(command)
         return SimpleNamespace(stdout="ltu-hpc-3\nltu-hpc-4\nltu-hpc-5\n")
     monkeypatch.setattr(subprocess, "run", hosts)
+    monkeypatch.setattr(distributed.socket, "gethostbyname", lambda host: "10.0.0.3" if host == "ltu-hpc-3" else pytest.fail(host))
     env = slurm_env()
     env.pop("MASTER_ADDR")
     env.update(SLURM_STEP_NODELIST="ltu-hpc-[3-5]", SLURM_STEP_NUM_NODES="3",
                SLURM_NNODES="5", MASTER_PORT="23456")
     distributed.resolve_launch_environment(env)
     assert calls == [["scontrol", "show", "hostnames", "ltu-hpc-[3-5]"]]
-    assert (env["MASTER_ADDR"], env["MASTER_PORT"]) == ("ltu-hpc-3", "23456")
+    assert (env["MASTER_ADDR"], env["MASTER_PORT"]) == ("10.0.0.3", "23456")
+
+
+def test_slurm_auto_master_reports_ipv4_resolution_failure(monkeypatch):
+    from worldttn import distributed
+    monkeypatch.setattr(distributed.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(stdout="ltu-hpc-1\nltu-hpc-2\nltu-hpc-3\n"))
+    def no_ipv4(host): raise distributed.socket.gaierror("no IPv4 address")
+    monkeypatch.setattr(distributed.socket, "gethostbyname", no_ipv4)
+    env = slurm_env()
+    env.pop("MASTER_ADDR")
+    with pytest.raises(ValueError, match="IPv4"): distributed.resolve_launch_environment(env)
 
 
 @pytest.mark.parametrize("change,match", [
@@ -320,20 +331,26 @@ def test_sbatch_executes_one_srun_with_shared_master_and_preserves_gpu_mask(tmp_
     writer.write_text("import json, os, sys\nfrom pathlib import Path\n"
                       "Path(os.environ['CAPTURE']).write_text(json.dumps({'args': sys.argv[1:], 'env': "
                       "{k: os.environ.get(k) for k in ('MASTER_ADDR', 'MASTER_PORT', 'CUDA_VISIBLE_DEVICES', "
-                      "'NCCL_SOCKET_IFNAME', 'OUTPUT')}}))\n")
+                      "'NCCL_SOCKET_IFNAME', 'NCCL_SOCKET_FAMILY', 'OUTPUT')}}))\n")
     mock_bin = tmp_path / "bin"
     mock_bin.mkdir()
-    for name, content in {"scontrol": "#!/usr/bin/env bash\nprintf 'ltu-hpc-1\\nltu-hpc-2\\nltu-hpc-3\\n'\n",
-                          "srun": '#!/usr/bin/env bash\nexec "$PYTHON" "$CAPTURE_WRITER" "$@"\n'}.items():
+    for name, content in {
+        "scontrol": "#!/usr/bin/env bash\nif [[ \"$3\" == ltu-hpc-2 ]]; then printf 'ltu-hpc-2\\n'; else printf 'ltu-hpc-1\\nltu-hpc-2\\nltu-hpc-3\\n'; fi\n",
+        "python-for-ttn": "#!/usr/bin/env bash\n[[ \"$1\" == -c ]] || exit 99\nif [[ \"$3\" == ltu-hpc-1 ]]; then printf '10.0.0.1\\n'; else printf '10.0.0.2\\n'; fi\n",
+        "srun": '#!/usr/bin/env bash\nexec "$REAL_PYTHON" "$CAPTURE_WRITER" "$@"\n'
+    }.items():
         stub = mock_bin / name
         stub.write_text(content, encoding="utf-8", newline="\n")
         stub.chmod(0o755)
     env = {key: value for key, value in os.environ.items()
            if not key.startswith("SLURM_") and key not in ("MASTER_ADDR", "MASTER_PORT", "DATASET_ROOT", "BATCH_FILE",
-                                                         "ADAPTER", "RESUME", "OUTPUT", "PYTHON", "CONFIG", "BASE_WEIGHTS")}
+                                                         "ADAPTER", "RESUME", "OUTPUT", "PYTHON", "CONFIG", "BASE_WEIGHTS",
+                                                         "DISTRIBUTED_TIMEOUT", "NCCL_SOCKET_FAMILY")}
     env.update(SLURM_JOB_ID="12345", SLURM_NTASKS="3", SLURM_JOB_NODELIST="ltu-hpc-[1-3]",
                SLURM_SUBMIT_DIR=root.as_posix(), PROJECT_ROOT=root.as_posix(), COMMAND=command,
-               PYTHON=Path(sys.executable).as_posix(), CAPTURE=capture.as_posix(), CAPTURE_WRITER=writer.as_posix(),
+               SLURM_STEP_NODELIST="ltu-hpc-2", SLURM_STEP_NUM_NODES="1",
+               PYTHON=(mock_bin / "python-for-ttn").as_posix(), REAL_PYTHON=Path(sys.executable).as_posix(),
+               CAPTURE=capture.as_posix(), CAPTURE_WRITER=writer.as_posix(),
                MOCK_BIN=mock_bin.as_posix(),
                SCRIPT=(root / "tools/ttn_slurm_train.sbatch").as_posix(),
                CUDA_VISIBLE_DEVICES="GPU-slurm-mask", NCCL_SOCKET_IFNAME="=eth-test", STAGE="C")
@@ -349,7 +366,11 @@ def test_sbatch_executes_one_srun_with_shared_master_and_preserves_gpu_mask(tmp_
     assert "--mpi=none" in args and "--kill-on-bad-exit=1" in args
     assert args[args.index("-m") + 1:args.index("-m") + 4] == ["worldttn.cli", command, "--parallel"]
     assert args[args.index("--parallel") + 1] == "ddp"
-    assert exported["MASTER_ADDR"] == "ltu-hpc-1" and exported["MASTER_PORT"] == "27345"
+    assert exported["MASTER_ADDR"] == "10.0.0.1" and exported["MASTER_PORT"] == "27345"
+    assert "master_node=ltu-hpc-1" in result.stdout
+    assert "--distribution=block" in args
+    assert exported["NCCL_SOCKET_FAMILY"] == "AF_INET"
+    assert args[args.index("--distributed-timeout") + 1] == ("120" if command == "distributed-check" else "600")
     assert exported["CUDA_VISIBLE_DEVICES"] == "GPU-slurm-mask" and exported["NCCL_SOCKET_IFNAME"] == "=eth-test"
     assert exported["OUTPUT"].endswith("slurm-12345-C")
     assert ("--resume" in args) == (command == "train")

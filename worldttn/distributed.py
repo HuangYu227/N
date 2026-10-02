@@ -78,7 +78,11 @@ def resolve_launch_environment(environ=None):
         nodes = number(count_name) if count_name else len(hosts)
         if world != nodes or node_rank < 0:
             raise ValueError("Slurm TTN requires one task per node: task count must equal node count")
-        master = master or hosts[0]
+        if not master:
+            try:
+                master = socket.gethostbyname(hosts[0])
+            except OSError as error:
+                raise ValueError(f"cannot resolve IPv4 address for Slurm master {hosts[0]}: {error}") from error
         if port is None:
             try: port = str(15000 + int(job_id) % 40000)
             except (TypeError, ValueError):
@@ -134,6 +138,10 @@ def initialize(mode="auto", device="cuda", *, timeout_seconds=600):
         torch.cuda.set_device(index)
         device = torch.device("cuda", index)
     if world > 1 and not dist.is_initialized():
+        if rank == 0:
+            print(f"[TTN init] host={socket.gethostname()} rank=0 local_rank={launch['local_rank']} "
+                  f"world_size={world} device={device} master={launch['master_addr']}:{launch['master_port']} "
+                  f"timeout={timeout_seconds}s", flush=True)
         options = {"device_id": device} if device.type == "cuda" else {}
         dist.init_process_group(backend="nccl" if device.type == "cuda" else "gloo", init_method="env://",
                                 rank=rank, world_size=world, timeout=timedelta(seconds=timeout_seconds), **options)
