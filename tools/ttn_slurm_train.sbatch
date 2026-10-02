@@ -9,8 +9,8 @@
 #SBATCH --time=00:30:00
 #SBATCH --output=slurm-%x-%j.out
 
-# Submit from the shared checkout root with an activated environment, or set
-# PROJECT_ROOT and PYTHON to shared absolute paths. Override resources with
+# Activate the existing $ROOT/envs/worldttn prefix environment and explicitly
+# export PYTHON=$ROOT/envs/worldttn/bin/python. Override resources with
 # sbatch --nodes=... --time=... . The script needs no Accelerate configuration.
 # COMMAND=distributed-check sbatch tools/ttn_slurm_train.sbatch
 # COMMAND=distributed-smoke TBPTT=1 sbatch tools/ttn_slurm_train.sbatch
@@ -21,6 +21,14 @@ set -euo pipefail
 project_root="$(cd "${PROJECT_ROOT:-${SLURM_SUBMIT_DIR:?Shared project root is required}}" && pwd)"
 [[ -f "$project_root/worldttn/cli.py" ]] || { echo "Not a TTN checkout: $project_root" >&2; exit 2; }
 cd "$project_root"
+source "$project_root/tools/ttn_cache_env.sh"
+export PYTHON="${PYTHON:?Set PYTHON to $ROOT/envs/worldttn/bin/python}"
+[[ "$PYTHON" == "$ROOT/envs/worldttn/bin/python" && -x "$PYTHON" ]] || {
+  echo "PYTHON must be the existing executable $ROOT/envs/worldttn/bin/python; got $PYTHON" >&2
+  exit 2
+}
+printf '[TTN cache] ROOT=%s PIP_CACHE_DIR=%s HF_HOME=%s TORCH_HOME=%s PYTHON=%s\n' \
+  "$ROOT" "$PIP_CACHE_DIR" "$HF_HOME" "$TORCH_HOME" "$PYTHON"
 
 # The batch shell has no current training step. A STEP_NODELIST inherited
 # from the submitting interactive session can belong to a different job.
@@ -29,7 +37,7 @@ if [[ -z "${MASTER_ADDR:-}" ]]; then
   hostnames="$(scontrol show hostnames "$node_list")"
   master_node="${hostnames%%$'\n'*}"
   [[ -n "$master_node" ]] || { echo 'scontrol returned an empty node list' >&2; exit 2; }
-  MASTER_ADDR="$("${PYTHON:-python}" -c 'import socket, sys; print(socket.gethostbyname(sys.argv[1]))' "$master_node")"
+  MASTER_ADDR="$("$PYTHON" -c 'import socket, sys; print(socket.gethostbyname(sys.argv[1]))' "$master_node")"
 fi
 export MASTER_ADDR
 export MASTER_PORT="${MASTER_PORT:-$((15000 + SLURM_JOB_ID % 40000))}"
@@ -80,4 +88,4 @@ if [[ "${RESUME:-0}" == 1 ]]; then
   args+=(--resume)
 fi
 exec srun --mpi=none --kill-on-bad-exit=1 --distribution=block --ntasks="$SLURM_NTASKS" --ntasks-per-node=1 \
-  --gres=gpu:1 --chdir="$project_root" "${PYTHON:-python}" -u -m worldttn.cli "${args[@]}" "$@"
+  --gres=gpu:1 --chdir="$project_root" "$PYTHON" -u -m worldttn.cli "${args[@]}" "$@"

@@ -314,8 +314,26 @@ def test_three_slurm_ranks_initialize_train_save_resume_and_keep_state_local(tmp
     assert run["launch"]["all_reduce_sum"] == 6
 
 
+def test_check_reports_actual_python_and_cache_environment(monkeypatch):
+    import sys
+    from worldttn import distributed
+    install_environment(monkeypatch, {})
+    monkeypatch.setenv("ROOT", "/shared/personal")
+    monkeypatch.setenv("HF_HOME", "/shared/personal/.cache/huggingface")
+    monkeypatch.setattr(distributed.dist, "is_initialized", lambda: False)
+    report = distributed.check_distributed("cpu")
+    record = report["ranks"][0]
+    assert record["python"] == sys.executable
+    assert record["python_version"] == sys.version.split()[0]
+    assert record["torch"] == str(torch.__version__)
+    assert record["cache"]["ROOT"] == "/shared/personal"
+    assert record["cache"]["HF_HOME"] == "/shared/personal/.cache/huggingface"
+
+
 @pytest.mark.parametrize("command", ["distributed-check", "distributed-smoke", "train"])
-def test_sbatch_executes_one_srun_with_shared_master_and_preserves_gpu_mask(tmp_path, command):
+@pytest.mark.parametrize("custom_root", [False, True])
+@pytest.mark.parametrize("python_mode", ["valid", "missing", "base"])
+def test_sbatch_executes_one_srun_with_shared_master_and_preserves_gpu_mask(tmp_path, command, custom_root, python_mode):
     import json
     import shutil
     import subprocess
@@ -326,17 +344,32 @@ def test_sbatch_executes_one_srun_with_shared_master_and_preserves_gpu_mask(tmp_
         if not candidate: pytest.skip("Bash not installed")
         bash = Path(candidate)
     root = Path(__file__).resolve().parents[2]
+    project = tmp_path / "shared parent" / "WorldTTN"
+    (project / "worldttn").mkdir(parents=True)
+    (project / "worldttn/cli.py").touch()
+    (project / "tools").mkdir()
+    shutil.copyfile(root / "tools/ttn_cache_env.sh", project / "tools/ttn_cache_env.sh")
+    personal_root = tmp_path / "personal shared root" if custom_root else project.parent
+    python = personal_root / "envs/worldttn/bin/python"
+    python.parent.mkdir(parents=True)
+    python.write_text("#!/usr/bin/env bash\n[[ \"$1\" == -c ]] || exit 99\n"
+                      "if [[ \"$3\" == ltu-hpc-1 ]]; then printf '10.0.0.1\\n'; else printf '10.0.0.2\\n'; fi\n",
+                      encoding="utf-8", newline="\n")
+    python.chmod(0o755)
     capture = tmp_path / "capture.json"
+    cache_names = ("XDG_CACHE_HOME", "PIP_CACHE_DIR", "HF_HOME", "HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE",
+                   "HF_DATASETS_CACHE", "HF_XET_CACHE", "HF_ASSETS_CACHE", "TRANSFORMERS_CACHE",
+                   "TORCH_HOME", "TORCH_EXTENSIONS_DIR", "TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR",
+                   "CUDA_CACHE_PATH")
     writer = tmp_path / "capture.py"
     writer.write_text("import json, os, sys\nfrom pathlib import Path\n"
                       "Path(os.environ['CAPTURE']).write_text(json.dumps({'args': sys.argv[1:], 'env': "
                       "{k: os.environ.get(k) for k in ('MASTER_ADDR', 'MASTER_PORT', 'CUDA_VISIBLE_DEVICES', "
-                      "'NCCL_SOCKET_IFNAME', 'NCCL_SOCKET_FAMILY', 'OUTPUT')}}))\n")
+                      f"'NCCL_SOCKET_IFNAME', 'NCCL_SOCKET_FAMILY', 'OUTPUT', 'ROOT', 'PYTHON', {', '.join(repr(k) for k in cache_names)})}}}}))\n")
     mock_bin = tmp_path / "bin"
     mock_bin.mkdir()
     for name, content in {
         "scontrol": "#!/usr/bin/env bash\nif [[ \"$3\" == ltu-hpc-2 ]]; then printf 'ltu-hpc-2\\n'; else printf 'ltu-hpc-1\\nltu-hpc-2\\nltu-hpc-3\\n'; fi\n",
-        "python-for-ttn": "#!/usr/bin/env bash\n[[ \"$1\" == -c ]] || exit 99\nif [[ \"$3\" == ltu-hpc-1 ]]; then printf '10.0.0.1\\n'; else printf '10.0.0.2\\n'; fi\n",
         "srun": '#!/usr/bin/env bash\nexec "$REAL_PYTHON" "$CAPTURE_WRITER" "$@"\n'
     }.items():
         stub = mock_bin / name
@@ -345,20 +378,32 @@ def test_sbatch_executes_one_srun_with_shared_master_and_preserves_gpu_mask(tmp_
     env = {key: value for key, value in os.environ.items()
            if not key.startswith("SLURM_") and key not in ("MASTER_ADDR", "MASTER_PORT", "DATASET_ROOT", "BATCH_FILE",
                                                          "ADAPTER", "RESUME", "OUTPUT", "PYTHON", "CONFIG", "BASE_WEIGHTS",
-                                                         "DISTRIBUTED_TIMEOUT", "NCCL_SOCKET_FAMILY")}
+                                                         "DISTRIBUTED_TIMEOUT", "NCCL_SOCKET_FAMILY", "ROOT")}
+    env.update({name: "/home/ad/z2zhang/stale-cache" for name in cache_names})
+    if custom_root: env["ROOT"] = personal_root.as_posix()
     env.update(SLURM_JOB_ID="12345", SLURM_NTASKS="3", SLURM_JOB_NODELIST="ltu-hpc-[1-3]",
-               SLURM_SUBMIT_DIR=root.as_posix(), PROJECT_ROOT=root.as_posix(), COMMAND=command,
+               SLURM_SUBMIT_DIR=project.as_posix(), PROJECT_ROOT=project.as_posix(), COMMAND=command,
                SLURM_STEP_NODELIST="ltu-hpc-2", SLURM_STEP_NUM_NODES="1",
-               PYTHON=(mock_bin / "python-for-ttn").as_posix(), REAL_PYTHON=Path(sys.executable).as_posix(),
+               REAL_PYTHON=Path(sys.executable).as_posix(),
                CAPTURE=capture.as_posix(), CAPTURE_WRITER=writer.as_posix(),
                MOCK_BIN=mock_bin.as_posix(),
                SCRIPT=(root / "tools/ttn_slurm_train.sbatch").as_posix(),
                CUDA_VISIBLE_DEVICES="GPU-slurm-mask", NCCL_SOCKET_IFNAME="=eth-test", STAGE="C")
+    env["PYTHON_MODE"] = python_mode
+    if python_mode == "base": env["PYTHON"] = "/data/group/zhaolab/project/miniconda/bin/python"
     if command == "train":
         env.update(DATASET_ROOT=(tmp_path / "shared data").as_posix(), ADAPTER=(tmp_path / "last.pt").as_posix(), RESUME="1")
-    shell = 'export PATH="$(cd "$MOCK_BIN" && pwd):$PATH"; bash "$SCRIPT"'
+    shell = ('export MSYS_NO_PATHCONV=1; export MSYS2_ENV_CONV_EXCL="*"; '
+             'export PATH="$(cd "$MOCK_BIN" && pwd):$PATH"; '
+             'if [[ "$PYTHON_MODE" == valid ]]; then '
+             'export PYTHON="${ROOT:-$(cd "$PROJECT_ROOT/.." && pwd)}/envs/worldttn/bin/python"; fi; bash "$SCRIPT"')
     result = subprocess.run([str(bash), "-c", shell], env=env, capture_output=True, text=True,
                             encoding="utf-8", errors="replace")
+    if python_mode != "valid":
+        assert result.returncode != 0
+        assert "PYTHON" in result.stderr and "envs/worldttn/bin/python" in result.stderr
+        assert not capture.exists(), "invalid environment must fail before srun"
+        return
     assert result.returncode == 0, result.stderr
     record = json.loads(capture.read_text())
     args, exported = record["args"], record["env"]
@@ -372,6 +417,17 @@ def test_sbatch_executes_one_srun_with_shared_master_and_preserves_gpu_mask(tmp_
     assert exported["NCCL_SOCKET_FAMILY"] == "AF_INET"
     assert args[args.index("--distributed-timeout") + 1] == ("120" if command == "distributed-check" else "600")
     assert exported["CUDA_VISIBLE_DEVICES"] == "GPU-slurm-mask" and exported["NCCL_SOCKET_IFNAME"] == "=eth-test"
+    cache_root = exported["ROOT"]
+    assert cache_root is not None
+    if custom_root: assert cache_root == env["ROOT"]
+    else: assert cache_root.endswith("/" + project.parent.name)
+    assert exported["PYTHON"] == cache_root + "/envs/worldttn/bin/python"
+    suffixes = ("", "/pip", "/huggingface", "/huggingface/hub", "/huggingface/hub",
+                "/huggingface/datasets", "/huggingface/xet", "/huggingface/assets", "/huggingface/hub",
+                "/torch", "/torch/extensions", "/torch/inductor", "/triton", "/cuda")
+    for name, suffix in zip(cache_names, suffixes):
+        assert exported[name] == cache_root + "/.cache" + suffix, name
+    assert "[TTN cache]" in result.stdout
     assert exported["OUTPUT"].endswith("slurm-12345-C")
     assert ("--resume" in args) == (command == "train")
     assert ("--dataset-root" in args) == (command == "train")
