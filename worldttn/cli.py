@@ -565,8 +565,10 @@ def diagnose_update_command(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("train", "infer", "smoke", "distributed-smoke", "distributed-check", "diagnose-update", "evaluate"))
+    parser.add_argument("command", choices=("train", "infer", "smoke", "distributed-smoke", "distributed-check", "diagnose-update", "evaluate", "align-chunk"))
     parser.add_argument("--training-run", help="completed training output directory; evaluate restores its config")
+    parser.add_argument("--alignment-timesteps", type=int, nargs="+", default=[0, 250, 500, 750, 999],
+                        help="align-chunk: fixed training-schedule indices, paired GT/noise, no CFG")
     parser.add_argument("--eval-cases", type=int, default=1, help="deterministic unique example clips, diagnostic only")
     parser.add_argument("--revisit-min-gap", type=int, default=30, help="minimum revisit separation in latent frames")
     parser.add_argument("--revisit-distance-fraction", type=float, default=.02, help="pose distance / trajectory extent")
@@ -621,6 +623,13 @@ def main():
             parser.error("evaluate reads real zip data from --training-run; no --batch-file or --resume")
         if args.frames < 4 or args.frames % 3 != 1 or args.eval_cases < 1:
             parser.error("evaluate requires positive cases and 1+3n latent frames")
+    if args.command == "align-chunk":
+        if not args.training_run or args.frames != 4 or args.eval_cases < 1:
+            parser.error("align-chunk requires --training-run, --frames 4 and positive --eval-cases")
+        if args.batch_file or args.resume or args.steps is not None:
+            parser.error("align-chunk uses real GT data without a sampler, --batch-file, --steps or --resume")
+        if min(args.alignment_timesteps) < 0 or len(set(args.alignment_timesteps)) != len(args.alignment_timesteps):
+            parser.error("align-chunk requires distinct nonnegative timesteps")
     if args.steps is None: args.steps = 4
     if args.diagnostic_unmask_all_valid and (args.command != "diagnose-update" or args.batch_file):
         parser.error("--diagnostic-unmask-all-valid requires synthetic diagnose-update without --batch-file")
@@ -644,8 +653,8 @@ def main():
     if min(args.steps, args.max_steps, args.save_every) < 1: parser.error("step counts must be positive")
     if int(os.environ.get("SANA_CP_SIZE", "1")) > 1: parser.error("TTN reference requires CP=1")
     world = launch["world_size"]
-    if args.command in ("infer", "smoke", "evaluate") and (world > 1 or args.parallel not in ("auto", "single")):
-        parser.error("infer/smoke/evaluate are single-card; use distributed-smoke for multi-rank training checks")
+    if args.command in ("infer", "smoke", "evaluate", "align-chunk") and (world > 1 or args.parallel not in ("auto", "single")):
+        parser.error("infer/smoke/evaluate/align-chunk are single-card; use distributed-smoke for multi-rank training checks")
     if args.command in ("distributed-smoke", "distributed-check") and (world < 2 or args.parallel == "single"):
         parser.error(f"{args.command} requires srun, accelerate launch or torchrun with at least two processes")
     try:
@@ -659,7 +668,9 @@ def main():
         if world > 1 and args.command != "distributed-check" and rank_world()[0] == 0:
             print(json.dumps({"distributed": args.launch}), flush=True)
         from .evaluation import evaluate_command
+        from .alignment import alignment_command
         {"train": train_command, "infer": infer_command, "smoke": smoke_command, "evaluate": evaluate_command,
+         "align-chunk": alignment_command,
          "distributed-smoke": distributed_smoke_command, "distributed-check": distributed_check_command,
          "diagnose-update": diagnose_update_command}[args.command](args)
     finally:

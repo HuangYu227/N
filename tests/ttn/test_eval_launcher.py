@@ -9,7 +9,7 @@ import sys
 import pytest
 
 
-@pytest.mark.parametrize("mode", ["valid", "base-python", "multi-node"])
+@pytest.mark.parametrize("mode", ["valid", "align-chunk", "base-python", "multi-node"])
 def test_eval_launcher_uses_prefix_python_one_task_and_existing_local_cache_worker(tmp_path, mode):
     bash = Path("D:/Git/bin/bash.exe")
     if not bash.exists():
@@ -49,20 +49,26 @@ def test_eval_launcher_uses_prefix_python_one_task_and_existing_local_cache_work
                CUDA_VISIBLE_DEVICES="GPU-slurm-mask", GDN_DISABLE_COMPILE="1",
                REAL_PYTHON=Path(sys.executable).as_posix(), WRITER=writer.as_posix(), CAPTURE=capture.as_posix(),
                SCRIPT=(root / "tools/ttn_slurm_eval.sbatch").as_posix(), MOCK_BIN=bins.as_posix())
-    for name in ("OUTPUT", "FRAMES", "STEPS", "ADAPTER", "BASE_WEIGHTS", "SANA_CONFIG", "CONFIG", "CROSS_ATTN_BACKEND"):
+    for name in ("OUTPUT", "FRAMES", "STEPS", "ADAPTER", "BASE_WEIGHTS", "SANA_CONFIG", "CONFIG", "CROSS_ATTN_BACKEND", "COMMAND"):
         env.pop(name, None)
+    if mode == "align-chunk": env["COMMAND"] = "align-chunk"
     shell = 'export MSYS_NO_PATHCONV=1 MSYS2_ENV_CONV_EXCL="*"; export PATH="$(cd "$MOCK_BIN" && pwd):$PATH"; bash "$SCRIPT"'
     result = subprocess.run([str(bash), "-c", shell], env=env, capture_output=True, text=True,
                             encoding="utf-8", errors="replace", timeout=30)
-    if mode != "valid":
+    if mode not in ("valid", "align-chunk"):
         assert result.returncode != 0 and not capture.exists()
         return
     assert result.returncode == 0, result.stderr
     record = json.loads(capture.read_text())
     args, exported = record["args"], record["env"]
     for flag in ("--nodes=1", "--ntasks=1", "--gres=gpu:1", "--mpi=none"): assert flag in args
-    for flag, value in (("--parallel", "single"), ("--frames", "61"), ("--steps", "20"), ("--cross-attn-backend", "math")):
+    for flag, value in (("--parallel", "single"), ("--frames", "4" if mode == "align-chunk" else "61"), ("--cross-attn-backend", "math")):
         assert args[args.index(flag) + 1] == value
+    if mode == "align-chunk":
+        assert "align-chunk" in args and "--steps" not in args
+        assert args[args.index("--output") + 1].endswith("/align-12345")
+    else:
+        assert args[args.index("--steps") + 1] == "20"
     assert args[args.index("bash") + 1].endswith("/tools/ttn_slurm_worker.sh")
     assert exported["PYTHON"] == env["PYTHON"] and exported["CUDA_VISIBLE_DEVICES"] == env["CUDA_VISIBLE_DEVICES"]
     assert exported["RANK"] is None and exported["MASTER_ADDR"] is None

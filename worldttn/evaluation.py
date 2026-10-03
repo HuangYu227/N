@@ -199,21 +199,11 @@ def select_cases(dataset, frames, count, seed, revisit_options):
     return cases, rejected
 
 
-def evaluate_command(args):
-    from .cli import ROOT, read_reference, rollout, timed_cuda, seed_everything, json_record, to_device
-    from .sana import build_sana, configure_cross_attention, resolve_data_paths
-    from .checkpoint import load_checkpoint
-    from diffusion.data.datasets.video.sana_wm_zip_latent_data import SanaWMZipLatentDataset
-    from diffusion.model.builder import get_tokenizer_and_text_encoder
-    from train_video_scripts.train_sana_wm_stage1 import _encode_prompts
-    from torch.utils.data import default_collate
-
-    output, training_run = Path(args.output).resolve(), Path(args.training_run).resolve()
-    if output.exists(): raise ValueError(f"use a new evaluation output directory: {output}")
-    if os.environ.get("SANA_WM_STAGE1_KV_SAVE_STRIDE", "1") != "1":
-        raise ValueError("paired TTN evaluation requires SANA_WM_STAGE1_KV_SAVE_STRIDE=1")
-    if args.cached_blocks == 0 or args.cached_blocks < -1:
-        raise ValueError("--cached-blocks must be -1 (unbounded) or positive")
+def load_evaluation_run(args):
+    """Shared identity/config validation for rollout and teacher-forcing probes."""
+    from .cli import ROOT, read_reference
+    from .sana import resolve_data_paths
+    training_run = Path(args.training_run).resolve()
     run = json.loads((training_run / "run_config.json").read_text())
     adapter = Path(args.adapter or training_run / "last.pt").resolve()
     adapter_digest = file_sha256(adapter)
@@ -221,7 +211,7 @@ def evaluate_command(args):
     if payload.get("format") != "TTN-SANA-WM-v0.1" or payload.get("base_revision") != BASE_REVISION:
         raise ValueError("not a compatible TTN checkpoint")
     ttn = TTNConfig(**payload["config"])
-    if args.stage and args.stage != ttn.stage: raise ValueError("evaluate must retain the checkpoint stage")
+    if args.stage and args.stage != ttn.stage: raise ValueError("diagnostics must retain the checkpoint stage")
     if payload["stage"] != ttn.stage or run["base"]["sha256"] != payload["base_sha256"]:
         raise ValueError("training run and checkpoint identities disagree")
     last_train = json.loads((training_run / "train.jsonl").read_text().splitlines()[-1])
@@ -234,6 +224,11 @@ def evaluate_command(args):
     if args.dataset_root: resolve_data_paths(config, args.dataset_root)
     if args.data_dir or args.vae_cache_dir:
         raise ValueError("evaluate restores training data paths; only --dataset-root is supported")
+    return run, config, ttn, adapter, adapter_digest, last_train
+
+
+def load_evaluation_cases(config, args):
+    from diffusion.data.datasets.video.sana_wm_zip_latent_data import SanaWMZipLatentDataset
     data = asdict(config.data)
     data.update(num_frames=(args.frames - 1) * config.data.vae_ratio[0] + 1,
                 data_repeat=1, sort_dataset=True, shuffle_dataset=False)
@@ -241,6 +236,25 @@ def evaluate_command(args):
     revisit_options = {"min_gap": args.revisit_min_gap, "distance_fraction": args.revisit_distance_fraction,
                        "angle_deg": args.revisit_angle_deg, "max_pairs": args.revisit_max_pairs}
     cases, rejected = select_cases(dataset, args.frames, args.eval_cases, args.seed, revisit_options)
+    return cases, rejected, revisit_options
+
+
+def evaluate_command(args):
+    from .cli import rollout, timed_cuda, seed_everything, json_record, to_device
+    from .sana import build_sana, configure_cross_attention
+    from .checkpoint import load_checkpoint
+    from diffusion.model.builder import get_tokenizer_and_text_encoder
+    from train_video_scripts.train_sana_wm_stage1 import _encode_prompts
+    from torch.utils.data import default_collate
+
+    output, training_run = Path(args.output).resolve(), Path(args.training_run).resolve()
+    if output.exists(): raise ValueError(f"use a new evaluation output directory: {output}")
+    if os.environ.get("SANA_WM_STAGE1_KV_SAVE_STRIDE", "1") != "1":
+        raise ValueError("paired TTN evaluation requires SANA_WM_STAGE1_KV_SAVE_STRIDE=1")
+    if args.cached_blocks == 0 or args.cached_blocks < -1:
+        raise ValueError("--cached-blocks must be -1 (unbounded) or positive")
+    run, config, ttn, adapter, adapter_digest, last_train = load_evaluation_run(args)
+    cases, rejected, revisit_options = load_evaluation_cases(config, args)
     output.mkdir(parents=True)
     tokenizer, encoder = get_tokenizer_and_text_encoder(config.text_encoder.text_encoder_name, "cpu")
     encoder.eval().requires_grad_(False)
@@ -257,7 +271,7 @@ def evaluate_command(args):
         if case["plucker"] is not None: case["input_sha256"]["plucker"] = tensor_sha256(case["plucker"])
         torch.save({"clean_latents": case["reference"], "camera_conditions": case["camera"],
                     "prompt": case["prompt"], "revisit_pairs": case["revisit_pairs"]}, output / f"case-{index:03d}-reference.pt")
-    del tokenizer, encoder, dataset, payload
+    del tokenizer, encoder
     gc.collect()
     manifest = [{k: v for k, v in case.items() if k not in ("reference", "camera", "plucker", "y", "mask", "info")}
                 for case in cases]

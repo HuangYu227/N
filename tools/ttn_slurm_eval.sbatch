@@ -15,6 +15,8 @@
 # schedule, not the 4-step engineering smoke nor a claim of optimal quality.
 # TRAINING_RUN=/shared/WorldTTN/output/worldttn/slurm-423058-A \
 #   sbatch tools/ttn_slurm_eval.sbatch
+# COMMAND=align-chunk uses the same environment for a 4-latent GT-only probe;
+# it compares same-input anchors and native flow predictions, without sampling.
 set -euo pipefail
 : "${SLURM_JOB_ID:?Submit with sbatch}"
 : "${TRAINING_RUN:?Set TRAINING_RUN to the completed training output directory}"
@@ -38,17 +40,25 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-${SLURM_CPUS_PER_TASK:-8}}"
 export GDN_DISABLE_COMPILE="${GDN_DISABLE_COMPILE:-1}"
 export GDN_DISABLE_COMPLEX_COMPILE="${GDN_DISABLE_COMPLEX_COMPILE:-0}"
 export DPM_TQDM=True
-output="${OUTPUT:-$project_root/output/worldttn/eval-${SLURM_JOB_ID}}"
-args=(evaluate --parallel single --training-run "$TRAINING_RUN" --output "$output"
-      --frames "${FRAMES:-61}" --steps "${STEPS:-20}" --eval-cases "${EVAL_CASES:-1}"
-      --seed "${SEED:-3407}" --cfg-scale "${CFG_SCALE:-4.5}" --cached-blocks "${CACHED_BLOCKS:-2}"
+command="${COMMAND:-evaluate}"
+case "$command" in
+  evaluate) frames="${FRAMES:-61}"; suffix=eval ;;
+  align-chunk) frames="${FRAMES:-4}"; suffix=align ;;
+  *) echo 'COMMAND must be evaluate or align-chunk' >&2; exit 2 ;;
+esac
+output="${OUTPUT:-$project_root/output/worldttn/${suffix}-${SLURM_JOB_ID}}"
+args=("$command" --parallel single --training-run "$TRAINING_RUN" --output "$output"
+      --frames "$frames" --eval-cases "${EVAL_CASES:-1}" --seed "${SEED:-3407}"
       --cross-attn-backend "${CROSS_ATTN_BACKEND:-math}")
+if [[ "$command" == evaluate ]]; then
+  args+=(--steps "${STEPS:-20}" --cfg-scale "${CFG_SCALE:-4.5}" --cached-blocks "${CACHED_BLOCKS:-2}")
+fi
 [[ -z "${ADAPTER:-}" ]] || args+=(--adapter "$ADAPTER")
 [[ -z "${BASE_WEIGHTS:-}" ]] || args+=(--base-weights "$BASE_WEIGHTS")
 [[ -z "${SANA_CONFIG:-}" ]] || args+=(--sana-config "$SANA_CONFIG")
 [[ -z "${CONFIG:-}" ]] || args+=(--config "$CONFIG")
-printf '[TTN eval Slurm] job=%s TRAINING_RUN=%s frames=%s steps=%s OUTPUT=%s PYTHON=%s\n' \
-  "$SLURM_JOB_ID" "$TRAINING_RUN" "${FRAMES:-61}" "${STEPS:-20}" "$output" "$PYTHON"
+printf '[TTN eval Slurm] job=%s command=%s TRAINING_RUN=%s frames=%s OUTPUT=%s PYTHON=%s\n' \
+  "$SLURM_JOB_ID" "$command" "$TRAINING_RUN" "$frames" "$output" "$PYTHON"
 # The same worker as training creates private node-local /tmp compiler caches.
 exec srun --mpi=none --kill-on-bad-exit=1 --nodes=1 --ntasks=1 --ntasks-per-node=1 \
   --gres=gpu:1 --chdir="$project_root" bash "$project_root/tools/ttn_slurm_worker.sh" "${args[@]}" "$@"
