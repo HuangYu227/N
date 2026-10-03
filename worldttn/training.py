@@ -203,7 +203,13 @@ def train_clip(model,
     runner = parallel.window if parallel else window_model
     if runner is None: runner = TTNTrainingWindow(model, loss_fn)
     if parallel: parallel.validate_schedule(frames, tbptt, len(episode.ranges), b)
-    with torch.no_grad():
+    # PyTorch 2.9 caches FP32 -> BF16 weights without grad_fn when their first
+    # use is under no_grad. Prefill and training share the caller's AMP scope,
+    # so keep prefill out of that weight cache; training still uses caching.
+    with torch.no_grad(), torch.autocast(device_type=clean.device.type,
+                                        enabled=torch.is_autocast_enabled(clean.device.type),
+                                        dtype=torch.get_autocast_dtype(clean.device.type),
+                                        cache_enabled=False):
         runner(episode, prefill=True)
     if parallel: parallel.reshard()
     runtime.detach()  # initial observed prefill is a boundary before generated-chunk windows
