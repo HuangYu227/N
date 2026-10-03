@@ -410,6 +410,7 @@ def test_sbatch_executes_one_srun_with_shared_master_and_preserves_gpu_mask(tmp_
     if python_mode == "base": env["PYTHON"] = "/data/group/zhaolab/project/miniconda/bin/python"
     if command == "train":
         env.update(DATASET_ROOT=(tmp_path / "shared data").as_posix(), ADAPTER=(tmp_path / "last.pt").as_posix(), RESUME="1")
+        env.update(TRAIN_SCOPE="dit" if custom_root else "ttn", BACKBONE_LR="2e-6")
     env.pop("CROSS_ATTN_BACKEND", None)
     env.pop("DIAGNOSTIC_UNMASK_ALL_VALID", None)
     if command == "diagnose-update":
@@ -441,6 +442,11 @@ def test_sbatch_executes_one_srun_with_shared_master_and_preserves_gpu_mask(tmp_
         assert args[args.index("--cross-attn-backend") + 1] == env.get("CROSS_ATTN_BACKEND", "auto")
     else:
         assert "--activation-offload" not in args and "--memory-trace" not in args
+    if command == "train":
+        assert args[args.index("--train-scope") + 1] == env["TRAIN_SCOPE"]
+        assert args[args.index("--backbone-lr") + 1] == "2e-6"
+    else:
+        assert "--train-scope" not in args and "--backbone-lr" not in args
     if command == "diagnose-update":
         assert "--cuda-trace" in args and args[args.index("--frames") + 1] == "13"
         assert args[args.index("--tbptt") + 1] == "1" and args[args.index("--stage") + 1] == "C"

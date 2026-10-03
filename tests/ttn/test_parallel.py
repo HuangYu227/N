@@ -111,7 +111,7 @@ def test_fsdp2_preserves_fp32_ttn_under_bf16_base_and_autocast(tmp_path):
         torch.testing.assert_close(ranks[0]["state"][name], ranks[1]["state"][name], atol=0, rtol=0)
 
 
-def _resume_worker(rank, size, init_uri, output, mode):
+def _resume_worker(rank, size, init_uri, output, mode, joint=False):
     from worldttn.distributed import ParallelTraining, save_training_checkpoint, restore_training_checkpoint
     from worldttn.checkpoint import load_checkpoint
     import torch.distributed as dist
@@ -121,6 +121,9 @@ def _resume_worker(rank, size, init_uri, output, mode):
     try:
         torch.manual_seed(17)
         model = TinyWorldModel("C")
+        if joint:
+            from worldttn.anchor import configure_train_scope
+            configure_train_scope(model, "dit")
         engine = ParallelTraining(model, linear_flow_loss, mode)
         optimizer = make_optimizer(model)
         clean, noise, t, camera = _rank_inputs(rank)
@@ -142,6 +145,7 @@ def _resume_worker(rank, size, init_uri, output, mode):
             expected[name] = value.clone()
         torch.manual_seed(17)
         resumed = TinyWorldModel("C")
+        if joint: configure_train_scope(resumed, "dit")
         load_checkpoint(path, resumed)
         new_engine = ParallelTraining(resumed, linear_flow_loss, mode)
         new_optimizer = make_optimizer(resumed)
@@ -160,6 +164,9 @@ def _resume_worker(rank, size, init_uri, output, mode):
         assert payload["optimizer"] is None
         assert not any(hasattr(value, "full_tensor") for value in payload["adapter"].values())
         assert all("world_state" not in key for key in payload["adapter"])
+        if joint:
+            assert payload["train_scope"] == payload["weight_scope"] == "dit"
+            assert payload["adapter"].keys() == model.state_dict().keys()
     finally:
         dist.destroy_process_group()
 

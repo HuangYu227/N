@@ -1,9 +1,9 @@
-"""Plain adapter exports plus rank-local optimizer shards and RNG for exact resume."""
+"""Plain offline weight exports plus rank-local optimizer shards and RNG for exact resume."""
 from pathlib import Path
 import uuid
 import torch
 from torch import distributed as dist
-from .anchor import adapter_state_dict
+from .anchor import offline_state_dict
 from .checkpoint import atomic_save, checkpoint_payload, read_checkpoint, rng_state, restore_rng
 from .training_health import optimizer_parameter_names
 
@@ -37,7 +37,7 @@ def save_training_checkpoint(path, parallel, optimizer, step, data_state=None, t
     """All ranks participate; publish last.pt only after all shards are complete.
 
     Same world size/backend are required for optimizer resume. last.pt remains
-    an ordinary single-card inference/stage-initialization adapter checkpoint.
+    an ordinary single-card inference/initialization checkpoint (full DiT for joint training).
     """
     path = Path(path)
     identifier = [uuid.uuid4().hex if parallel.rank == 0 else None]
@@ -47,7 +47,7 @@ def save_training_checkpoint(path, parallel, optimizer, step, data_state=None, t
     folder.mkdir(parents=True, exist_ok=True)
     parallel.reshard()
     adapter = {}
-    for name, value in adapter_state_dict(parallel.model).items():
+    for name, value in offline_state_dict(parallel.model).items():
         value = value.detach()
         if hasattr(value, "full_tensor"): value = value.full_tensor()  # collective on EVERY rank
         if parallel.rank == 0: adapter[name] = value.cpu()

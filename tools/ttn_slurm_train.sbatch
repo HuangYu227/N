@@ -14,6 +14,8 @@
 # sbatch --nodes=... --time=... . The script needs no Accelerate configuration.
 # COMMAND=distributed-check sbatch tools/ttn_slurm_train.sbatch
 # COMMAND=distributed-smoke TBPTT=1 sbatch tools/ttn_slurm_train.sbatch
+# Full C + DiT: STAGE=C TRAIN_SCOPE=dit BACKBONE_LR=1e-6 MAX_STEPS=1
+# sbatch --mem=256G tools/ttn_slurm_train.sbatch (first verify one real update).
 # Single-card, one-update CUDA diagnosis (keep the existing prefix environment):
 # COMMAND=diagnose-update STAGE=A CUDA_TRACE=1 GDN_DISABLE_COMPILE=1 CUDA_LAUNCH_BLOCKING=1 sbatch --nodes=1 --ntasks=1 --ntasks-per-node=1 tools/ttn_slurm_train.sbatch
 # Text SDPA backend A/B: add CROSS_ATTN_BACKEND=math, then flash after math passes.
@@ -76,7 +78,8 @@ args=("$command" --parallel "$parallel" --distributed-timeout "${DISTRIBUTED_TIM
 case "$command" in
   train)
     args+=(--stage "${STAGE:-A}" --tbptt "${TBPTT:-2}" --max-steps "${MAX_STEPS:-100}"
-           --save-every "${SAVE_EVERY:-50}" --text-encoder-device "${TEXT_ENCODER_DEVICE:-cpu}")
+           --save-every "${SAVE_EVERY:-50}" --text-encoder-device "${TEXT_ENCODER_DEVICE:-cpu}"
+           --train-scope "${TRAIN_SCOPE:-ttn}" --backbone-lr "${BACKBONE_LR:-1e-6}")
     if [[ -n "${BATCH_FILE:-}" ]]; then
       args+=(--batch-file "$BATCH_FILE")
     else

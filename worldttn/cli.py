@@ -1,6 +1,7 @@
 """Single-card inference and causal DDP/FSDP2 training; --help needs no CUDA SANA imports."""
 import argparse
 import json
+import math
 import os
 import random
 import time
@@ -8,7 +9,7 @@ from pathlib import Path
 from dataclasses import replace, asdict
 import torch
 from .core import TTNConfig, BASE_ID, ANCHORS
-from .checkpoint import make_optimizer, save_checkpoint, load_checkpoint, read_checkpoint
+from .checkpoint import make_optimizer, save_checkpoint, load_checkpoint, read_checkpoint, apply_checkpoint_weights
 from .training import train_clip, SANAFlowLoss, chunk_ranges
 from .session import TTNSession
 
@@ -91,7 +92,9 @@ def build(args, stage=None, sana_path=None):
         if len(names) != 1: raise ValueError("--data-dir requires a single named dataset in the SANA config")
         config.data.data_dir = {names[0]: str(Path(args.data_dir).resolve())}
     if getattr(args, "vae_cache_dir", None): config.data.vae_cache_dir = str(Path(args.vae_cache_dir).resolve())
-    model = build_sana(config, ttn, args.base_weights, device=args.device)
+    # Do not quantize inherited master weights to BF16 before joint fine-tuning.
+    options = {"dtype": torch.float32} if getattr(args, "train_scope", "ttn") == "dit" else {}
+    model = build_sana(config, ttn, args.base_weights, device=args.device, **options)
     policy = configure_cross_attention(model, getattr(args, "cross_attn_backend", "auto"),
                                        diagnostic_unmask_all_valid=getattr(args, "diagnostic_unmask_all_valid", False))
     from .distributed import rank_world
@@ -260,7 +263,7 @@ def _training_identity(args, config, settings, k):
         value = getattr(config, name, None)
         return asdict(value) if value is not None else None
     train = getattr(config, "train", None)
-    return {"tbptt": k, "seed": args.seed, "per_rank_batch": 1,
+    identity = {"tbptt": k, "seed": args.seed, "per_rank_batch": 1,
             "learning_rate": settings.get("learning_rate", 1e-5),
             "scheduler": asdict(config.scheduler),
             "task": getattr(config, "task", None), "sana_model": section("model"),
@@ -270,6 +273,10 @@ def _training_identity(args, config, settings, k):
                 "chunk_sampling_strategy", "same_timestep_prob", "chunk_mixture_probs", "noise_multiplier")},
             "batch_file": args.batch_file,
             "data": None if args.batch_file else asdict(config.data)}
+    # Preserve existing frozen-backbone resume identities exactly.
+    if getattr(args, "train_scope", "ttn") == "dit":
+        identity.update(train_scope="dit", backbone_lr=getattr(args, "backbone_lr", 1e-6), optimizer_foreach=False)
+    return identity
 
 
 def _training_record(model, result, timing, parallel):
@@ -284,6 +291,8 @@ def _training_record(model, result, timing, parallel):
             "outer_grad_norm": result["outer_grad_norm"], "ranks": ranks,
             "seconds": max(record["seconds"] for record in ranks),
             "world_size": parallel.world, "global_batch": parallel.world, "parallel": parallel.mode,
+            "train_scope": getattr(model, "ttn_train_scope", "ttn"),
+            "weight_scope": getattr(model, "ttn_weight_scope", "ttn"),
             "config": model.ttn_system.config.to_dict(), "base": model.base_load_report,
             "cross_attention": getattr(model, "cross_attention_report", None)}
 
@@ -297,6 +306,9 @@ def train_command(args):
     import hashlib
     import inspect
     model, config, settings = build(args)
+    from .anchor import configure_train_scope, is_ttn_parameter
+    if getattr(args, "train_scope", "ttn") != "ttn":
+        configure_train_scope(model, args.train_scope)
     mode = getattr(args, "parallel", "single")
     rank, world = rank_world()
     k = args.tbptt or settings.get("tbptt", 2)
@@ -306,12 +318,13 @@ def train_command(args):
         validate_training_checkpoint(payload, mode, world, identity)
     elif args.resume and mode != "single":
         raise ValueError("multi-GPU resume requires optimizer shards; use --adapter without --resume for initialization")
-    if payload: model.load_state_dict(payload["adapter"], strict=False)
+    if payload: apply_checkpoint_weights(model, payload)
     parallel = ParallelTraining(model, SANAFlowLoss(config), mode,
                                 activation_offload=getattr(args, "activation_offload", "none"),
                                 memory_trace=getattr(args, "memory_trace", False))
     # FSDP2 optimizer must be constructed AFTER parameters become DTensors.
-    optimizer = make_optimizer(model, settings.get("learning_rate", 1e-5))
+    optimizer = make_optimizer(model, settings.get("learning_rate", 1e-5),
+                               backbone_lr=getattr(args, "backbone_lr", 1e-6))
     step, cursor = 0, None
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
@@ -356,7 +369,7 @@ def train_command(args):
                                   for name, path in sources.items()}}
         (output / "run_config.json").write_text(json.dumps(run, indent=2), encoding="utf-8")
         print("[TTN trainable] " + json.dumps({k: parameter_report[k] for k in
-              ("stage", "trainable_numel", "frozen_numel")}), flush=True)
+              ("stage", "train_scope", "weight_scope", "trainable_numel", "frozen_numel", "optimizer_groups")}), flush=True)
     first_update = True
     while step < args.max_steps:
         if stream is not None: batch = _dataset_batch(next(stream), config, args, tokenizer, encoder, encoder_device)
@@ -374,9 +387,12 @@ def train_command(args):
             if rank == 0:
                 (output / "first_update.json").write_text(json.dumps(health, indent=2), encoding="utf-8")
                 for group, values in result["parameter_update"]["groups"].items():
+                    if not is_ttn_parameter(group + "."): continue
                     print(f"[TTN update] {group}: grad={values['grad_norm']:.6g}, "
                           f"delta={values['delta_norm']:.6g}, changed={values['changed_elements']}, "
                           f"optimizer_states={values['optimizer_state_parameters']}", flush=True)
+                if getattr(model, "ttn_train_scope", "ttn") == "dit":
+                    print("[DiT update] " + json.dumps(result["parameter_update"]["backbone"]), flush=True)
             if any(r["missing_core_gradients"] for r in health["ranks"]):
                 raise RuntimeError("first training update disconnected core TTN projections; inspect first_update.json")
         if rank == 0:
@@ -628,6 +644,10 @@ def main():
     parser.add_argument("--sana-config")
     parser.add_argument("--base-weights", help="local mirror of the specified SANA teacher, or hf:// URI")
     parser.add_argument("--adapter", help="TTN checkpoint; stage comes from --stage or reference config")
+    parser.add_argument("--train-scope", choices=("ttn", "dit"), default="ttn",
+                        help="train: ttn freezes the remaining DiT; dit jointly trains the complete DiT")
+    parser.add_argument("--backbone-lr", type=float, default=1e-6,
+                        help="learning rate for pretrained DiT outside five TTN anchors; --train-scope dit only")
     parser.add_argument("--stage", choices=("A", "B", "C"),
                         help="A: identity Predict + Correct/Read; B: camera-conditioned Predict + Correct/Read; "
                              "C: B plus per-clean-chunk psi adaptation")
@@ -647,6 +667,10 @@ def main():
     parser.add_argument("--latent-height", type=int, default=22)
     parser.add_argument("--latent-width", type=int, default=40)
     args = parser.parse_args()
+    if args.train_scope != "ttn" and args.command != "train":
+        parser.error("--train-scope dit is only supported for train; inference reads weight scope from checkpoint")
+    if not math.isfinite(args.backbone_lr) or args.backbone_lr <= 0:
+        parser.error("--backbone-lr must be finite and positive")
     if args.command == "evaluate":
         if not args.training_run or args.steps is None:
             parser.error("evaluate requires --training-run and explicit --steps")

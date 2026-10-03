@@ -144,3 +144,33 @@ def adapter_state_dict(model):
         for name, tensor in model.state_dict().items()
         if name.startswith("ttn_system.") or any(name.startswith(f"blocks.{i}.attn.") for i in ANCHORS)
     }
+
+
+def is_ttn_parameter(name):
+    return name.startswith("ttn_system.") or any(name.startswith(f"blocks.{i}.attn.") for i in ANCHORS)
+
+
+def trainable_parameter_names(model, scope=None):
+    scope = scope or getattr(model, "ttn_train_scope", "ttn")
+    if scope not in ("ttn", "dit"): raise ValueError("train-scope must be ttn or dit")
+    return {name for name, _ in model.named_parameters()
+            if (scope == "dit" or is_ttn_parameter(name))
+            and not (model.ttn_system.config.stage == "A" and name.startswith("ttn_system."))}
+
+
+def configure_train_scope(model, scope="ttn"):
+    """Configure optimizer ownership before DDP/FSDP wrapping; compute still uses autocast."""
+    expected = trainable_parameter_names(model, scope)
+    if scope == "dit": model.float()  # FP32 master weights, including inherited DiT mappings
+    for name, p in model.named_parameters(): p.requires_grad_(name in expected)
+    model.ttn_train_scope = scope
+    # A previously fine-tuned, now frozen backbone must still be exported in full.
+    if scope == "dit": model.ttn_weight_scope = "dit"
+    model.eval()  # Preserve the reference fixed-conditioning/dropout policy.
+    return model
+
+
+def offline_state_dict(model, scope=None):
+    scope = scope or getattr(model, "ttn_weight_scope", "ttn")
+    if scope not in ("ttn", "dit"): raise ValueError("checkpoint weight scope must be ttn or dit")
+    return model.state_dict() if scope == "dit" else adapter_state_dict(model)

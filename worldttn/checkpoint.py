@@ -1,20 +1,30 @@
-"""Adapter-only offline checkpoints. Runtime S/psi are never serialized."""
+"""Offline adapter or full DiT checkpoints. Runtime S/psi are never serialized."""
+import math
 import os
 import random
 import tempfile
 from pathlib import Path
 import torch
-from .anchor import adapter_state_dict
+from .anchor import is_ttn_parameter, offline_state_dict
 from .core import BASE_REVISION
 from .training_health import optimizer_parameter_names, audit_training_parameters
 
 
-def make_optimizer(model, lr=1e-5):
-    optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
-                                 lr=lr,
+def make_optimizer(model, lr=1e-5, *, backbone_lr=1e-6):
+    if not math.isfinite(lr) or lr <= 0: raise ValueError("learning rate must be finite and positive")
+    parameters = [p for p in model.parameters() if p.requires_grad]
+    options = {}
+    if getattr(model, "ttn_train_scope", "ttn") == "dit":
+        if not math.isfinite(backbone_lr) or backbone_lr <= 0:
+            raise ValueError("backbone learning rate must be finite and positive")
+        parameters = [{"name": name, "lr": rate,
+                       "params": [p for n, p in model.named_parameters() if p.requires_grad and is_ttn_parameter(n) == ttn]}
+                      for name, rate, ttn in (("ttn", lr, True), ("backbone", backbone_lr, False))]
+        options["foreach"] = False  # Avoid a full-parameter-sized CUDA AdamW temporary.
+    optimizer = torch.optim.AdamW(parameters, lr=lr,
                                  betas=(.9, .999),
                                  eps=1e-10,
-                                 weight_decay=0.)
+                                 weight_decay=0., **options)
     audit_training_parameters(model, optimizer)
     return optimizer
 
@@ -46,6 +56,8 @@ def checkpoint_payload(model, adapter, optimizer, step):
         "base_sha256": getattr(model, "base_load_report", {}).get("sha256"),
         "config": model.ttn_system.config.to_dict(),
         "stage": model.ttn_system.config.stage,
+        "train_scope": getattr(model, "ttn_train_scope", "ttn"),
+        "weight_scope": getattr(model, "ttn_weight_scope", "ttn"),
         "adapter": adapter,
         "optimizer": optimizer.state_dict() if optimizer else None,
         "optimizer_parameter_names": optimizer_parameter_names(model, optimizer) if optimizer else None,
@@ -67,7 +79,7 @@ def atomic_save(payload, path):
 
 
 def save_checkpoint(path, model, optimizer, step):
-    adapter = {k: v.detach().cpu() for k, v in adapter_state_dict(model).items()}
+    adapter = {k: v.detach().cpu() for k, v in offline_state_dict(model).items()}
     atomic_save(checkpoint_payload(model, adapter, optimizer, step), path)
 
 
@@ -85,23 +97,41 @@ def read_checkpoint(path, model, resume=False):
     if resume and stage != current_stage: raise ValueError("optimizer resume requires the same stage")
     if stage != current_stage and (stage, current_stage) not in (("A", "B"), ("B", "C")):
         raise ValueError("stage initialization must advance A->B or B->C")
-    expected = adapter_state_dict(model)
+    train_scope, weight_scope = payload.get("train_scope", "ttn"), payload.get("weight_scope", "ttn")
+    if train_scope not in ("ttn", "dit") or weight_scope not in ("ttn", "dit"):
+        raise ValueError("invalid checkpoint train-scope/weight scope")
+    if train_scope == "dit" and weight_scope != "dit":
+        raise ValueError("joint DiT checkpoint must include full weights")
+    if resume and train_scope != getattr(model, "ttn_train_scope", "ttn"):
+        raise ValueError("optimizer resume requires the same train-scope; use --adapter for initialization")
+    expected = offline_state_dict(model, weight_scope)
     actual = payload["adapter"]
     if expected.keys() != actual.keys() or any(expected[k].shape != actual[k].shape for k in expected):
         raise ValueError("checkpoint adapter keys/shapes mismatch")
     return payload
 
 
+def apply_checkpoint_weights(model, payload):
+    """Apply a validated payload before parallel wrapping, retaining its export scope."""
+    if payload.get("weight_scope", "ttn") == "dit":
+        model.float()  # Preserve saved FP32 backbone weights even in a frozen inference model.
+        model.ttn_weight_scope = "dit"
+    model.load_state_dict(payload["adapter"], strict=False)
+
+
 def load_checkpoint(path, model, optimizer=None, resume=False):
     payload = read_checkpoint(path, model, resume)
-    actual = payload["adapter"]
     # All validation happens before loading any parameter.
     if resume and (optimizer is None or payload.get("optimizer") is None):
         raise ValueError("resume requires optimizer state")
     if resume and payload.get("optimizer_parameter_names") is not None and (
             payload["optimizer_parameter_names"] != optimizer_parameter_names(model, optimizer)):
         raise ValueError("resume optimizer parameter names/order mismatch")
-    model.load_state_dict(actual, strict=False)
+    if resume and getattr(model, "ttn_train_scope", "ttn") == "dit":
+        stored_groups = payload["optimizer"]["param_groups"]
+        if [g["lr"] for g in stored_groups] != [g["lr"] for g in optimizer.param_groups]:
+            raise ValueError("resume learning rate mismatch")
+    apply_checkpoint_weights(model, payload)
     if resume:
         optimizer.load_state_dict(payload["optimizer"])
         restore_rng(payload["rng"])
