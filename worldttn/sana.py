@@ -34,7 +34,7 @@ def load_sana_config(path):
     return config
 
 
-def build_sana(config, ttn_config, base_weights=None, device="cuda", dtype=torch.bfloat16):
+def build_sana(config, ttn_config, base_weights=None, device="cuda", dtype=torch.bfloat16, *, install_adapter=True):
     from diffusion.model.builder import build_model
     from diffusion.utils.camctrl_config import model_video_camctrl_init_config
     from tools.download import find_model
@@ -65,9 +65,12 @@ def build_sana(config, ttn_config, base_weights=None, device="cuda", dtype=torch
     if set(missing) - allowed or unexpected:
         raise ValueError(f"base checkpoint mismatch: missing={missing}, unexpected={unexpected}")
     model.to(device=device, dtype=dtype)
-    install_ttn(model, ttn_config)
-    for index in (3, 7, 11, 15, 19):
-        model.blocks[index].attn.float()  # FP32 optimizer weights, BF16 CUDA autocast compute
+    if install_adapter:
+        install_ttn(model, ttn_config)
+        for index in (3, 7, 11, 15, 19):
+            model.blocks[index].attn.float()  # FP32 optimizer weights, BF16 CUDA autocast compute
+    else:
+        model.requires_grad_(False).eval()  # unchanged SANA anchors for paired inference
     model.base_load_report = {
         "source": base_weights or ttn_config.base_id,
         "missing": missing,

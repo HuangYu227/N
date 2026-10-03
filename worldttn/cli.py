@@ -145,7 +145,7 @@ def train_update(model, config, batch, optimizer, k, parallel=None, *, activatio
 
 
 @torch.no_grad()
-def rollout(model, config, batch, steps=4, cfg_scale=4.5, cached_blocks=-1):
+def rollout(model, config, batch, steps=4, cfg_scale=4.5, cached_blocks=-1, *, initial_noise=None, on_chunk=None):
     from diffusion.scheduler.self_forcing_flow_euler_sampler import SelfForcingFlowEulerCamCtrl
     initial = batch.get("initial_latent")
     if initial is None: initial = batch["clean_latents"][:, :, :1]
@@ -153,18 +153,36 @@ def rollout(model, config, batch, steps=4, cfg_scale=4.5, cached_blocks=-1):
         raise ValueError("reference rollout accepts batch 1, one initial latent frame")
     frames = batch["camera_conditions"].shape[1]
     if frames < 4 or frames % 3 != 1: raise ValueError("native first-plus-one rollout requires 1+3n latent frames")
-    noise = torch.randn(initial.shape[0], initial.shape[1], frames, *initial.shape[-2:], device=initial.device)
+    shape = (initial.shape[0], initial.shape[1], frames, *initial.shape[-2:])
+    if initial_noise is not None:
+        if tuple(initial_noise.shape) != shape or initial_noise.device != initial.device:
+            raise ValueError("initial noise shape/device must match the rollout")
+        noise = initial_noise.clone()  # methods must never share an in-place-mutated noise tensor
+    else:
+        noise = torch.randn(*shape, device=initial.device)
     noise[:, :, :1] = initial.float()
     extras = {"chunk_plucker": batch["chunk_plucker"]} if "chunk_plucker" in batch else {}
     session = TTNSession(model, batch["camera_conditions"], batch["width"], batch["height"],
-                         batch.get("frame_valid_mask"), extras)
+                         batch.get("frame_valid_mask"), extras) if hasattr(model, "ttn_system") else None
+    from .session import repeat_batch
+    cfg_batch = initial.shape[0] * (2 if cfg_scale > 1 else 1)
+    camera = repeat_batch(batch["camera_conditions"], cfg_batch).clone()
+    camera[..., 16:] *= camera.new_tensor([initial.shape[-1] / batch["width"],
+                                          initial.shape[-2] / batch["height"]] * 2)
+    mask = batch.get("mask")
+    if isinstance(mask, torch.Tensor):
+        if mask.ndim not in (2, 4) or (mask.ndim == 4 and mask.shape[1:3] != (1, 1)):
+            raise ValueError("rollout text mask must be [B,L] or [B,1,1,L]")
+        # SANA forward_long repeats a 2D token mask for CFG BEFORE squeezing;
+        # _encode_prompts returns [B,1,1,L]. Preserve all padding bits.
+        mask = mask.reshape(mask.shape[0], -1)
     kwargs = {
-        "mask": batch.get("mask"),
+        "mask": mask,
         "data_info": dict(batch.get("data_info", {})),
-        "camera_conditions": batch["camera_conditions"],
-        "ttn_session": session,
-        **extras
+        "camera_conditions": camera,
+        **{key: repeat_batch(value, cfg_batch) for key, value in extras.items()}
     }
+    if session is not None: kwargs["ttn_session"] = session
     kwargs["data_info"]["condition_frame_info"] = {0: 0.}
     # Restore forward_long after this episode so repeated rollouts cannot stack sampler patches.
     original = model.forward_long
@@ -191,18 +209,20 @@ def rollout(model, config, batch, steps=4, cfg_scale=4.5, cached_blocks=-1):
                     "start": start,
                     "end": end,
                     "seconds": now - last,
-                    **session.runtime.last_stats
+                    **(session.runtime.last_stats if session is not None else {})
                 })
+                if on_chunk is not None: on_chunk(records[-1])
                 last = now
     finally:
         model.forward_long = original
-    expected = len(chunk_ranges(frames))
-    if session.runtime.commit_count != expected + 1 or session.runtime.predict_count != expected + 1:
-        raise AssertionError("prefill/chunk state counters disagree")
-    if any(len(ids) != frames for ids in session.runtime.committed_frame_ids):
-        raise AssertionError("duplicate/missing frame writes")
+    if session is not None:
+        expected = len(chunk_ranges(frames))
+        if session.runtime.commit_count != expected + 1 or session.runtime.predict_count != expected + 1:
+            raise AssertionError("prefill/chunk state counters disagree")
+        if any(len(ids) != frames for ids in session.runtime.committed_frame_ids):
+            raise AssertionError("duplicate/missing frame writes")
     if not torch.equal(noise[:, :, :1], initial.float()): raise AssertionError("initial frame was modified")
-    return noise, session.runtime, records
+    return noise, session.runtime if session is not None else None, records
 
 
 def timed_cuda(call):
@@ -545,7 +565,13 @@ def diagnose_update_command(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("train", "infer", "smoke", "distributed-smoke", "distributed-check", "diagnose-update"))
+    parser.add_argument("command", choices=("train", "infer", "smoke", "distributed-smoke", "distributed-check", "diagnose-update", "evaluate"))
+    parser.add_argument("--training-run", help="completed training output directory; evaluate restores its config")
+    parser.add_argument("--eval-cases", type=int, default=1, help="deterministic unique example clips, diagnostic only")
+    parser.add_argument("--revisit-min-gap", type=int, default=30, help="minimum revisit separation in latent frames")
+    parser.add_argument("--revisit-distance-fraction", type=float, default=.02, help="pose distance / trajectory extent")
+    parser.add_argument("--revisit-angle-deg", type=float, default=5.)
+    parser.add_argument("--revisit-max-pairs", type=int, default=5)
     parser.add_argument("--parallel", choices=("auto", "single", "ddp", "fsdp2"), default="auto",
                         help="auto: single with one process, DDP under Slurm, otherwise native FSDP2")
     parser.add_argument("--distributed-timeout", type=int, default=600,
@@ -580,7 +606,7 @@ def main():
     parser.add_argument("--max-steps", type=int, default=1)
     parser.add_argument("--save-every", type=int, default=50)
     parser.add_argument("--tbptt", type=int, choices=(1, 2, 4))
-    parser.add_argument("--steps", type=int, default=4, help="4 is smoke only; set an explicit quality schedule")
+    parser.add_argument("--steps", type=int, help="default 4 for smoke; evaluate requires an explicit quality schedule")
     parser.add_argument("--cfg-scale", type=float, default=4.5)
     parser.add_argument("--cached-blocks", type=int, default=-1)
     parser.add_argument("--stages", nargs="+", choices=("A", "B", "C"), default=["A", "B", "C"])
@@ -588,6 +614,14 @@ def main():
     parser.add_argument("--latent-height", type=int, default=22)
     parser.add_argument("--latent-width", type=int, default=40)
     args = parser.parse_args()
+    if args.command == "evaluate":
+        if not args.training_run or args.steps is None:
+            parser.error("evaluate requires --training-run and explicit --steps")
+        if args.batch_file or args.resume:
+            parser.error("evaluate reads real zip data from --training-run; no --batch-file or --resume")
+        if args.frames < 4 or args.frames % 3 != 1 or args.eval_cases < 1:
+            parser.error("evaluate requires positive cases and 1+3n latent frames")
+    if args.steps is None: args.steps = 4
     if args.diagnostic_unmask_all_valid and (args.command != "diagnose-update" or args.batch_file):
         parser.error("--diagnostic-unmask-all-valid requires synthetic diagnose-update without --batch-file")
     os.environ.setdefault("DISABLE_XFORMERS", "1")
@@ -610,8 +644,8 @@ def main():
     if min(args.steps, args.max_steps, args.save_every) < 1: parser.error("step counts must be positive")
     if int(os.environ.get("SANA_CP_SIZE", "1")) > 1: parser.error("TTN reference requires CP=1")
     world = launch["world_size"]
-    if args.command in ("infer", "smoke") and (world > 1 or args.parallel not in ("auto", "single")):
-        parser.error("infer/smoke are single-card; use distributed-smoke for multi-rank training checks")
+    if args.command in ("infer", "smoke", "evaluate") and (world > 1 or args.parallel not in ("auto", "single")):
+        parser.error("infer/smoke/evaluate are single-card; use distributed-smoke for multi-rank training checks")
     if args.command in ("distributed-smoke", "distributed-check") and (world < 2 or args.parallel == "single"):
         parser.error(f"{args.command} requires srun, accelerate launch or torchrun with at least two processes")
     try:
@@ -624,7 +658,8 @@ def main():
         args.launch = check_distributed(device)
         if world > 1 and args.command != "distributed-check" and rank_world()[0] == 0:
             print(json.dumps({"distributed": args.launch}), flush=True)
-        {"train": train_command, "infer": infer_command, "smoke": smoke_command,
+        from .evaluation import evaluate_command
+        {"train": train_command, "infer": infer_command, "smoke": smoke_command, "evaluate": evaluate_command,
          "distributed-smoke": distributed_smoke_command, "distributed-check": distributed_check_command,
          "diagnose-update": diagnose_update_command}[args.command](args)
     finally:
