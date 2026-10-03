@@ -68,15 +68,20 @@ class TTNAnchor(nn.Module):
         if ttn_chunk_context is None:
             raise ValueError("TTN anchors require an explicit ttn_chunk_context")
         ctx = ttn_chunk_context
+        diagnostic = kwargs.get("ttn_diagnostic")
         cfg = self.config
         b, n, c = x.shape
+        if diagnostic is not None: diagnostic("input", x)
         read, write = ctx.token_masks(n)
         x = x * read[..., None].to(x.dtype)
         q, k, v = self.visual_features(x, rotary_emb)
+        if diagnostic is not None: diagnostic("visual_features", (q, k, v))
         with torch.autocast(device_type=x.device.type, enabled=False):
             beta = self.beta_proj(x.float()).sigmoid().transpose(1, 2)
             state, w = correct(ctx.predicted[:, self.index], k, v, beta, write, cfg.alpha_s, cfg.eps)
             raw = q @ state
+            if diagnostic is not None:
+                diagnostic("memory", (ctx.predicted[:, self.index], state, k, v, beta, w, write))
             if ctx.clean_mode:
                 gradient = torch.zeros_like(ctx.psi[:, self.index])
                 if cfg.stage == "C" and not ctx.prefill_mode:
@@ -93,6 +98,7 @@ class TTNAnchor(nn.Module):
                 }
                 ctx.stage(self.index, state, gradient, stats)
         raw = raw.transpose(1, 2).reshape(b, n, c)
+        if diagnostic is not None: diagnostic("visual_raw", raw)
         if camera_conditions is not None:
             cq, ck, cv, to = self.camera_features(x, HW, camera_conditions, rotary_emb, kwargs.get("prope_fns"))
             with torch.autocast(device_type=x.device.type, enabled=False):
@@ -100,9 +106,16 @@ class TTNAnchor(nn.Module):
                 camera_state = ck.transpose(-1, -2) @ (cv * read[:, None, :, None]) / denom[:, None, None, None]
                 camera_out = to(cq @ camera_state)  # output transform BEFORE MergeHeads
                 camera_out = camera_out.transpose(1, 2).reshape(b, n, c)
-            raw = raw + self.out_proj_cam(camera_out.to(x.dtype))
+            camera_contribution = self.out_proj_cam(camera_out.to(x.dtype))
+            if diagnostic is not None:
+                diagnostic("camera_raw", camera_out.to(x.dtype))
+                diagnostic("camera_contribution", camera_contribution)
+            raw = raw + camera_contribution
+        if diagnostic is not None: diagnostic("fused_raw", raw)
         gate = F.silu(self.output_gate(x).float())
-        out = self.proj((raw * gate).to(x.dtype)) * read[..., None].to(x.dtype)
+        gated = (raw * gate).to(x.dtype)
+        if diagnostic is not None: diagnostic("gated_raw", gated)
+        out = self.proj(gated) * read[..., None].to(x.dtype)
         cache = kwargs.get("kv_cache")
         return (out, [None] * 9 + [cache[9]]) if cache is not None else out
 

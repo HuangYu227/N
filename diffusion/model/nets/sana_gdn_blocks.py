@@ -1271,6 +1271,8 @@ class CachedChunkCausalSoftmaxAttn(ChunkCausalSoftmaxAttn):
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.reshape(B, N, self.heads, self.dim).transpose(1, 2)
+        diagnostic = kwargs.get("ttn_diagnostic")
+        if diagnostic is not None: diagnostic("visual_features", (q, k, v))
 
         dtype_orig = x.dtype
         if q.dtype == torch.float32:
@@ -1303,6 +1305,7 @@ class CachedChunkCausalSoftmaxAttn(ChunkCausalSoftmaxAttn):
         if out.dtype != dtype_orig:
             out = out.to(dtype_orig)
         out = out.transpose(1, 2).reshape(B, N, C)
+        if diagnostic is not None: diagnostic("visual_raw", out)
 
         if apply_output_gate:
             out = self._apply_output_gate(out, x)

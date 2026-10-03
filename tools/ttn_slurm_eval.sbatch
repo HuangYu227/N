@@ -52,6 +52,8 @@ args=("$command" --parallel single --training-run "$TRAINING_RUN" --output "$out
       --cross-attn-backend "${CROSS_ATTN_BACKEND:-math}")
 if [[ "$command" == evaluate ]]; then
   args+=(--steps "${STEPS:-20}" --cfg-scale "${CFG_SCALE:-4.5}" --cached-blocks "${CACHED_BLOCKS:-2}")
+else
+  args+=(--alignment-grad-timestep "${ALIGNMENT_GRAD_TIMESTEP:-500}")
 fi
 [[ -z "${ADAPTER:-}" ]] || args+=(--adapter "$ADAPTER")
 [[ -z "${BASE_WEIGHTS:-}" ]] || args+=(--base-weights "$BASE_WEIGHTS")

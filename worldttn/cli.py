@@ -569,6 +569,8 @@ def main():
     parser.add_argument("--training-run", help="completed training output directory; evaluate restores its config")
     parser.add_argument("--alignment-timesteps", type=int, nargs="+", default=[0, 250, 500, 750, 999],
                         help="align-chunk: fixed training-schedule indices, paired GT/noise, no CFG")
+    parser.add_argument("--alignment-grad-timestep", type=int, default=500,
+                        help="align-chunk: read-only autograd.grad probe at this index; no optimizer step")
     parser.add_argument("--eval-cases", type=int, default=1, help="deterministic unique example clips, diagnostic only")
     parser.add_argument("--revisit-min-gap", type=int, default=30, help="minimum revisit separation in latent frames")
     parser.add_argument("--revisit-distance-fraction", type=float, default=.02, help="pose distance / trajectory extent")
@@ -628,7 +630,7 @@ def main():
             parser.error("align-chunk requires --training-run, --frames 4 and positive --eval-cases")
         if args.batch_file or args.resume or args.steps is not None:
             parser.error("align-chunk uses real GT data without a sampler, --batch-file, --steps or --resume")
-        if min(args.alignment_timesteps) < 0 or len(set(args.alignment_timesteps)) != len(args.alignment_timesteps):
+        if min(*args.alignment_timesteps, args.alignment_grad_timestep) < 0 or len(set(args.alignment_timesteps)) != len(args.alignment_timesteps):
             parser.error("align-chunk requires distinct nonnegative timesteps")
     if args.steps is None: args.steps = 4
     if args.diagnostic_unmask_all_valid and (args.command != "diagnose-update" or args.batch_file):

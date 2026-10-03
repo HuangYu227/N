@@ -17,31 +17,53 @@ from worldttn.training import linear_flow_loss
 class SoftmaxProjection(ProjectionContract):
     def forward(self, x, kv_cache=None, **kwargs):
         b, n, c = x.shape
+        diagnostic = kwargs.get("ttn_diagnostic")
         q, k, v = self.qkv(x).chunk(3, -1)
         q = self.q_norm(q).reshape(b, n, self.heads, self.dim).transpose(1, 2)
         k = self.k_norm(k).reshape(b, n, self.heads, self.dim).transpose(1, 2)
         v = v.reshape(b, n, self.heads, self.dim).transpose(1, 2)
+        if diagnostic is not None: diagnostic("visual_features", (q, k, v))
         z = ((q @ k.transpose(-1, -2) / self.dim**.5).softmax(-1) @ v).transpose(1, 2).reshape(b, n, c)
-        out = self.proj(z * torch.nn.functional.silu(self.output_gate(x)))
+        if diagnostic is not None: diagnostic("visual_raw", z)
+        if kwargs.get("camera_conditions") is not None:
+            cq = self.q_norm_cam(self.q_proj_cam(x)).reshape(b, n, self.heads, self.dim).transpose(1, 2)
+            ck = self.k_norm_cam(self.k_proj_cam(x)).reshape(b, n, self.heads, self.dim).transpose(1, 2)
+            cv = self.v_proj_cam(x).reshape(b, n, self.heads, self.dim).transpose(1, 2)
+            cam = ((cq @ ck.transpose(-1, -2) / self.dim**.5).softmax(-1) @ cv).transpose(1, 2).reshape(b, n, c)
+            contribution = self.out_proj_cam(cam)
+            if diagnostic is not None:
+                diagnostic("camera_raw", cam)
+                diagnostic("camera_contribution", contribution)
+            z = z + contribution
+        if diagnostic is not None: diagnostic("fused_raw", z)
+        gated = z * torch.nn.functional.silu(self.output_gate(x))
+        if diagnostic is not None: diagnostic("gated_raw", gated)
+        out = self.proj(gated)
         return (out, list(kv_cache)) if kv_cache is not None else out
+
+
+class Block(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.attn = SoftmaxProjection()
+
+    def forward(self, z, cache, context, hw, camera):
+        out, new_cache = self.attn(z, kv_cache=cache, HW=hw, camera_conditions=camera,
+                                   prope_fns=(lambda v: v, lambda v: v, lambda v: v), ttn_chunk_context=context)
+        return z + .02 * out, new_cache
 
 
 class Model(nn.Module):
     def __init__(self):
         super().__init__()
-        self.blocks = nn.ModuleList([nn.Module() for _ in range(20)])
-        for block in self.blocks: block.attn = SoftmaxProjection()
+        self.blocks = nn.ModuleList([Block() for _ in range(20)])
 
     def forward(self, x, t, y, kv_cache, ttn_chunk_context=None, **kwargs):
         b, c, f, h, w = x.shape
         z = x.permute(0, 2, 3, 4, 1).reshape(b, -1, c)
         cache = []
         for i, block in enumerate(self.blocks):
-            out, new_cache = block.attn(z, kv_cache=kv_cache[i], HW=(f, h, w),
-                                        camera_conditions=kwargs.get("camera_conditions"),
-                                        prope_fns=(lambda v: v, lambda v: v, lambda v: v),
-                                        ttn_chunk_context=ttn_chunk_context)
-            z = z + .02 * out
+            z, new_cache = block(z, kv_cache[i], ttn_chunk_context, (f, h, w), kwargs.get("camera_conditions"))
             cache.append(new_cache)
         return z.reshape(b, f, h, w, c).permute(0, 4, 1, 2, 3), cache
 

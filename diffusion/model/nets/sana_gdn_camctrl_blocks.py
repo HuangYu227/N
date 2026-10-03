@@ -862,6 +862,7 @@ class CachedSoftmaxUCPESinglePathLiteLA(_SoftmaxUCPESinglePathLiteLA):
         )
 
         cam_contrib: torch.Tensor | int = 0
+        diagnostic = kwargs.get("ttn_diagnostic")
         if camera_conditions is not None:
             cam_raw = self._cached_cam_branch_softmax(
                 x,
@@ -874,9 +875,14 @@ class CachedSoftmaxUCPESinglePathLiteLA(_SoftmaxUCPESinglePathLiteLA):
                 **kwargs,
             )
             cam_contrib = self.out_proj_cam(cam_raw)
+            if diagnostic is not None:
+                diagnostic("camera_raw", cam_raw)
+                diagnostic("camera_contribution", cam_contrib)
 
         combined = main_raw + cam_contrib
+        if diagnostic is not None: diagnostic("fused_raw", combined)
         combined = self._apply_output_gate(combined, x)
+        if diagnostic is not None: diagnostic("gated_raw", combined.to(x.dtype))
         return self.proj(combined.to(x.dtype)), kv_cache
 
     def _cached_cam_branch_softmax(
