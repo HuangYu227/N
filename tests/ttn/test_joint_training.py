@@ -166,7 +166,7 @@ def test_joint_builder_loads_fp32_master_weights_without_bf16_round_trip(monkeyp
     assert seen == [torch.float32, torch.bfloat16]
 
 
-def _joint_cli_worker(rank, size, uri, output):
+def _joint_cli_worker(rank, size, uri, output, mode="ddp"):
     from worldttn import cli
     from test_parallel import _rank_inputs
     from test_parallel_cli import CPUFlowConfig
@@ -191,9 +191,10 @@ def _joint_cli_worker(rank, size, uri, output):
         clean, noise, t, camera = _rank_inputs(rank)
         batch = Path(output) / f"batch-{rank}.pt"
         torch.save({"clean_latents": clean, "y": torch.zeros(1, 1, 2, 8), "camera_conditions": camera}, batch)
-        args = Namespace(parallel="ddp", seed=3407, batch_file=str(Path(output) / "batch-{rank}.pt"),
+        args = Namespace(parallel=mode, seed=3407, batch_file=str(Path(output) / "batch-{rank}.pt"),
                          device="cpu", adapter=None, resume=False, output=str(Path(output) / "train"),
-                         max_steps=1, save_every=1, tbptt=2, train_scope="dit", backbone_lr=1e-6)
+                         max_steps=1, save_every=1, tbptt=2, train_scope="dit", backbone_lr=1e-6,
+                         activation_offload="cpu")
         cli.train_command(args)
         args.adapter = str(Path(args.output) / "last.pt")
         args.resume, args.max_steps = True, 2
@@ -214,7 +215,7 @@ def _joint_cli_worker(rank, size, uri, output):
             from worldttn.parallel_checkpoint import validate_training_checkpoint
             identity["backbone_lr"] = 2e-6
             with pytest.raises(ValueError, match="training configuration"):
-                validate_training_checkpoint(full, "ddp", size, identity)
+                validate_training_checkpoint(full, mode, size, identity)
     finally:
         dist.destroy_process_group()
 

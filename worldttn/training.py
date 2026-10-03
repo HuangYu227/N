@@ -7,7 +7,12 @@ from .cuda_debug import trace_backward
 
 
 def activation_storage(mode):
-    """Change saved-tensor storage only; never replay a stateful TTN forward."""
+    """Copy saved tensors to host before FSDP resharding; never replay TTN forwards.
+
+    Native save_on_cpu copies values (including weight views) during forward,
+    so backward does not retain/read freed FSDP all-gather storage. FSDP's own
+    parameter hooks still unshard and reduce the actual parameter gradients.
+    """
     if mode == "none": return nullcontext()
     if mode == "cpu": return torch.autograd.graph.save_on_cpu(pin_memory=True)
     raise ValueError("activation_offload must be none or cpu")
@@ -180,8 +185,6 @@ def train_clip(model,
                memory_callback=None):
     if tbptt not in (1, 2, 4): raise ValueError("reference TBPTT supports K=1,2,4")
     if activation_offload not in ("none", "cpu"): raise ValueError("activation_offload must be none or cpu")
-    if activation_offload == "cpu" and parallel is not None and parallel.mode == "fsdp2":
-        raise ValueError("CPU activation offload currently supports single/DDP; use none with FSDP2")
     b, _, frames, _, _ = clean.shape
     if timesteps.ndim == 1: timesteps = timesteps[:, None, None].expand(b, 1, frames).clone()
     if timesteps.shape != (b, 1, frames) or noise.shape != clean.shape:
@@ -216,9 +219,16 @@ def train_clip(model,
     for first in range(0, len(episode.ranges), tbptt):
         last = min(first + tbptt, len(episode.ranges))
         sync = parallel.accumulation(last == len(episode.ranges)) if parallel else nullcontext()
+        # FSDP swaps full parameter storage between chunk forwards. Cached AMP
+        # weight casts share one backward node across those forwards and can
+        # defer weight gradients past FSDP's per-forward reduction hooks.
+        amp = torch.autocast(device_type=clean.device.type,
+                             enabled=torch.is_autocast_enabled(clean.device.type),
+                             dtype=torch.get_autocast_dtype(clean.device.type),
+                             cache_enabled=False) if parallel is not None and parallel.mode == "fsdp2" else nullcontext()
         # DDP no_sync still encloses both forward and backward. CPU storage
         # preserves the full window's S graph and detached inner updates.
-        with sync, activation_storage(activation_offload):
+        with sync, amp, activation_storage(activation_offload):
             loss = runner(episode, first, last, on_prediction=on_prediction)
             _memory_phase(memory_callback, "backward_begin", first=first, last=last)
             with trace_backward(loss):

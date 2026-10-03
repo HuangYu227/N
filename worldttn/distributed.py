@@ -202,8 +202,6 @@ def check_distributed(device):
 class ParallelTraining:
     def __init__(self, model, loss_fn, mode="single", *, activation_offload="none", memory_trace=False):
         if activation_offload not in ("none", "cpu"): raise ValueError("activation_offload must be none or cpu")
-        if mode == "fsdp2" and activation_offload != "none":
-            raise ValueError("CPU activation offload currently supports single/DDP; use none with FSDP2")
         self.model = model
         self.loss_fn = loss_fn
         self.mode = mode
@@ -247,6 +245,25 @@ class ParallelTraining:
 
     def reshard(self):
         if self.mode == "fsdp2": self.window.reshard()
+
+    def storage_record(self, optimizer):
+        """Actual rank-local persistent storage; excludes activations and communication temporaries."""
+        def local_bytes(value):
+            if isinstance(value, torch.Tensor):
+                tensor = value.to_local() if hasattr(value, "to_local") else value
+                return tensor.numel() * tensor.element_size()
+            if isinstance(value, dict): return sum(local_bytes(v) for v in value.values())
+            if isinstance(value, (tuple, list)): return sum(local_bytes(v) for v in value)
+            return 0
+        parameters = list(self.model.parameters())
+        return {"parallel": self.mode, "world_size": self.world,
+                "sharded_parameters": sum(hasattr(p, "to_local") for p in parameters),
+                "replicated_parameters": sum(not hasattr(p, "to_local") for p in parameters),
+                "global_parameter_bytes": sum(p.numel() * p.element_size() for p in parameters),
+                "local_parameter_bytes": sum(local_bytes(p) for p in parameters),
+                "local_gradient_bytes": sum(local_bytes(p.grad) for p in parameters),
+                "local_optimizer_bytes": local_bytes(optimizer.state),
+                "scope": "parameter/gradient/optimizer tensors only; runtime and activations excluded"}
 
     def validate_schedule(self, frames, tbptt, chunks, batch):
         if self.world == 1: return

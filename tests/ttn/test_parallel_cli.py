@@ -164,7 +164,7 @@ def test_offload_policy_validation_precedes_parallel_initialization():
     from worldttn.distributed import ParallelTraining
     from worldttn.training import linear_flow_loss, activation_storage
     with pytest.raises(ValueError, match="none or cpu"): activation_storage("disk")
-    with pytest.raises(ValueError, match="single/DDP"):
+    with pytest.raises(ValueError, match="at least two|initialized multi|requires.*group"):
         ParallelTraining(TinyWorldModel(), linear_flow_loss, "fsdp2", activation_offload="cpu")
 
 

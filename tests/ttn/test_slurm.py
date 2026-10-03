@@ -197,7 +197,7 @@ def test_slurm_launcher_contract_and_local_launcher_guard():
     assert script.exists(), "Slurm sbatch entrypoint is missing"
     content = script.read_text()
     for token in ("--nodes=4", "--mem=128G", "--ntasks-per-node=1", "--gres=gpu:1", "--mpi=none", "--kill-on-bad-exit=1",
-                  "SLURM_SUBMIT_DIR", "SLURM_JOB_ID", "distributed-check", "parallel=ddp", '--parallel "$parallel"'):
+                  "SLURM_SUBMIT_DIR", "SLURM_JOB_ID", "distributed-check", 'parallel="${PARALLEL:-ddp}"', '--parallel "$parallel"'):
         assert token in content
     assert "CUDA_VISIBLE_DEVICES=" not in content
     assert "accelerate.commands.launch" not in content and "torchrun" not in content
@@ -411,6 +411,7 @@ def test_sbatch_executes_one_srun_with_shared_master_and_preserves_gpu_mask(tmp_
     if command == "train":
         env.update(DATASET_ROOT=(tmp_path / "shared data").as_posix(), ADAPTER=(tmp_path / "last.pt").as_posix(), RESUME="1")
         env.update(TRAIN_SCOPE="dit" if custom_root else "ttn", BACKBONE_LR="2e-6")
+    env.pop("PARALLEL", None)
     env.pop("CROSS_ATTN_BACKEND", None)
     env.pop("DIAGNOSTIC_UNMASK_ALL_VALID", None)
     if command == "diagnose-update":
@@ -436,7 +437,9 @@ def test_sbatch_executes_one_srun_with_shared_master_and_preserves_gpu_mask(tmp_
     worker_index = args.index("bash") + 1
     assert args[worker_index].endswith("/tools/ttn_slurm_worker.sh")
     assert args[worker_index + 1:worker_index + 3] == [command, "--parallel"]
-    assert args[args.index("--parallel") + 1] == ("single" if tasks == 1 else "ddp")
+    expected_parallel = "single" if tasks == 1 else ("fsdp2" if command == "train" and custom_root else "ddp")
+    assert args[args.index("--parallel") + 1] == expected_parallel
+    assert f"parallel={expected_parallel}" in result.stdout
     if command in ("train", "distributed-smoke", "diagnose-update"):
         assert args[args.index("--activation-offload") + 1] == "cpu" and "--memory-trace" in args
         assert args[args.index("--cross-attn-backend") + 1] == env.get("CROSS_ATTN_BACKEND", "auto")

@@ -14,7 +14,7 @@
 # sbatch --nodes=... --time=... . The script needs no Accelerate configuration.
 # COMMAND=distributed-check sbatch tools/ttn_slurm_train.sbatch
 # COMMAND=distributed-smoke TBPTT=1 sbatch tools/ttn_slurm_train.sbatch
-# Full C + DiT: STAGE=C TRAIN_SCOPE=dit BACKBONE_LR=1e-6 MAX_STEPS=1
+# Full C + DiT: STAGE=C TRAIN_SCOPE=dit PARALLEL=fsdp2 BACKBONE_LR=1e-6 MAX_STEPS=1
 # sbatch --mem=256G tools/ttn_slurm_train.sbatch (first verify one real update).
 # Single-card, one-update CUDA diagnosis (keep the existing prefix environment):
 # COMMAND=diagnose-update STAGE=A CUDA_TRACE=1 GDN_DISABLE_COMPILE=1 CUDA_LAUNCH_BLOCKING=1 sbatch --nodes=1 --ntasks=1 --ntasks-per-node=1 tools/ttn_slurm_train.sbatch
@@ -65,13 +65,17 @@ export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 export NCCL_SOCKET_FAMILY="${NCCL_SOCKET_FAMILY:-AF_INET}"
 # Keep Slurm's GPU mask and NCCL's network selection; user NIC overrides propagate.
 command="${COMMAND:-train}"
-parallel=ddp
+parallel="${PARALLEL:-ddp}"
+# Joint DiT needs sharded parameters/gradients/AdamW states on 40GB cards.
+# Existing frozen-backbone TTN jobs retain DDP unless explicitly overridden.
+if [[ "$command" == train && "${TRAIN_SCOPE:-ttn}" == dit && -z "${PARALLEL:-}" ]]; then parallel=fsdp2; fi
+case "$parallel" in ddp|fsdp2|single) ;; *) echo "Unsupported PARALLEL: $parallel" >&2; exit 2 ;; esac
 # A one-card diagnostic must not create a process group or wrap the model in DDP.
 if [[ "$command" == diagnose-update && "$SLURM_NTASKS" == 1 ]]; then parallel=single; fi
 default_timeout=600
 [[ "$command" != distributed-check ]] || default_timeout=120
-printf '[TTN Slurm] job=%s nodes=%s master_node=%s MASTER_ADDR=%s MASTER_PORT=%s command=%s\n' \
-  "$SLURM_JOB_ID" "$node_list" "${master_node:-explicit}" "$MASTER_ADDR" "$MASTER_PORT" "$command"
+printf '[TTN Slurm] job=%s nodes=%s master_node=%s MASTER_ADDR=%s MASTER_PORT=%s command=%s parallel=%s\n' \
+  "$SLURM_JOB_ID" "$node_list" "${master_node:-explicit}" "$MASTER_ADDR" "$MASTER_PORT" "$command" "$parallel"
 export OUTPUT="${OUTPUT:-$project_root/output/worldttn/slurm-${SLURM_JOB_ID}-${STAGE:-A}}"
 args=("$command" --parallel "$parallel" --distributed-timeout "${DISTRIBUTED_TIMEOUT:-$default_timeout}"
       --seed "${SEED:-3407}" --output "$OUTPUT")

@@ -116,6 +116,8 @@ def train_update(model, config, batch, optimizer, k, parallel=None, *, activatio
     def trace(phase, **info):
         from .distributed import rank_world
         record = {"phase": phase, "rank": rank_world()[0], "activation_offload": activation_offload, **info}
+        if parallel is not None and phase in ("prefill_begin", "backward_end", "optimizer_end", "oom"):
+            record["storage"] = parallel.storage_record(optimizer)
         if clean.device.type == "cuda":
             record.update(allocated_bytes=torch.cuda.memory_allocated(clean.device),
                           reserved_bytes=torch.cuda.memory_reserved(clean.device),
@@ -284,6 +286,7 @@ def _training_record(model, result, timing, parallel):
              "commits": result["runtime"].commit_count, "predictions": result["runtime"].predict_count,
              "chunks": result["chunks"], "activation_offload": result.get("activation_offload", "none"),
              "memory_phases": result.get("memory_phases", []), **timing}
+    local["storage"] = result.get("storage")
     from .distributed import gather_records
     if "parameter_update" in result: local["parameter_update"] = result["parameter_update"]
     ranks = gather_records(local)
@@ -361,10 +364,11 @@ def train_command(args):
     if rank == 0:
         sources = {"cli": Path(__file__), "anchor": Path(inspect.getfile(type(model.blocks[3].attn))),
                    "sana": Path(inspect.getfile(build_sana)), "optimizer": Path(inspect.getfile(make_optimizer)),
-                   "training": Path(inspect.getfile(train_clip))}
+                   "training": Path(inspect.getfile(train_clip)), "distributed": Path(inspect.getfile(ParallelTraining))}
         run = {"arguments": vars(args), "parallel": mode, "world_size": world, "global_batch": world,
                "training": identity, "base": model.base_load_report, "torch": torch.__version__,
                "launch": getattr(args, "launch", None), "parameters": parameter_report,
+               "storage": parallel.storage_record(optimizer),
                "implementation": {name: {"path": str(path.resolve()), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
                                   for name, path in sources.items()}}
         (output / "run_config.json").write_text(json.dumps(run, indent=2), encoding="utf-8")
@@ -375,6 +379,7 @@ def train_command(args):
         if stream is not None: batch = _dataset_batch(next(stream), config, args, tokenizer, encoder, encoder_device)
         update_probe = FirstUpdateProbe(model) if first_update else None
         result, timing = timed_cuda(lambda: train_update(model, config, batch, optimizer, k, parallel))
+        result["storage"] = parallel.storage_record(optimizer)
         if update_probe is not None:
             result["parameter_update"] = update_probe.report(optimizer)
             first_update = False
@@ -626,7 +631,7 @@ def main():
     parser.add_argument("--distributed-timeout", type=int, default=600,
                         help="process group timeout in seconds (default: 600)")
     parser.add_argument("--activation-offload", choices=("none", "cpu"), default="none",
-                        help="store backward saved tensors in pinned host RAM; single/DDP only, no forward replay")
+                        help="store backward saved tensors in pinned host RAM; single/DDP/FSDP2, no forward replay")
     parser.add_argument("--memory-trace", action="store_true",
                         help="print per-rank prefill/noisy/clean/backward/optimizer memory diagnostics")
     parser.add_argument("--cuda-trace", action="store_true",
