@@ -94,6 +94,16 @@ def test_metrics_measure_scale_and_keep_zero_norm_ratios_undefined():
     with pytest.raises(ValueError): comparison_metrics(a, b * float("nan"))
 
 
+def test_metrics_use_stable_reductions_for_full_width_sana_chunks():
+    a = torch.randn(1, 3520, 2240, generator=torch.Generator().manual_seed(7)).bfloat16()
+    for scale in (1., -1.):
+        result = comparison_metrics(a, a * scale)
+        assert result["cosine"] == pytest.approx(scale, abs=1e-12)
+        assert -1 <= result["cosine"] <= 1
+        assert result["relative_l2"] == pytest.approx(abs(scale - 1), abs=1e-12)
+        assert result["norm_ratio"] == pytest.approx(1., abs=1e-12)
+
+
 def test_replay_preserves_teacher_downstream_and_receives_identical_inputs():
     teacher, student, batch = models_and_batch()
     session = TTNSession(student, batch["camera_conditions"], 1, 1)

@@ -11,7 +11,9 @@ from .training import activation_storage
 
 def comparison_metrics(teacher, student, mask=None):
     if teacher.shape != student.shape: raise ValueError("alignment output shapes disagree")
-    a, b = teacher.detach().float(), student.detach().float()
+    # FP32 vector norms lose accuracy on full-width SANA chunks (even cos(x,x)>1).
+    # This is diagnostic accumulation only; model tensors and compute stay unchanged.
+    a, b = teacher.detach().double(), student.detach().double()
     if mask is not None:
         if mask.shape != a.shape[:-1]: raise ValueError("alignment mask must select tokens")
         a, b = a[mask.bool()], b[mask.bool()]
@@ -22,7 +24,7 @@ def comparison_metrics(teacher, student, mask=None):
     mse, energy = (a - b).square().mean().item(), a.square().mean().item()
     ratio = norm_b / norm_a if norm_a > 0 else None
     return {"mse": mse, "relative_l2": (mse / energy)**.5 if energy > 0 else None,
-            "cosine": (a * b).sum().item() / (norm_a * norm_b) if norm_a * norm_b > 0 else None,
+            "cosine": max(-1., min(1., (a * b).sum().item() / (norm_a * norm_b))) if norm_a * norm_b > 0 else None,
             "teacher_rms": energy**.5, "student_rms": b.square().mean().item()**.5,
             "rms_ratio": ratio, "norm_ratio": ratio, "elements": a.numel()}
 
