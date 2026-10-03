@@ -6,14 +6,17 @@ from pathlib import Path
 import torch
 from .anchor import adapter_state_dict
 from .core import BASE_REVISION
+from .training_health import optimizer_parameter_names, audit_training_parameters
 
 
 def make_optimizer(model, lr=1e-5):
-    return torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
-                             lr=lr,
-                             betas=(.9, .999),
-                             eps=1e-10,
-                             weight_decay=0.)
+    optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
+                                 lr=lr,
+                                 betas=(.9, .999),
+                                 eps=1e-10,
+                                 weight_decay=0.)
+    audit_training_parameters(model, optimizer)
+    return optimizer
 
 
 def rng_state():
@@ -45,6 +48,7 @@ def checkpoint_payload(model, adapter, optimizer, step):
         "stage": model.ttn_system.config.stage,
         "adapter": adapter,
         "optimizer": optimizer.state_dict() if optimizer else None,
+        "optimizer_parameter_names": optimizer_parameter_names(model, optimizer) if optimizer else None,
         "step": step,
         "rng": rng_state()
     }
@@ -94,6 +98,9 @@ def load_checkpoint(path, model, optimizer=None, resume=False):
     # All validation happens before loading any parameter.
     if resume and (optimizer is None or payload.get("optimizer") is None):
         raise ValueError("resume requires optimizer state")
+    if resume and payload.get("optimizer_parameter_names") is not None and (
+            payload["optimizer_parameter_names"] != optimizer_parameter_names(model, optimizer)):
+        raise ValueError("resume optimizer parameter names/order mismatch")
     model.load_state_dict(actual, strict=False)
     if resume:
         optimizer.load_state_dict(payload["optimizer"])

@@ -87,6 +87,14 @@ def _cli_worker(rank, size, init_uri, output, mode):
             assert all(record["global_batch"] == 2 and len(record["ranks"]) == 2 for record in records)
             assert all(r["commits"] == 5 for record in records for r in record["ranks"])
             assert torch.load(args.adapter, weights_only=False)["step"] == 2
+            health = json.loads((Path(args.output) / "first_update.json").read_text())
+            assert health["step"] == 2 and len(health["ranks"]) == 2
+            assert all(not r["missing_core_gradients"] for r in health["ranks"])
+            for r in health["ranks"]:
+                assert r["groups"]["blocks.3.attn.qkv"]["delta_norm"] > 0
+            run = json.loads((Path(args.output) / "run_config.json").read_text())
+            names = sum(run["parameters"]["optimizer_parameter_names"], [])
+            assert "blocks.3.attn.qkv.weight" in names and "ttn_system.generators.u" in names
     finally:
         dist.destroy_process_group()
 

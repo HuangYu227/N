@@ -5,6 +5,7 @@ import torch
 from torch import distributed as dist
 from .anchor import adapter_state_dict
 from .checkpoint import atomic_save, checkpoint_payload, read_checkpoint, rng_state, restore_rng
+from .training_health import optimizer_parameter_names
 
 
 def _pack(value):
@@ -54,7 +55,8 @@ def save_training_checkpoint(path, parallel, optimizer, step, data_state=None, t
         "format": "TTN-parallel-resume-v1", "rank": parallel.rank, "world_size": parallel.world,
         "mode": parallel.mode, "step": step, "rng": rng_state(), "data": data_state or {},
         "checkpoint_id": checkpoint_id,
-        "optimizer": _pack(optimizer.state_dict()) if parallel.mode == "fsdp2" or parallel.rank == 0 else None
+        "optimizer": _pack(optimizer.state_dict()) if parallel.mode == "fsdp2" or parallel.rank == 0 else None,
+        "optimizer_parameter_names": optimizer_parameter_names(parallel.model, optimizer)
     }
     atomic_save(shard, folder / f"rank-{parallel.rank:05d}.pt")
     if parallel.world > 1: dist.barrier()
@@ -102,6 +104,12 @@ def restore_training_checkpoint(path, parallel, optimizer, training_config=None)
         owner = torch.load(folder / "rank-00000.pt", map_location="cpu", weights_only=False)
         validate(owner, 0)
         state = owner["optimizer"]
+        if owner.get("optimizer_parameter_names") is not None and (
+                owner["optimizer_parameter_names"] != optimizer_parameter_names(parallel.model, optimizer)):
+            raise ValueError("resume owner optimizer parameter names/order mismatch")
+    if shard.get("optimizer_parameter_names") is not None and (
+            shard["optimizer_parameter_names"] != optimizer_parameter_names(parallel.model, optimizer)):
+        raise ValueError("resume optimizer parameter names/order mismatch")
     parameters = [p for group in optimizer.param_groups for p in group["params"]]
     ids = [i for group in state["param_groups"] for i in group["params"]]
     if len(parameters) != len(ids): raise ValueError("resume optimizer parameter count mismatch")

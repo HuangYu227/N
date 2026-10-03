@@ -278,6 +278,7 @@ def _training_record(model, result, timing, parallel):
              "chunks": result["chunks"], "activation_offload": result.get("activation_offload", "none"),
              "memory_phases": result.get("memory_phases", []), **timing}
     from .distributed import gather_records
+    if "parameter_update" in result: local["parameter_update"] = result["parameter_update"]
     ranks = gather_records(local)
     return {"loss": sum(record["loss"] for record in ranks) / parallel.world,
             "outer_grad_norm": result["outer_grad_norm"], "ranks": ranks,
@@ -291,6 +292,10 @@ def train_command(args):
     from .distributed import ParallelTraining, save_training_checkpoint, restore_training_checkpoint, rank_world
     from .parallel_checkpoint import validate_training_checkpoint
     from .parallel_data import ResumableBatchStream
+    from .training_health import audit_training_parameters, FirstUpdateProbe
+    from .sana import build_sana
+    import hashlib
+    import inspect
     model, config, settings = build(args)
     mode = getattr(args, "parallel", "single")
     rank, world = rank_world()
@@ -339,17 +344,41 @@ def train_command(args):
             step = load_checkpoint(args.adapter, model, optimizer, resume=True)
     if not args.batch_file:
         stream = ResumableBatchStream(loader, seed=args.seed, rank=rank, world=world, state=cursor)
+    parameter_report = audit_training_parameters(model, optimizer)
     if rank == 0:
+        sources = {"cli": Path(__file__), "anchor": Path(inspect.getfile(type(model.blocks[3].attn))),
+                   "sana": Path(inspect.getfile(build_sana)), "optimizer": Path(inspect.getfile(make_optimizer)),
+                   "training": Path(inspect.getfile(train_clip))}
         run = {"arguments": vars(args), "parallel": mode, "world_size": world, "global_batch": world,
                "training": identity, "base": model.base_load_report, "torch": torch.__version__,
-               "launch": getattr(args, "launch", None)}
+               "launch": getattr(args, "launch", None), "parameters": parameter_report,
+               "implementation": {name: {"path": str(path.resolve()), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+                                  for name, path in sources.items()}}
         (output / "run_config.json").write_text(json.dumps(run, indent=2), encoding="utf-8")
+        print("[TTN trainable] " + json.dumps({k: parameter_report[k] for k in
+              ("stage", "trainable_numel", "frozen_numel")}), flush=True)
+    first_update = True
     while step < args.max_steps:
         if stream is not None: batch = _dataset_batch(next(stream), config, args, tokenizer, encoder, encoder_device)
+        update_probe = FirstUpdateProbe(model) if first_update else None
         result, timing = timed_cuda(lambda: train_update(model, config, batch, optimizer, k, parallel))
+        if update_probe is not None:
+            result["parameter_update"] = update_probe.report(optimizer)
+            first_update = False
         step += 1
         record = {"step": step, "stage": model.ttn_system.config.stage, "tbptt": k,
                   **_training_record(model, result, timing, parallel)}
+        if "parameter_update" in result:
+            health = {"step": step, "stage": model.ttn_system.config.stage,
+                      "ranks": [{"rank": r["rank"], **r["parameter_update"]} for r in record["ranks"]]}
+            if rank == 0:
+                (output / "first_update.json").write_text(json.dumps(health, indent=2), encoding="utf-8")
+                for group, values in result["parameter_update"]["groups"].items():
+                    print(f"[TTN update] {group}: grad={values['grad_norm']:.6g}, "
+                          f"delta={values['delta_norm']:.6g}, changed={values['changed_elements']}, "
+                          f"optimizer_states={values['optimizer_state_parameters']}", flush=True)
+            if any(r["missing_core_gradients"] for r in health["ranks"]):
+                raise RuntimeError("first training update disconnected core TTN projections; inspect first_update.json")
         if rank == 0:
             json_record(output / "train.jsonl", record)
             print(json.dumps(record), flush=True)
