@@ -344,7 +344,7 @@ def test_check_reports_actual_python_and_cache_environment(monkeypatch):
                                  "cuda_launch_blocking": "1"}
 
 
-@pytest.mark.parametrize("command", ["distributed-check", "distributed-smoke", "train", "diagnose-update", "diagnose-single"])
+@pytest.mark.parametrize("command", ["distributed-check", "distributed-smoke", "train", "unfreeze-train", "diagnose-update", "diagnose-single"])
 @pytest.mark.parametrize("custom_root", [False, True])
 @pytest.mark.parametrize("python_mode", ["valid", "missing", "base"])
 def test_sbatch_executes_one_srun_with_shared_master_and_preserves_gpu_mask(tmp_path, command, custom_root, python_mode):
@@ -353,6 +353,8 @@ def test_sbatch_executes_one_srun_with_shared_master_and_preserves_gpu_mask(tmp_
     import subprocess
     import sys
     tasks = 1 if command == "diagnose-single" else 3
+    unfreeze = command == "unfreeze-train"
+    if unfreeze: command = "train"
     command = "diagnose-update" if command == "diagnose-single" else command
     bash = Path("D:/Git/bin/bash.exe")
     if not bash.exists():
@@ -395,7 +397,7 @@ def test_sbatch_executes_one_srun_with_shared_master_and_preserves_gpu_mask(tmp_
     env = {key: value for key, value in os.environ.items()
            if not key.startswith("SLURM_") and key not in ("MASTER_ADDR", "MASTER_PORT", "DATASET_ROOT", "BATCH_FILE",
                                                          "ADAPTER", "RESUME", "OUTPUT", "PYTHON", "CONFIG", "BASE_WEIGHTS",
-                                                         "DISTRIBUTED_TIMEOUT", "NCCL_SOCKET_FAMILY", "ROOT")}
+                                                         "DISTRIBUTED_TIMEOUT", "NCCL_SOCKET_FAMILY", "ROOT", "UNFREEZE")}
     env.update({name: "/home/ad/z2zhang/stale-cache" for name in cache_names})
     if custom_root: env["ROOT"] = personal_root.as_posix()
     env.update(SLURM_JOB_ID="12345", SLURM_NTASKS=str(tasks), SLURM_JOB_NODELIST="ltu-hpc-[1-3]",
@@ -411,6 +413,7 @@ def test_sbatch_executes_one_srun_with_shared_master_and_preserves_gpu_mask(tmp_
     if command == "train":
         env.update(DATASET_ROOT=(tmp_path / "shared data").as_posix(), ADAPTER=(tmp_path / "last.pt").as_posix(), RESUME="1")
         env.update(TRAIN_SCOPE="dit" if custom_root else "ttn", BACKBONE_LR="2e-6")
+        if unfreeze: env.update(TRAIN_SCOPE="dit", RESUME="0", UNFREEZE="1")
     env.pop("PARALLEL", None)
     env.pop("CROSS_ATTN_BACKEND", None)
     env.pop("DIAGNOSTIC_UNMASK_ALL_VALID", None)
@@ -437,7 +440,7 @@ def test_sbatch_executes_one_srun_with_shared_master_and_preserves_gpu_mask(tmp_
     worker_index = args.index("bash") + 1
     assert args[worker_index].endswith("/tools/ttn_slurm_worker.sh")
     assert args[worker_index + 1:worker_index + 3] == [command, "--parallel"]
-    expected_parallel = "single" if tasks == 1 else ("fsdp2" if command == "train" and custom_root else "ddp")
+    expected_parallel = "single" if tasks == 1 else ("fsdp2" if command == "train" and (custom_root or unfreeze) else "ddp")
     assert args[args.index("--parallel") + 1] == expected_parallel
     assert f"parallel={expected_parallel}" in result.stdout
     if command in ("train", "distributed-smoke", "diagnose-update"):
@@ -472,6 +475,7 @@ def test_sbatch_executes_one_srun_with_shared_master_and_preserves_gpu_mask(tmp_
         assert exported[name] == cache_root + "/.cache" + suffix, name
     assert "[TTN cache]" in result.stdout
     assert exported["OUTPUT"].endswith("slurm-12345-C")
-    assert ("--resume" in args) == (command == "train")
+    assert ("--resume" in args) == (command == "train" and not unfreeze)
+    assert ("--unfreeze" in args) == unfreeze
     assert ("--dataset-root" in args) == (command == "train")
     if command == "distributed-smoke": assert args[args.index("--frames") + 1] == "13"

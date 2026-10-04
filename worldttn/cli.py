@@ -93,7 +93,7 @@ def build(args, stage=None, sana_path=None):
         config.data.data_dir = {names[0]: str(Path(args.data_dir).resolve())}
     if getattr(args, "vae_cache_dir", None): config.data.vae_cache_dir = str(Path(args.vae_cache_dir).resolve())
     # Do not quantize inherited master weights to BF16 before joint fine-tuning.
-    options = {"dtype": torch.float32} if getattr(args, "train_scope", "ttn") == "dit" else {}
+    options = {"dtype": torch.float32} if getattr(args, "train_scope", "ttn") in ("ttn-visual", "dit") else {}
     model = build_sana(config, ttn, args.base_weights, device=args.device, **options)
     policy = configure_cross_attention(model, getattr(args, "cross_attn_backend", "auto"),
                                        diagnostic_unmask_all_valid=getattr(args, "diagnostic_unmask_all_valid", False))
@@ -278,6 +278,8 @@ def _training_identity(args, config, settings, k):
     # Preserve existing frozen-backbone resume identities exactly.
     if getattr(args, "train_scope", "ttn") == "dit":
         identity.update(train_scope="dit", backbone_lr=getattr(args, "backbone_lr", 1e-6), optimizer_foreach=False)
+    elif getattr(args, "train_scope", "ttn") == "ttn-visual":
+        identity.update(train_scope="ttn-visual", optimizer_foreach=False)
     return identity
 
 
@@ -302,7 +304,7 @@ def _training_record(model, result, timing, parallel):
 
 def train_command(args):
     from .distributed import ParallelTraining, save_training_checkpoint, restore_training_checkpoint, rank_world
-    from .parallel_checkpoint import validate_training_checkpoint
+    from .parallel_checkpoint import validate_training_checkpoint, validate_unfreeze_checkpoint, restore_training_progress
     from .parallel_data import ResumableBatchStream
     from .training_health import audit_training_parameters, FirstUpdateProbe
     from .sana import build_sana
@@ -317,6 +319,13 @@ def train_command(args):
     k = args.tbptt or settings.get("tbptt", 2)
     identity = _training_identity(args, config, settings, k)
     payload = read_checkpoint(args.adapter, model, resume=args.resume) if args.adapter else None
+    unfreeze = getattr(args, "unfreeze", False)
+    if unfreeze:
+        if args.resume or not payload or getattr(args, "train_scope", "ttn") != "dit":
+            raise ValueError("unfreeze requires --adapter, --train-scope dit and no --resume")
+        if Path(args.output).resolve() == Path(args.adapter).resolve().parent:
+            raise ValueError("unfreeze requires a separate output directory")
+        validate_unfreeze_checkpoint(payload, mode, world, identity)
     if args.resume and payload.get("distributed"):
         validate_training_checkpoint(payload, mode, world, identity)
     elif args.resume and mode != "single":
@@ -358,6 +367,8 @@ def train_command(args):
             step, cursor = restore_training_checkpoint(args.adapter, parallel, optimizer, identity)
         else:
             step = load_checkpoint(args.adapter, model, optimizer, resume=True)
+    elif unfreeze:
+        step, cursor = restore_training_progress(args.adapter, parallel, identity)
     if not args.batch_file:
         stream = ResumableBatchStream(loader, seed=args.seed, rank=rank, world=world, state=cursor)
     parameter_report = audit_training_parameters(model, optimizer)
@@ -371,6 +382,10 @@ def train_command(args):
                "storage": parallel.storage_record(optimizer),
                "implementation": {name: {"path": str(path.resolve()), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
                                   for name, path in sources.items()}}
+        if unfreeze:
+            run["initialization"] = {"checkpoint": str(Path(args.adapter).resolve()), "step": step,
+                                     "optimizer_reset": True, "rng_and_data_cursor_restored": True}
+            print(f"[TTN unfreeze] source_step={step} next_step={step + 1} optimizer=reset rng/data=restored", flush=True)
         (output / "run_config.json").write_text(json.dumps(run, indent=2), encoding="utf-8")
         print("[TTN trainable] " + json.dumps({k: parameter_report[k] for k in
               ("stage", "train_scope", "weight_scope", "trainable_numel", "frozen_numel", "optimizer_groups")}), flush=True)
@@ -651,8 +666,8 @@ def main():
     parser.add_argument("--adapter", help="TTN checkpoint; stage comes from --stage or reference config")
     parser.add_argument("--camera-attention", choices=("linear", "sana"),
                         help="evaluate only: explicitly override the loaded TTN camera mixer/cache semantics")
-    parser.add_argument("--train-scope", choices=("ttn", "dit"), default="ttn",
-                        help="train: ttn freezes the remaining DiT; dit jointly trains the complete DiT")
+    parser.add_argument("--train-scope", choices=("ttn", "ttn-visual", "dit"), default="ttn",
+                        help="train: ttn-visual also freezes the original camera parameters; dit trains the complete DiT")
     parser.add_argument("--backbone-lr", type=float, default=1e-6,
                         help="learning rate for pretrained DiT outside five TTN anchors; --train-scope dit only")
     parser.add_argument("--stage", choices=("A", "B", "C"),
@@ -663,6 +678,8 @@ def main():
     parser.add_argument("--output", default="output/worldttn")
     parser.add_argument("--batch-file", help="precomputed tensor bundle; optional {rank} expands per process")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--unfreeze", action="store_true",
+                        help="train: initialize DiT from C/sana-camera visual warmup, reset optimizer, restore step/RNG/cursor")
     parser.add_argument("--max-steps", type=int, default=1)
     parser.add_argument("--save-every", type=int, default=50)
     parser.add_argument("--tbptt", type=int, choices=(1, 2, 4))
@@ -677,7 +694,9 @@ def main():
     if args.camera_attention is not None and args.command != "evaluate":
         parser.error("--camera-attention is an evaluate-only ablation; train with an explicit reference config")
     if args.train_scope != "ttn" and args.command != "train":
-        parser.error("--train-scope dit is only supported for train; inference reads weight scope from checkpoint")
+        parser.error("--train-scope is only supported for train; inference reads weight scope from checkpoint")
+    if args.unfreeze and (args.command != "train" or args.train_scope != "dit" or not args.adapter or args.resume):
+        parser.error("--unfreeze requires train --train-scope dit --adapter and no --resume")
     if not math.isfinite(args.backbone_lr) or args.backbone_lr <= 0:
         parser.error("--backbone-lr must be finite and positive")
     if args.command == "evaluate":

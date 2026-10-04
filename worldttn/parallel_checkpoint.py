@@ -82,6 +82,43 @@ def validate_training_checkpoint(payload, mode, world, training_config):
         raise ValueError("invalid resume directory")
 
 
+def validate_unfreeze_checkpoint(payload, mode, world, training_config):
+    meta = payload.get("distributed", {})
+    old_config = meta.get("training_config", {})
+    validate_training_checkpoint(payload, mode, world, old_config)
+    if (payload.get("train_scope") != "ttn-visual" or payload.get("stage") != "C"
+            or payload["config"].get("camera_attention") != "sana"
+            or old_config.get("train_scope") != "ttn-visual" or training_config.get("train_scope") != "dit"):
+        raise ValueError("unfreeze requires Stage C/sana-camera visual warmup -> joint DiT")
+    changed = {"train_scope", "backbone_lr", "optimizer_foreach"}
+    if ({k: v for k, v in old_config.items() if k not in changed}
+            != {k: v for k, v in training_config.items() if k not in changed}):
+        raise ValueError("unfreeze training configuration mismatch")
+
+
+def _validate_shard(shard, payload, parallel, rank):
+    if (shard.get("rank"), shard.get("world_size"), shard.get("mode"), shard.get("step"),
+            shard.get("checkpoint_id")) != (
+            rank, parallel.world, parallel.mode, payload["step"], payload["distributed"]["checkpoint_id"]):
+        raise ValueError("resume shard metadata mismatch")
+
+
+def _rank_shard(path, payload, parallel):
+    folder = Path(path).parent / payload["distributed"]["resume_dir"]
+    shard = torch.load(folder / f"rank-{parallel.rank:05d}.pt", map_location="cpu", weights_only=False)
+    _validate_shard(shard, payload, parallel, parallel.rank)
+    return shard
+
+
+def restore_training_progress(path, parallel, training_config):
+    """Deliberate scope transition: keep RNG/cursor/step, never load old Adam state."""
+    payload = read_checkpoint(path, parallel.model)
+    validate_unfreeze_checkpoint(payload, parallel.mode, parallel.world, training_config)
+    shard = _rank_shard(path, payload, parallel)
+    restore_rng(shard["rng"])
+    return int(payload["step"]), shard["data"]
+
+
 def restore_training_checkpoint(path, parallel, optimizer, training_config=None):
     """Restore optimizer/RNG/cursor AFTER loading adapter into the unwrapped model.
 
@@ -92,17 +129,11 @@ def restore_training_checkpoint(path, parallel, optimizer, training_config=None)
     payload = read_checkpoint(path, parallel.model, resume=True)
     validate_training_checkpoint(payload, parallel.mode, parallel.world, training_config)
     folder = path.parent / payload["distributed"]["resume_dir"]
-    shard = torch.load(folder / f"rank-{parallel.rank:05d}.pt", map_location="cpu", weights_only=False)
-    def validate(shard, rank):
-        if (shard.get("rank"), shard.get("world_size"), shard.get("mode"), shard.get("step"),
-                shard.get("checkpoint_id")) != (
-                rank, parallel.world, parallel.mode, payload["step"], payload["distributed"]["checkpoint_id"]):
-            raise ValueError("resume shard metadata mismatch")
-    validate(shard, parallel.rank)
+    shard = _rank_shard(path, payload, parallel)
     state = shard["optimizer"]
     if state is None:
         owner = torch.load(folder / "rank-00000.pt", map_location="cpu", weights_only=False)
-        validate(owner, 0)
+        _validate_shard(owner, payload, parallel, 0)
         state = owner["optimizer"]
         if owner.get("optimizer_parameter_names") is not None and (
                 owner["optimizer_parameter_names"] != optimizer_parameter_names(parallel.model, optimizer)):

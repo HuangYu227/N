@@ -188,18 +188,25 @@ def is_ttn_parameter(name):
     return name.startswith("ttn_system.") or any(name.startswith(f"blocks.{i}.attn.") for i in ANCHORS)
 
 
+def is_ttn_camera_parameter(name):
+    return any(name.startswith(f"blocks.{i}.attn.{group}.") for i in ANCHORS
+               for group in ("q_proj_cam", "k_proj_cam", "v_proj_cam", "out_proj_cam",
+                             "q_norm_cam", "k_norm_cam", "conv_q_cam", "conv_k_cam", "conv_v_cam"))
+
+
 def trainable_parameter_names(model, scope=None):
     scope = scope or getattr(model, "ttn_train_scope", "ttn")
-    if scope not in ("ttn", "dit"): raise ValueError("train-scope must be ttn or dit")
+    if scope not in ("ttn", "ttn-visual", "dit"): raise ValueError("train-scope must be ttn, ttn-visual or dit")
     return {name for name, _ in model.named_parameters()
             if (scope == "dit" or is_ttn_parameter(name))
+            and not (scope == "ttn-visual" and is_ttn_camera_parameter(name))
             and not (model.ttn_system.config.stage == "A" and name.startswith("ttn_system."))}
 
 
 def configure_train_scope(model, scope="ttn"):
     """Configure optimizer ownership before DDP/FSDP wrapping; compute still uses autocast."""
     expected = trainable_parameter_names(model, scope)
-    if scope == "dit": model.float()  # FP32 master weights, including inherited DiT mappings
+    if scope in ("ttn-visual", "dit"): model.float()  # Preserve masters across the later unfreeze.
     for name, p in model.named_parameters(): p.requires_grad_(name in expected)
     model.ttn_train_scope = scope
     # A previously fine-tuned, now frozen backbone must still be exported in full.

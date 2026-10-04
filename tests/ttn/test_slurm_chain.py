@@ -39,7 +39,7 @@ def complete(run, step):
 
 def test_submission_preserves_training_and_does_not_inherit_old_allocation(chain, plan, monkeypatch):
     for key in ("SLURM_JOB_ID", "SLURM_NTASKS", "SBATCH_ARRAY_INX", "MASTER_ADDR", "MASTER_PORT",
-                "CUDA_VISIBLE_DEVICES", "RANK", "BATCH_FILE", "BASE_WEIGHTS", "CONFIG", "DIAGNOSTIC_UNMASK_ALL_VALID"):
+                "CUDA_VISIBLE_DEVICES", "RANK", "BATCH_FILE", "BASE_WEIGHTS", "CONFIG", "UNFREEZE", "DIAGNOSTIC_UNMASK_ALL_VALID"):
         monkeypatch.setenv(key, "stale")
     calls = []
     def run(cmd, **kw):
@@ -54,7 +54,7 @@ def test_submission_preserves_training_and_does_not_inherit_old_allocation(chain
         assert flag in cmd
     env = kw["env"]
     assert not any(name.startswith(("SLURM_", "SBATCH_")) for name in env)
-    for key in ("MASTER_ADDR", "MASTER_PORT", "CUDA_VISIBLE_DEVICES", "RANK", "BATCH_FILE", "BASE_WEIGHTS", "CONFIG", "DIAGNOSTIC_UNMASK_ALL_VALID"):
+    for key in ("MASTER_ADDR", "MASTER_PORT", "CUDA_VISIBLE_DEVICES", "RANK", "BATCH_FILE", "BASE_WEIGHTS", "CONFIG", "UNFREEZE", "DIAGNOSTIC_UNMASK_ALL_VALID"):
         assert key not in env
     assert env["ADAPTER"] == str(Path(plan["source"]) / "last.pt")
     assert env["MAX_STEPS"] == "16" and env["SAVE_EVERY"] == "28"
@@ -139,7 +139,8 @@ def test_submission_failure_does_not_record_a_nonexistent_job(chain, plan, monke
 
 
 @pytest.mark.parametrize("pending", [True, False])
-def test_start_inherits_saved_profile_and_uses_source_final_target(chain, tmp_path, monkeypatch, pending):
+@pytest.mark.parametrize("unfreeze", [False, True])
+def test_start_inherits_saved_profile_and_uses_source_final_target(chain, tmp_path, monkeypatch, pending, unfreeze):
     project = tmp_path / "WorldTTN"
     (project / "tools").mkdir(parents=True)
     monkeypatch.setattr(chain, "__file__", str(project / "tools/ttn_slurm_chain.py"))
@@ -149,19 +150,20 @@ def test_start_inherits_saved_profile_and_uses_source_final_target(chain, tmp_pa
     monkeypatch.setenv("ROOT", str(tmp_path))
     source = tmp_path / "source"
     source.mkdir()
-    args = {"max_steps": 6, "stage": "C", "train_scope": "dit", "tbptt": 2,
+    args = {"max_steps": 6, "stage": "C", "train_scope": "ttn-visual" if unfreeze else "dit", "tbptt": 2,
             "seed": 3407, "backbone_lr": 1e-6, "config": "configs/custom.json",
             "dataset_root": "shared/example", "data_dir": "shared/raw",
             "vae_cache_dir": "shared/cache", "base_weights": "shared/base.safetensors",
             "sana_config": "configs/sana.yaml", "batch_file": None,
             "text_encoder_device": "cpu", "cross_attn_backend": "math", "activation_offload": "cpu"}
-    (source / "run_config.json").write_text(json.dumps({"parallel": "fsdp2", "world_size": 4, "arguments": args}))
+    (source / "run_config.json").write_text(json.dumps({"parallel": "fsdp2", "world_size": 4, "arguments": args,
+                                                      "training": {"train_scope": args["train_scope"]}}))
     complete(source, 3 if pending else 6)
     monkeypatch.setattr(chain, "parent_dependency", lambda job: job if pending else None)
     submissions = []
     monkeypatch.setattr(chain, "submit", lambda *values: submissions.append(values))
     chain.start_chain(SimpleNamespace(from_run=str(source), after_job="423072", target_step=500,
-                                     segment_steps=10, partition="short"))
+                                     segment_steps=10, partition="short", unfreeze=unfreeze))
     assert len(submissions) == 1
     plan, manifest, start, dependency = submissions[0]
     assert start == 6 and dependency == ("423072" if pending else None)
@@ -172,6 +174,7 @@ def test_start_inherits_saved_profile_and_uses_source_final_target(chain, tmp_pa
             assert plan["environment"][env_name] == str(args[field])
     assert plan["environment"]["PYTHON"] == str(python)
     assert "BATCH_FILE" not in plan["environment"]
+    assert bool(plan.get("unfreeze")) == unfreeze
 
 
 @pytest.mark.parametrize("change", [{"world_size": 3}, {"parallel": "ddp"}, {"stage": "A"}, {"train_scope": "ttn"}])
@@ -184,3 +187,71 @@ def test_start_rejects_incompatible_resume_profile_before_submission(chain, tmp_
     with pytest.raises(ValueError, match="FSDP2"):
         chain.start_chain(SimpleNamespace(from_run=str(tmp_path), after_job=None, target_step=500,
                                          segment_steps=10, partition="short"))
+
+
+@pytest.mark.parametrize("hold", [False, True])
+def test_fresh_original_ucpe_plan_starts_without_old_weights_and_clamps_warmup_boundary(chain, tmp_path, monkeypatch, hold):
+    project = tmp_path/"WorldTTN"
+    (project/"tools").mkdir(parents=True)
+    config = project/"configs/worldttn/reference_sana_camera.json"
+    config.parent.mkdir(parents=True)
+    config.write_text(json.dumps({"ttn": {"stage": "C", "camera_attention": "sana"}}))
+    python = tmp_path/"envs/worldttn/bin/python"
+    python.parent.mkdir(parents=True)
+    python.touch()
+    (tmp_path/"datasets/sana-wm-example").mkdir(parents=True)
+    monkeypatch.setattr(chain, "__file__", str(project/"tools/ttn_slurm_chain.py"))
+    monkeypatch.setenv("ROOT", str(tmp_path))
+    monkeypatch.setenv("ADAPTER", "/old/linear-camera.pt")
+    monkeypatch.setenv("UNFREEZE", "1")
+    calls = []
+    monkeypatch.setattr(chain, "submit", lambda *args: calls.append(args))
+    chain.fresh_chain(SimpleNamespace(output=str(tmp_path/"new"), dataset_root=None, config=None,
+                    warmup_steps=25, target_step=100, segment_steps=10, partition="short", seed=3407,
+                    tbptt=2, backbone_lr=1e-6, base_weights=None, warmup_only=hold))
+    assert len(calls) == 1
+    plan, manifest, start = calls[0]
+    assert start == 0 and plan["target_step"] == 25 and plan["environment"]["TRAIN_SCOPE"] == "ttn-visual"
+    assert bool(plan.get("joint_target_step")) == (not hold)
+    env = chain.environment(plan, 0)
+    assert "ADAPTER" not in env and "UNFREEZE" not in env and env["RESUME"] == "0"
+    env = chain.environment(plan, 20)
+    assert env["MAX_STEPS"] == "25" and env["RESUME"] == "1" and "UNFREEZE" not in env
+    assert env["ADAPTER"] == str(Path(plan["output"])/"last.pt")
+    assert manifest.is_file()
+
+
+def test_joint_transition_resets_optimizer_only_in_first_segment(chain, plan):
+    plan.update(initial_step=50, target_step=500, unfreeze=True)
+    env = chain.environment(plan, 50)
+    assert env["MAX_STEPS"] == "60" and env["RESUME"] == "0" and env["UNFREEZE"] == "1"
+    assert env["ADAPTER"] == str(Path(plan["source"])/"last.pt")
+    env = chain.environment(plan, 60)
+    assert env["RESUME"] == "1" and "UNFREEZE" not in env and env["MAX_STEPS"] == "70"
+    assert env["ADAPTER"] == str(Path(plan["output"])/"last.pt")
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_warmup_submits_joint_phase_only_after_successful_final_checkpoint(chain, plan, monkeypatch, fail):
+    plan.update(fresh=True, initial_step=0, target_step=25, joint_target_step=100,
+                joint_output=str(Path(plan["output"])/"joint"))
+    plan["environment"]["TRAIN_SCOPE"] = "ttn-visual"
+    complete(plan["output"], 20)
+    manifest = Path(plan["output"])/"chain.json"
+    manifest.write_text(json.dumps(plan))
+    monkeypatch.setenv("SLURM_JOB_ID", "98765")
+    monkeypatch.setenv("SLURM_NTASKS", "4")
+    calls = []
+    def train(cmd, **kw):
+        assert kw["env"]["MAX_STEPS"] == "25" and kw["env"]["RESUME"] == "1"
+        if fail: raise subprocess.CalledProcessError(1, cmd)
+        complete(plan["output"], 25)
+    monkeypatch.setattr(chain.subprocess, "run", train)
+    monkeypatch.setattr(chain, "start_chain", lambda args: calls.append(args))
+    if fail:
+        with pytest.raises(subprocess.CalledProcessError): chain.worker(manifest, 20)
+    else:
+        chain.worker(manifest, 20)
+        assert len(calls) == 1 and calls[0].unfreeze and calls[0].target_step == 100
+        assert calls[0].from_run == plan["output"] and calls[0].after_job == "98765"
+    assert bool(calls) == (not fail)

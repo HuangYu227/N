@@ -121,6 +121,12 @@ if [[ "${RESUME:-0}" == 1 ]]; then
   [[ "$command" == train ]] || { echo 'RESUME=1 is only supported for train' >&2; exit 2; }
   args+=(--resume)
 fi
+if [[ "${UNFREEZE:-0}" == 1 ]]; then
+  [[ "$command" == train && "${TRAIN_SCOPE:-ttn}" == dit && -n "${ADAPTER:-}" && "${RESUME:-0}" != 1 ]] || {
+    echo 'UNFREEZE=1 requires train, TRAIN_SCOPE=dit, ADAPTER, and no RESUME=1' >&2; exit 2;
+  }
+  args+=(--unfreeze)
+fi
 # Set local TMPDIR and compilation caches inside each worker, after the shared
 # cache helper above. Do not initialize a single directory on the batch node.
 exec srun --mpi=none --kill-on-bad-exit=1 --distribution=block --ntasks="$SLURM_NTASKS" --ntasks-per-node=1 \

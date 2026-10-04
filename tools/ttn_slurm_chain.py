@@ -1,4 +1,4 @@
-"""Continue an existing full-C/DiT run in sequential, hour-limited Slurm jobs.
+"""Adapt visual TTN then unfreeze DiT, or resume a run in hour-limited Slurm jobs.
 
 Uses the existing training launcher and exact-resume protocol unchanged. Only
 one successor is submitted at a time, after a successful training segment.
@@ -6,10 +6,12 @@ one successor is submitted at a time, after a successful training segment.
 import argparse
 from datetime import datetime, timezone
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 import uuid
 
 
@@ -65,7 +67,7 @@ def environment(plan, start):
     # session must not carry that session's ranks, GPU mask or launch options.
     for name in list(env):
         if name.startswith(("SLURM_", "SBATCH_")) or name in (
-            *PROFILE.values(), "OUTPUT", "ADAPTER", "RESUME", "MASTER_ADDR", "MASTER_PORT",
+            *PROFILE.values(), "OUTPUT", "ADAPTER", "RESUME", "UNFREEZE", "TRAIN_SCOPE", "MASTER_ADDR", "MASTER_PORT",
             "RANK", "LOCAL_RANK", "WORLD_SIZE", "NODE_RANK", "LOCAL_WORLD_SIZE", "CUDA_VISIBLE_DEVICES",
             "STAGES", "FRAMES", "STEPS", "LATENT_HEIGHT", "LATENT_WIDTH", "DIAGNOSTIC_UNMASK_ALL_VALID",
         ):
@@ -76,6 +78,11 @@ def environment(plan, start):
                # instead of also saving at unrelated absolute-step multiples.
                SAVE_EVERY=str(plan["target_step"] + 1),
                ADAPTER=str(Path(plan["source"] if start == plan["initial_step"] else plan["output"]) / "last.pt"))
+    if plan.get("fresh"):
+        env["RESUME"] = "0" if start == 0 else "1"
+        if start == 0: env.pop("ADAPTER", None)
+    if plan.get("unfreeze") and start == plan["initial_step"]:
+        env.update(UNFREEZE="1", RESUME="0")
     return env
 
 
@@ -106,8 +113,12 @@ def start_chain(args):
     source = Path(args.from_run).resolve()
     run = json.loads((source / "run_config.json").read_text(encoding="utf-8"))
     original = run["arguments"]
-    if (run["parallel"], run["world_size"], original["stage"], original["train_scope"]) != ("fsdp2", 4, "C", "dit"):
+    unfreeze = getattr(args, "unfreeze", False)
+    expected_scope = "ttn-visual" if unfreeze else "dit"
+    if (run["parallel"], run["world_size"], original["stage"], original["train_scope"]) != ("fsdp2", 4, "C", expected_scope):
         raise ValueError("Expected an existing 4-rank FSDP2 full Stage C/DiT training run")
+    if unfreeze and run["training"].get("train_scope") != "ttn-visual":
+        raise ValueError("unfreeze source must be a visual warmup run")
     initial = int(original["max_steps"])
     if args.target_step <= initial or args.segment_steps < 1:
         raise ValueError("Target must exceed the source run's final target; segment steps must be positive")
@@ -124,15 +135,59 @@ def start_chain(args):
                    CUDA_TRACE="0", CUDA_LAUNCH_BLOCKING="0", GDN_DISABLE_COMPILE="1",
                    GDN_DISABLE_COMPLEX_COMPILE="0", DISTRIBUTED_TIMEOUT="1800")
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    output = project / "output/worldttn" / f"formal-C-{stamp}-{uuid.uuid4().hex[:6]}"
+    output = (Path(args.output).resolve() if getattr(args, "output", None) else
+              project / "output/worldttn" / f"formal-C-{stamp}-{uuid.uuid4().hex[:6]}")
     output.mkdir(parents=True, exist_ok=False)
     plan = {"source": str(source), "project": str(project), "output": str(output), "environment": profile,
             "initial_step": initial, "target_step": args.target_step,
             "segment_steps": args.segment_steps, "partition": args.partition}
+    if unfreeze: plan["unfreeze"] = True
     manifest = output / "chain.json"
     manifest.write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
     print(f"[TTN chain] output={output}", flush=True)
     submit(plan, manifest, initial, dependency)
+
+
+def fresh_chain(args):
+    """Start from SANA, warm up visual TTN, then deliberately rebuild joint training."""
+    project = Path(__file__).resolve().parents[1]
+    root = Path(os.environ.get("ROOT", project.parent)).resolve()
+    python = root / "envs/worldttn/bin/python"
+    dataset = Path(args.dataset_root or root / "datasets/sana-wm-example").resolve()
+    config = Path(args.config or project / "configs/worldttn/reference_sana_camera.json").resolve()
+    reference = json.loads(config.read_text(encoding="utf-8"))
+    if reference["ttn"].get("stage") != "C" or reference["ttn"].get("camera_attention") != "sana":
+        raise ValueError("fresh adaptation requires the Stage C/original SANA camera config")
+    if not python.is_file() or not dataset.is_dir():
+        raise ValueError("Existing prefix Python and dataset are required; no environment/data will be created")
+    if args.warmup_steps < 1 or args.segment_steps < 1 or args.target_step <= args.warmup_steps:
+        raise ValueError("positive warmup/segment steps and target-step > warmup-steps are required")
+    if not math.isfinite(args.backbone_lr) or args.backbone_lr <= 0:
+        raise ValueError("backbone learning rate must be finite and positive")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    output = (Path(args.output).resolve() if args.output else
+              project / "output/worldttn" / f"ucpe-C-{stamp}-{uuid.uuid4().hex[:6]}")
+    output.mkdir(parents=True, exist_ok=False)
+    warmup = output / "adapt"
+    warmup.mkdir()
+    profile = {"ROOT": str(root), "PROJECT_ROOT": str(project), "PYTHON": str(python),
+               "CONFIG": str(config), "DATASET_ROOT": str(dataset), "COMMAND": "train",
+               "PARALLEL": "fsdp2", "STAGE": "C", "TRAIN_SCOPE": "ttn-visual", "RESUME": "0",
+               "SEED": str(args.seed), "TBPTT": str(args.tbptt), "BACKBONE_LR": str(args.backbone_lr),
+               "ACTIVATION_OFFLOAD": "cpu", "TEXT_ENCODER_DEVICE": "cpu", "CROSS_ATTN_BACKEND": "math",
+               "MEMORY_TRACE": "1", "CUDA_TRACE": "0", "CUDA_LAUNCH_BLOCKING": "0",
+               "GDN_DISABLE_COMPILE": "1", "GDN_DISABLE_COMPLEX_COMPILE": "0", "DISTRIBUTED_TIMEOUT": "1800"}
+    if args.base_weights: profile["BASE_WEIGHTS"] = args.base_weights
+    plan = {"source": "", "fresh": True, "project": str(project), "output": str(warmup),
+            "environment": profile, "initial_step": 0, "target_step": args.warmup_steps,
+            "segment_steps": args.segment_steps, "partition": args.partition}
+    if not args.warmup_only:
+        plan.update(joint_output=str(output / "joint"), joint_target_step=args.target_step)
+    manifest = warmup / "chain.json"
+    manifest.write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
+    print(f"[TTN chain] output={output} warmup=1..{args.warmup_steps} "
+          f"joint={'held' if args.warmup_only else str(args.warmup_steps + 1) + '..' + str(args.target_step)}", flush=True)
+    submit(plan, manifest, 0)
 
 
 def worker(manifest, start):
@@ -140,7 +195,7 @@ def worker(manifest, start):
     if start < plan["initial_step"] or start >= plan["target_step"]:
         raise ValueError("Invalid segment start")
     source = Path(plan["source"] if start == plan["initial_step"] else plan["output"])
-    require_checkpoint(source, start)
+    if not (plan.get("fresh") and start == 0): require_checkpoint(source, start)
     job = os.environ.get("SLURM_JOB_ID", "")
     if not job.isdecimal() or os.environ.get("SLURM_NTASKS") != "4":
         raise ValueError("Chain worker requires a four-task sbatch allocation")
@@ -153,6 +208,10 @@ def worker(manifest, start):
     require_checkpoint(Path(plan["output"]), stop)
     if stop < plan["target_step"]:
         submit(plan, manifest, stop, dependency=job)
+    elif plan.get("joint_target_step"):
+        start_chain(SimpleNamespace(from_run=plan["output"], after_job=job, unfreeze=True,
+                                   output=plan["joint_output"], target_step=plan["joint_target_step"],
+                                   segment_steps=plan["segment_steps"], partition=plan["partition"]))
     else:
         print(f"[TTN chain] completed target step {stop}", flush=True)
 
@@ -166,12 +225,29 @@ def main():
     start.add_argument("--target-step", type=int, default=500, help="Cumulative optimizer step, not per-job count")
     start.add_argument("--segment-steps", type=int, default=10)
     start.add_argument("--partition", default="short")
+    start.add_argument("--unfreeze", action="store_true", help="Source is C/sana-camera visual warmup; reset optimizer once")
+    start.add_argument("--output", help="New joint output directory")
+    fresh = modes.add_parser("fresh", help="New original-UCPE C run: visual adaptation then joint DiT")
+    fresh.add_argument("--warmup-steps", type=int, default=50)
+    fresh.add_argument("--target-step", type=int, default=500, help="Total adaptation + joint steps")
+    fresh.add_argument("--segment-steps", type=int, default=10)
+    fresh.add_argument("--partition", default="short")
+    fresh.add_argument("--warmup-only", action="store_true", help="Stop at warmup for quality review before unfreezing")
+    fresh.add_argument("--dataset-root")
+    fresh.add_argument("--base-weights")
+    fresh.add_argument("--config")
+    fresh.add_argument("--output")
+    fresh.add_argument("--seed", type=int, default=3407)
+    fresh.add_argument("--tbptt", type=int, choices=(1, 2, 4), default=2)
+    fresh.add_argument("--backbone-lr", type=float, default=1e-6)
     work = modes.add_parser("worker", help=argparse.SUPPRESS)
     work.add_argument("manifest", type=Path)
     work.add_argument("start_step", type=int)
     args = parser.parse_args()
     try:
-        start_chain(args) if args.mode == "start" else worker(args.manifest, args.start_step)
+        if args.mode == "start": start_chain(args)
+        elif args.mode == "fresh": fresh_chain(args)
+        else: worker(args.manifest, args.start_step)
     except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as error:
         print(f"[TTN chain] stopped: {error}", file=sys.stderr, flush=True)
         if isinstance(error, subprocess.CalledProcessError) and error.stderr:

@@ -14,6 +14,9 @@ def make_optimizer(model, lr=1e-5, *, backbone_lr=1e-6):
     if not math.isfinite(lr) or lr <= 0: raise ValueError("learning rate must be finite and positive")
     parameters = [p for p in model.parameters() if p.requires_grad]
     options = {}
+    if getattr(model, "ttn_train_scope", "ttn") == "ttn-visual":
+        parameters = [{"name": "ttn_visual", "params": parameters}]
+        options["foreach"] = False
     if getattr(model, "ttn_train_scope", "ttn") == "dit":
         if not math.isfinite(backbone_lr) or backbone_lr <= 0:
             raise ValueError("backbone learning rate must be finite and positive")
@@ -99,7 +102,7 @@ def read_checkpoint(path, model, resume=False):
     if stage != current_stage and (stage, current_stage) not in (("A", "B"), ("B", "C")):
         raise ValueError("stage initialization must advance A->B or B->C")
     train_scope, weight_scope = payload.get("train_scope", "ttn"), payload.get("weight_scope", "ttn")
-    if train_scope not in ("ttn", "dit") or weight_scope not in ("ttn", "dit"):
+    if train_scope not in ("ttn", "ttn-visual", "dit") or weight_scope not in ("ttn", "dit"):
         raise ValueError("invalid checkpoint train-scope/weight scope")
     if train_scope == "dit" and weight_scope != "dit":
         raise ValueError("joint DiT checkpoint must include full weights")
@@ -128,7 +131,7 @@ def load_checkpoint(path, model, optimizer=None, resume=False):
     if resume and payload.get("optimizer_parameter_names") is not None and (
             payload["optimizer_parameter_names"] != optimizer_parameter_names(model, optimizer)):
         raise ValueError("resume optimizer parameter names/order mismatch")
-    if resume and getattr(model, "ttn_train_scope", "ttn") == "dit":
+    if resume and getattr(model, "ttn_train_scope", "ttn") in ("ttn-visual", "dit"):
         stored_groups = payload["optimizer"]["param_groups"]
         if [g["lr"] for g in stored_groups] != [g["lr"] for g in optimizer.param_groups]:
             raise ValueError("resume learning rate mismatch")
