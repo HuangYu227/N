@@ -9,7 +9,7 @@ import sys
 import pytest
 
 
-@pytest.mark.parametrize("mode", ["valid", "sana-camera", "align-chunk", "stage-evaluate", "base-python", "multi-node"])
+@pytest.mark.parametrize("mode", ["valid", "sana-camera", "align-chunk", "stage-evaluate", "mechanism", "base-python", "multi-node"])
 def test_eval_launcher_uses_prefix_python_one_task_and_existing_local_cache_worker(tmp_path, mode):
     bash = Path("D:/Git/bin/bash.exe")
     if not bash.exists():
@@ -49,17 +49,19 @@ def test_eval_launcher_uses_prefix_python_one_task_and_existing_local_cache_work
                CUDA_VISIBLE_DEVICES="GPU-slurm-mask", GDN_DISABLE_COMPILE="1",
                REAL_PYTHON=Path(sys.executable).as_posix(), WRITER=writer.as_posix(), CAPTURE=capture.as_posix(),
                SCRIPT=(root / "tools/ttn_slurm_eval.sbatch").as_posix(), MOCK_BIN=bins.as_posix())
-    for name in ("OUTPUT", "FRAMES", "STEPS", "ADAPTER", "BASE_WEIGHTS", "SANA_CONFIG", "CONFIG", "CROSS_ATTN_BACKEND", "CAMERA_ATTENTION", "COMMAND"):
+    for name in ("OUTPUT", "FRAMES", "STEPS", "ADAPTER", "BASE_WEIGHTS", "SANA_CONFIG", "CONFIG", "CROSS_ATTN_BACKEND", "CAMERA_ATTENTION", "COMMAND",
+                 "TTN_ABLATION", "HISTORY_SOURCE", "STATE_DIAGNOSTICS", "EVAL_METHODS"):
         env.pop(name, None)
     if mode == "align-chunk": env["COMMAND"] = "align-chunk"
     if mode == "stage-evaluate":
         env["COMMAND"] = "stage-evaluate"
         env["FIXED_CASES"] = str(training / "fixed-cases.pt")
     if mode == "sana-camera": env["CAMERA_ATTENTION"] = "sana"
+    if mode == "mechanism": env.update(TTN_ABLATION="no-ttt", HISTORY_SOURCE="generated", STATE_DIAGNOSTICS="1", EVAL_METHODS="ttn")
     shell = 'export MSYS_NO_PATHCONV=1 MSYS2_ENV_CONV_EXCL="*"; export PATH="$(cd "$MOCK_BIN" && pwd):$PATH"; bash "$SCRIPT"'
     result = subprocess.run([str(bash), "-c", shell], env=env, capture_output=True, text=True,
                             encoding="utf-8", errors="replace", timeout=30)
-    if mode not in ("valid", "sana-camera", "align-chunk", "stage-evaluate"):
+    if mode not in ("valid", "sana-camera", "align-chunk", "stage-evaluate", "mechanism"):
         assert result.returncode != 0 and not capture.exists()
         return
     assert result.returncode == 0, result.stderr
@@ -82,3 +84,7 @@ def test_eval_launcher_uses_prefix_python_one_task_and_existing_local_cache_work
     assert exported["RANK"] is None and exported["MASTER_ADDR"] is None
     assert exported["HF_HOME"] == tmp_path.as_posix() + "/.cache/huggingface"
     assert exported["GDN_DISABLE_COMPILE"] == "1"
+    if mode == "mechanism":
+        assert args[args.index("--ttn-ablation") + 1] == "no-ttt"
+        assert args[args.index("--history-source") + 1] == "generated" and "--state-diagnostics" in args
+        assert args[args.index("--eval-methods") + 1] == "ttn"

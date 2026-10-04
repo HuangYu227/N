@@ -71,9 +71,16 @@ class TTNRuntimeState:
     revision: int = 0
     prefilled: bool = False
     last_stats: dict = field(default_factory=dict)
+    # Runtime-only interventions: never saved as offline model configuration.
+    ablation: str = "full"
+    diagnostics: bool = False
 
     @classmethod
-    def create(cls, config, batch_size, device):
+    def create(cls, config, batch_size, device, *, ablation="full", diagnostics=False):
+        if ablation not in ("full", "no-ttt", "identity"):
+            raise ValueError("unknown TTN runtime ablation")
+        if ablation != "full" and torch.is_grad_enabled():
+            raise ValueError("TTN runtime ablations are inference-only")
         s = torch.zeros(batch_size,
                         5,
                         config.heads,
@@ -83,7 +90,8 @@ class TTNRuntimeState:
                         dtype=torch.float32)
         psi = torch.zeros(batch_size, 5, config.heads, config.generators, device=device, dtype=torch.float32)
         pose = torch.eye(4, device=device).expand(batch_size, 4, 4).clone()
-        return cls(config, s, psi, pose, [set() for _ in range(batch_size)])
+        return cls(config, s, psi, pose, [set() for _ in range(batch_size)],
+                   ablation=ablation, diagnostics=diagnostics)
 
     def reset(self):
         self.world_state = torch.zeros_like(self.world_state)
@@ -112,12 +120,13 @@ class TTNRuntimeState:
         if prefill and (self.prefilled or self.commit_count): raise RuntimeError("prefill already completed")
         previous_pose = poses[:, 0] if prefill else self.previous_committed_pose
         with torch.autocast(device_type=self.world_state.device.type, enabled=False):
-            if self.config.stage == "A" or prefill:
+            if self.config.stage == "A" or prefill or self.ablation == "identity":
                 cbase = torch.zeros_like(self.transition_fast)
                 predicted = self.world_state
             else:
                 cbase = system.controller(poses, intrinsics, previous_pose, write, width, height)
-                coeff = cbase + (self.config.delta_psi * self.transition_fast.tanh() if self.config.stage == "C" else 0)
+                coeff = cbase + (self.config.delta_psi * self.transition_fast.tanh()
+                                 if self.config.stage == "C" and self.ablation == "full" else 0)
                 factors = CayleyFactors(system.generators.u.float(), system.generators.v.float(), coeff)
                 predicted = factors.right(self.world_state)
         self.predict_count += 1
@@ -158,10 +167,16 @@ class TTNRuntimeState:
         grad = torch.stack(gradients, 1)
         scale = (self.config.inner_clip / grad.norm(dim=-1, keepdim=True).clamp_min(self.config.eps)).clamp_max(1)
         psi = (self.transition_fast -
-               self.config.eta_psi * grad * scale).detach() if self.config.stage == "C" else torch.zeros_like(
+               self.config.eta_psi * grad * scale).detach() if self.config.stage == "C" and self.ablation == "full" else torch.zeros_like(
                    self.transition_fast)
         anchor_stats = [committed_anchor_stats(context.candidates[i][2], self.transition_fast[:, i], psi[:, i],
                         grad[:, i], scale[:, i], context.cbase[:, i], ANCHORS[i], context.prefill_mode) for i in range(5)]
+        if self.diagnostics:
+            from .stability import state_dynamics
+            for i, stats in enumerate(anchor_stats):
+                stats.update(state_dynamics(context.previous[:, i], context.predicted[:, i],
+                                            new_state[:, i], self.config.eps),
+                             inner_update_applied=self.config.stage == "C" and self.ablation == "full" and not context.prefill_mode)
         previous_pose = self.previous_committed_pose.clone()
         committed = [set(s) for s in self.committed_frame_ids]
         for b in range(new_state.shape[0]):
@@ -183,10 +198,12 @@ class TTNRuntimeState:
             "state_norm": float(new_state.detach().norm()),
             "state_rms": matrix_scale(new_state)["rms"],
             "psi_norm": float(psi.norm()),
-            "psi_update_norm": float((self.config.eta_psi * grad * scale).norm()) if self.config.stage == "C" else 0.,
+            "psi_update_norm": float((self.config.eta_psi * grad * scale).norm())
+                if self.config.stage == "C" and self.ablation == "full" else 0.,
             "prefill": context.prefill_mode,
             "anchors": anchor_stats
         }
+        if self.diagnostics or self.ablation != "full": self.last_stats["ablation"] = self.ablation
 
     def detach(self):
         self.world_state = self.world_state.detach()

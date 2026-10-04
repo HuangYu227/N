@@ -1,6 +1,7 @@
 """Paired autoregressive latent diagnostics, not a decoded SANA-WM benchmark.
 
-Future GT stays on CPU and is used only after sampling. Pose-selected returns
+Free-rollout future GT stays on CPU and is used only after sampling. Explicit
+GT-history diagnostics reveal each clean chunk only AFTER its prediction. Pose-selected returns
 are candidates, not proof that the same visible scene was actually revisited.
 """
 import gc
@@ -17,7 +18,7 @@ from .core import TTNConfig, BASE_REVISION
 from .training import chunk_ranges
 
 
-def latent_metrics(generated, reference, revisit_pairs):
+def latent_metrics(generated, reference, revisit_pairs, *, training_frames=None):
     if generated.shape != reference.shape or generated.ndim != 5 or generated.shape[0] != 1:
         raise ValueError("paired latents must have identical [1,C,F,H,W] shapes")
     frames = generated.shape[2]
@@ -41,13 +42,23 @@ def latent_metrics(generated, reference, revisit_pairs):
     t = torch.arange(1, frames, dtype=torch.float32)
     t -= t.mean()
     slope = (t * (errors[1:] - errors[1:].mean())).sum() / t.square().sum()
-    return {"mean_future_latent_mse": errors[1:].mean().item(),
+    result = {"mean_future_latent_mse": errors[1:].mean().item(),
             "final_chunk_latent_mse": chunks[-1]["latent_mse"],
             "error_slope_per_latent_frame": slope.item(),
             "per_frame_latent_mse": [None, *errors[1:].tolist()], "chunks": chunks,
             "revisits": revisits,
             "revisit_return_gt_latent_mse": _mean([p["return_gt_latent_mse"] for p in revisits]),
             "revisit_generated_pair_latent_mse": _mean([p["generated_pair_latent_mse"] for p in revisits])}
+    if training_frames is not None:
+        if training_frames < 1: raise ValueError("training horizon must be positive")
+        tail = errors[training_frames:]
+        indices = torch.arange(training_frames, frames, dtype=torch.float32)
+        indices -= indices.mean() if indices.numel() else 0
+        result.update(after_training_horizon_frame_count=tail.numel(),
+            after_training_horizon_mean_latent_mse=tail.mean().item() if tail.numel() else None,
+            after_training_horizon_error_slope=((indices * (tail - tail.mean())).sum() / indices.square().sum()).item()
+                if tail.numel() > 1 else None)
+    return result
 
 
 def _mean(values):
@@ -110,8 +121,7 @@ def paired_summary(records):
         methods[row["method"]][key] = row["metrics"]
     if not methods["sana"] or methods["sana"].keys() != methods["ttn"].keys():
         raise ValueError("summary requires a complete SANA/TTN pair for every case/seed")
-    names = ("mean_future_latent_mse", "final_chunk_latent_mse", "error_slope_per_latent_frame",
-             "revisit_return_gt_latent_mse", "revisit_generated_pair_latent_mse")
+    names = metric_names(records[0]["metrics"])
     means, deltas = {}, {}
     for name in names:
         pairs = [(methods["sana"][key][name], methods["ttn"][key][name]) for key in methods["sana"]]
@@ -125,6 +135,24 @@ def paired_summary(records):
         deltas[name] = _mean([b - a for a, b in values])
     return {"common_case_seed_count": len(methods["sana"]), "metrics": means,
             "ttn_minus_sana": deltas, "delta_direction": "lower is better; slope is descriptive"}
+
+
+def metric_names(metrics):
+    names = ("mean_future_latent_mse", "final_chunk_latent_mse", "error_slope_per_latent_frame",
+             "revisit_return_gt_latent_mse", "revisit_generated_pair_latent_mse",
+             "after_training_horizon_mean_latent_mse", "after_training_horizon_error_slope")
+    return [name for name in names if name in metrics]
+
+
+def evaluation_summary(records):
+    if {r["method"] for r in records} == {"sana", "ttn"}: return paired_summary(records)
+    method = records[0]["method"]
+    if len({(r["case_id"], r["seed"]) for r in records}) != len(records):
+        raise ValueError("duplicate single-method case/seed")
+    return {"case_seed_count": len(records), "metrics": {
+        name: {method: _mean([r["metrics"][name] for r in records if r["metrics"][name] is not None]),
+               "count": sum(r["metrics"][name] is not None for r in records)}
+        for name in metric_names(records[0]["metrics"])}}
 
 
 def file_sha256(path):
@@ -301,10 +329,18 @@ def evaluate_command(args):
     if args.cached_blocks == 0 or args.cached_blocks < -1:
         raise ValueError("--cached-blocks must be -1 (unbounded) or positive")
     run, config, ttn, adapter, adapter_digest, last_train = load_evaluation_run(args)
+    ablation = getattr(args, "ttn_ablation", "full")
+    history = getattr(args, "history_source", "generated")
+    methods = getattr(args, "eval_methods", ("sana", "ttn"))
+    diagnostics = getattr(args, "state_diagnostics", False)
+    if ablation != "full" and ttn.stage != "C": raise ValueError("mechanism ablations require a Stage C checkpoint")
+    if not methods or len(set(methods)) != len(methods) or any(m not in ("sana", "ttn") for m in methods):
+        raise ValueError("evaluate requires distinct sana/ttn methods")
     from .provenance import camera_contract, implementation_identity
     camera_policy = camera_contract(ttn.camera_attention, getattr(args, "camera_attention", None),
                                     ablation=getattr(args, "camera_ablation", False))
     cases, rejected, revisit_options = load_evaluation_cases(config, args)
+    fixed_digest = file_sha256(args.fixed_cases) if getattr(args, "fixed_cases", None) else None
     output.mkdir(parents=True)
     tokenizer, encoder = get_tokenizer_and_text_encoder(config.text_encoder.text_encoder_name, "cpu")
     encoder.eval().requires_grad_(False)
@@ -330,19 +366,24 @@ def evaluate_command(args):
                 "interpretation": "GT error includes sample ambiguity; pose candidates require visual validation",
                 "training_run": str(training_run), "checkpoint": str(adapter), "checkpoint_sha256": adapter_digest,
                 "stage": ttn.stage, "step": last_train["step"], "frames": args.frames, "steps": args.steps,
+                "ttn_ablation": ablation, "history_source": history, "eval_methods": list(methods),
+                "state_diagnostics": diagnostics,
+                "history_access": "GT slice after current denoising; commits TTN + GDN/camera/FFN caches; output remains generated"
+                    if history == "gt" else "one observed frame; generated chunks update all history",
                 "train_scope": last_train.get("train_scope", run["arguments"].get("train_scope", "ttn")),
                 "weight_scope": last_train.get("weight_scope", "ttn"),
                 "provenance": implementation_identity(), "training_provenance": run.get("provenance"),
-                "fixed_cases_sha256": file_sha256(args.fixed_cases) if getattr(args, "fixed_cases", None) else None,
+                "fixed_cases_sha256": fixed_digest,
                 "noise_frames": getattr(args, "noise_frames", None) or args.frames,
                 **camera_policy,
                 "checkpoint_camera_attention": ttn.camera_attention,
                 "ttn_camera_attention": getattr(args, "camera_attention", None) or ttn.camera_attention,
                 "ttn_camera_backend": "flash_or_math" if (getattr(args, "camera_attention", None) or ttn.camera_attention) == "sana" else None,
                 "cfg_scale": args.cfg_scale, "unconditional_text": "encoded empty prompt via SANA _encode_prompts",
+                "cross_attn_backend": args.cross_attn_backend,
                 "cached_blocks": args.cached_blocks, "kv_save_stride": 1, "refiner": None,
                 "training_history_protocol": run.get("history_protocol", {"clean_commits": "GT", "camera_cache": "all previous chunks within clip"}),
-                "rollout_history": "generated clean chunks; original SANA cache window; TTN S/psi persistent",
+                "rollout_history": f"{history} clean chunks; original SANA cache window; TTN S/psi persistent",
                 "flow_shift": config.scheduler.inference_flow_shift, "revisit_options": revisit_options,
                 "excursion_fraction_min": .1, "excursion_angle_deg_min": 15,
                 "training_latent_frames": (run["training"]["data"]["num_frames"] - 1) // config.data.vae_ratio[0] + 1,
@@ -352,7 +393,7 @@ def evaluate_command(args):
                 "launch": args.launch, "compile": {name: os.getenv(name) for name in ("GDN_DISABLE_COMPILE", "GDN_DISABLE_COMPLEX_COMPILE")}}
     (output / "manifest.json").write_text(json.dumps({"protocol": protocol, "cases": manifest, "rejected": rejected}, indent=2))
     records = []
-    for method in ("sana", "ttn"):
+    for method in methods:
         seed_everything(args.seed)
         kwargs = {"install_adapter": method == "ttn"}
         if method == "ttn" and (last_train.get("weight_scope") == "dit" or
@@ -381,11 +422,22 @@ def evaluate_command(args):
             noise = diagnostic_noise(gt.shape, args.device, case["seed"], getattr(args, "noise_frames", None))
             noise_hash = tensor_sha256(noise)
             def progress(chunk):
-                print("[TTN eval chunk] " + json.dumps({"method": method, "case": index, **chunk}), flush=True)
+                if diagnostics:
+                    display = {key: chunk[key] for key in ("chunk", "start", "end", "seconds", "state_norm", "psi_norm") if key in chunk}
+                    print("[TTN mechanism chunk] " + json.dumps({"method": method, "case": index,
+                          "ablation": ablation, "history": history, **display}), flush=True)
+                else:
+                    print("[TTN eval chunk] " + json.dumps({"method": method, "case": index, **chunk}), flush=True)
+            runtime_options = {}
+            if method == "ttn" and (ablation != "full" or diagnostics):
+                runtime_options.update(ttn_ablation=ablation, state_diagnostics=diagnostics)
+            if history == "gt": runtime_options["history_reference"] = gt
             (generated, runtime, chunks), timing = timed_cuda(lambda: rollout(
-                model, config, batch, args.steps, args.cfg_scale, args.cached_blocks, initial_noise=noise, on_chunk=progress))
+                model, config, batch, args.steps, args.cfg_scale, args.cached_blocks, initial_noise=noise,
+                on_chunk=progress, **runtime_options))
             generated = generated.cpu()
-            metrics = latent_metrics(generated, gt, case["revisit_pairs"])
+            metric_options = {"training_frames": protocol["training_latent_frames"]} if diagnostics else {}
+            metrics = latent_metrics(generated, gt, case["revisit_pairs"], **metric_options)
             row = {"case_id": case["case_id"], "seed": case["seed"], "method": method,
                    "input_sha256": case["input_sha256"], "initial_noise_sha256": noise_hash,
                    "mask_valid": int(batch["mask"].sum()), "mask_tokens": batch["mask"].numel(),
@@ -394,6 +446,10 @@ def evaluate_command(args):
                    "parameter_dtypes": sorted({str(p.dtype) for p in model.parameters()}),
                    "commits": runtime.commit_count if runtime else None,
                    "predictions": runtime.predict_count if runtime else None}
+            if diagnostics and args.frames >= 13:
+                row["prefix_13_metrics"] = latent_metrics(generated[:, :, :13], gt[:, :, :13],
+                    [p for p in case["revisit_pairs"] if p["frame_b"] < 13], **metric_options)
+                row["prefix_protocol"] = "causal first 13 frames of this rollout, same full-horizon noise; not a separate run"
             torch.save({"latents": generated, "method": method, "case_id": case["case_id"], "seed": case["seed"]},
                        output / f"case-{index:03d}-{method}.pt")
             json_record(output / "episodes.jsonl", row)
@@ -404,10 +460,14 @@ def evaluate_command(args):
         del model
         gc.collect()
         torch.cuda.empty_cache()
-    for index in range(len(cases)):
-        a, b = records[index], records[index + len(cases)]
-        if any(a[name] != b[name] for name in ("case_id", "seed", "input_sha256", "initial_noise_sha256", "base_sha256")):
-            raise AssertionError("paired evaluation inputs disagree")
-    result = {"protocol": protocol, **paired_summary(records), "episodes": records}
+    if len(methods) == 2:
+        for index in range(len(cases)):
+            a, b = records[index], records[index + len(cases)]
+            if any(a[name] != b[name] for name in ("case_id", "seed", "input_sha256", "initial_noise_sha256", "base_sha256")):
+                raise AssertionError("paired evaluation inputs disagree")
+    if file_sha256(adapter) != adapter_digest: raise ValueError("checkpoint changed during evaluation")
+    if fixed_digest is not None and file_sha256(args.fixed_cases) != fixed_digest:
+        raise ValueError("fixed cases changed during evaluation")
+    result = {"protocol": protocol, **evaluation_summary(records), "episodes": records}
     (output / "summary.json").write_text(json.dumps(result, indent=2))
-    print("[TTN eval summary] " + json.dumps({"output": str(output), **paired_summary(records)}), flush=True)
+    print("[TTN eval summary] " + json.dumps({"output": str(output), **evaluation_summary(records)}), flush=True)

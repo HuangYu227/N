@@ -48,7 +48,8 @@ def carry_cache(cache, camera_attention="linear", previous=None):
 
 class TTNSession:
 
-    def __init__(self, model, camera_conditions, width, height, valid_mask=None, extras=None):
+    def __init__(self, model, camera_conditions, width, height, valid_mask=None, extras=None,
+                 *, ablation="full", diagnostics=False):
         if camera_conditions.ndim != 3 or camera_conditions.shape[-1] != 20:
             raise ValueError("camera_conditions must contain C2W(16) + intrinsics(4)")
         self.model = model
@@ -58,9 +59,11 @@ class TTNSession:
         self.valid_mask = valid_mask
         self.extras = extras or {}
         self.runtime = None
+        self.ablation, self.diagnostics = ablation, diagnostics
 
     def reset(self, batch_size):
-        self.runtime = TTNRuntimeState.create(self.model.ttn_system.config, batch_size, self.camera.device)
+        self.runtime = TTNRuntimeState.create(self.model.ttn_system.config, batch_size, self.camera.device,
+                                             ablation=self.ablation, diagnostics=self.diagnostics)
         return self.runtime
 
     def begin_chunk(self, start, end, prefill=False):

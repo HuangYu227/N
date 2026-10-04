@@ -59,6 +59,13 @@ fi
 [[ -z "${ADAPTER:-}" ]] || args+=(--adapter "$ADAPTER")
 [[ -z "${CAMERA_ATTENTION:-}" ]] || args+=(--camera-attention "$CAMERA_ATTENTION")
 [[ "${CAMERA_ABLATION:-0}" != 1 ]] || args+=(--camera-ablation)
+[[ -z "${TTN_ABLATION:-}" ]] || args+=(--ttn-ablation "$TTN_ABLATION")
+[[ -z "${HISTORY_SOURCE:-}" ]] || args+=(--history-source "$HISTORY_SOURCE")
+[[ "${STATE_DIAGNOSTICS:-0}" != 1 ]] || args+=(--state-diagnostics)
+if [[ -n "${EVAL_METHODS:-}" ]]; then
+  read -r -a methods <<< "$EVAL_METHODS"
+  args+=(--eval-methods "${methods[@]}")
+fi
 [[ -z "${FIXED_CASES:-}" ]] || args+=(--fixed-cases "$FIXED_CASES")
 [[ -z "${BASE_WEIGHTS:-}" ]] || args+=(--base-weights "$BASE_WEIGHTS")
 [[ -z "${SANA_CONFIG:-}" ]] || args+=(--sana-config "$SANA_CONFIG")

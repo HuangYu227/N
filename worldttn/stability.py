@@ -2,6 +2,34 @@
 import torch
 
 
+@torch.no_grad()
+def state_dynamics(previous, predicted, candidate, eps):
+    """Evaluation-only, per [CFG branch, head]. Spectral concentration is not failure."""
+    previous, predicted, candidate = (t.detach().float() for t in (previous, predicted, candidate))
+    def ratio(a, b):
+        valid = b > eps
+        values = (a / b.clamp_min(eps)).cpu().tolist()
+        return [[x if valid[i, j] else None for j, x in enumerate(row)] for i, row in enumerate(values)]
+    def norm(t):
+        return t.flatten(-2).norm(dim=-1)
+    def cosine(a, b):
+        return ratio((a * b).sum((-1, -2)), norm(a) * norm(b))
+    spectra = {}
+    for name, state in (("previous", previous), ("predicted", predicted), ("committed", candidate)):
+        singular = torch.linalg.svdvals(state)
+        spectra[name] = {"sigma_max": singular[..., 0].cpu().tolist(),
+                         "top4": singular[..., :4].cpu().tolist(),
+                         "stable_rank": ratio(state.square().sum((-1, -2)), singular[..., 0].square())}
+    correction = candidate - predicted
+    return {"state_spectrum": spectra, "state_dynamics": {
+        "transport_norm": norm(predicted - previous).cpu().tolist(),
+        "transport_relative": ratio(norm(predicted - previous), norm(previous)),
+        "previous_prediction_cosine": cosine(previous, predicted),
+        "correction_prediction_cosine": cosine(correction, predicted),
+        "correction_relative": ratio(norm(correction), norm(predicted)),
+        "measurement": "detached FP32; [CFG branch, head]; zero-reference ratios are null"}}
+
+
 def matrix_scale(value):
     value = value.detach().float()
     return {"norm": value.norm().item(), "rms": value.square().mean().sqrt().item(),

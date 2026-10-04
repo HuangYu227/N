@@ -151,7 +151,8 @@ def train_update(model, config, batch, optimizer, k, parallel=None, *, activatio
 
 
 @torch.no_grad()
-def rollout(model, config, batch, steps=4, cfg_scale=4.5, cached_blocks=-1, *, initial_noise=None, on_chunk=None):
+def rollout(model, config, batch, steps=4, cfg_scale=4.5, cached_blocks=-1, *, initial_noise=None, on_chunk=None,
+            ttn_ablation="full", state_diagnostics=False, history_reference=None):
     from diffusion.scheduler.self_forcing_flow_euler_sampler import SelfForcingFlowEulerCamCtrl
     initial = batch.get("initial_latent")
     if initial is None: initial = batch["clean_latents"][:, :, :1]
@@ -160,6 +161,11 @@ def rollout(model, config, batch, steps=4, cfg_scale=4.5, cached_blocks=-1, *, i
     frames = batch["camera_conditions"].shape[1]
     if frames < 4 or frames % 3 != 1: raise ValueError("native first-plus-one rollout requires 1+3n latent frames")
     shape = (initial.shape[0], initial.shape[1], frames, *initial.shape[-2:])
+    if history_reference is not None:
+        if history_reference.device.type != "cpu" or tuple(history_reference.shape) != shape:
+            raise ValueError("GT-history reference must stay on CPU with the exact rollout shape")
+        if not torch.isfinite(history_reference).all() or not torch.equal(history_reference[:, :, :1], initial.cpu()):
+            raise ValueError("GT-history reference is nonfinite or has a different observed frame")
     if initial_noise is not None:
         if tuple(initial_noise.shape) != shape or initial_noise.device != initial.device:
             raise ValueError("initial noise shape/device must match the rollout")
@@ -169,7 +175,8 @@ def rollout(model, config, batch, steps=4, cfg_scale=4.5, cached_blocks=-1, *, i
     noise[:, :, :1] = initial.float()
     extras = {"chunk_plucker": batch["chunk_plucker"]} if "chunk_plucker" in batch else {}
     session = TTNSession(model, batch["camera_conditions"], batch["width"], batch["height"],
-                         batch.get("frame_valid_mask"), extras) if hasattr(model, "ttn_system") else None
+                         batch.get("frame_valid_mask"), extras, ablation=ttn_ablation,
+                         diagnostics=state_diagnostics) if hasattr(model, "ttn_system") else None
     from .session import repeat_batch
     cfg_batch = initial.shape[0] * (2 if cfg_scale > 1 else 1)
     camera = repeat_batch(batch["camera_conditions"], cfg_batch).clone()
@@ -195,6 +202,8 @@ def rollout(model, config, batch, steps=4, cfg_scale=4.5, cached_blocks=-1, *, i
     records = []
     last = time.perf_counter()
     try:
+        history_kwargs = {} if history_reference is None else {
+            "clean_history_provider": lambda start, end: history_reference[:, :, start:end].to(initial.device)}
         solver = SelfForcingFlowEulerCamCtrl(model,
                                              batch["y"],
                                              batch.get("uncondition", torch.zeros_like(batch["y"])),
@@ -202,7 +211,7 @@ def rollout(model, config, batch, steps=4, cfg_scale=4.5, cached_blocks=-1, *, i
                                              flow_shift=config.scheduler.inference_flow_shift,
                                              model_kwargs=kwargs,
                                              base_chunk_frames=3,
-                                             num_cached_blocks=cached_blocks)
+                                             num_cached_blocks=cached_blocks, **history_kwargs)
         with torch.autocast(device_type=initial.device.type,
                             dtype=torch.bfloat16,
                             enabled=initial.device.type == "cuda"):
@@ -217,6 +226,7 @@ def rollout(model, config, batch, steps=4, cfg_scale=4.5, cached_blocks=-1, *, i
                     "seconds": now - last,
                     **(session.runtime.last_stats if session is not None else {})
                 })
+                if history_reference is not None: records[-1]["clean_history_source"] = "GT after current prediction; all caches"
                 if on_chunk is not None: on_chunk(records[-1])
                 last = now
     finally:
@@ -652,6 +662,13 @@ def main():
                         help="align-chunk: read-only autograd.grad probe at this index; no optimizer step")
     parser.add_argument("--eval-cases", type=int, default=1, help="deterministic unique example clips, diagnostic only")
     parser.add_argument("--fixed-cases", help="immutable CPU case bundle pinned by stage evaluation (shared full horizon)")
+    parser.add_argument("--ttn-ablation", choices=("full", "no-ttt", "identity"), default="full",
+                        help="evaluate only: runtime intervention on the same C checkpoint, without changing stage/weights")
+    parser.add_argument("--history-source", choices=("generated", "gt"), default="generated",
+                        help="evaluate only: gt commits current GT after prediction to ALL caches; output stays generated")
+    parser.add_argument("--state-diagnostics", action="store_true", help="evaluate only: detached per-head spectra/transport; adds diagnostic overhead")
+    parser.add_argument("--eval-methods", nargs="+", choices=("sana", "ttn"), default=["sana", "ttn"],
+                        help="evaluate only: allow TTN-only mechanism runs without repeating the SANA baseline")
     parser.add_argument("--noise-frames", type=int, help="generate noise at this horizon, then take a prefix; use 61 for paired 13/61 diagnostics")
     parser.add_argument("--revisit-min-gap", type=int, default=30, help="minimum revisit separation in latent frames")
     parser.add_argument("--revisit-distance-fraction", type=float, default=.02, help="pose distance / trajectory extent")
@@ -709,6 +726,10 @@ def main():
     parser.add_argument("--latent-height", type=int, default=22)
     parser.add_argument("--latent-width", type=int, default=40)
     args = parser.parse_args()
+    if args.command != "evaluate" and (args.ttn_ablation != "full" or args.history_source != "generated"
+            or args.state_diagnostics or args.eval_methods != ["sana", "ttn"]):
+        parser.error("mechanism interventions are evaluate-only; training semantics are unchanged")
+    if len(set(args.eval_methods)) != len(args.eval_methods): parser.error("--eval-methods must be distinct")
     if args.camera_attention is not None and args.command != "evaluate":
         parser.error("--camera-attention is an evaluate-only ablation; train with an explicit reference config")
     if args.camera_ablation and args.command != "evaluate": parser.error("--camera-ablation is evaluate-only")

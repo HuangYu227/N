@@ -300,6 +300,9 @@ class SelfForcingFlowEulerCamCtrl(SelfForcingFlowEuler):
     ) -> None:
         model_kwargs = model_kwargs or {}
         self.ttn_session = model_kwargs.pop("ttn_session", None)
+        # Diagnostic callback only: never injected into a model's kwargs.
+        # It is consulted AFTER the current chunk has finished denoising.
+        self.clean_history_provider = kw.pop("clean_history_provider", None)
         self._extra_model_kwargs = _pop_extra_model_kwargs(model_kwargs)
         super().__init__(
             model_fn,
@@ -450,7 +453,7 @@ class SelfForcingFlowEulerCamCtrl(SelfForcingFlowEuler):
         num_chunks = len(chunk_indices) - 1
         kv_cache = self._initialize_kv_cache(num_chunks)
         kv_save_stride = int(os.environ.get("SANA_WM_STAGE1_KV_SAVE_STRIDE", "1"))
-        if self.ttn_session is not None and kv_save_stride != 1:
+        if (self.ttn_session is not None or self.clean_history_provider is not None) and kv_save_stride != 1:
             raise ValueError("TTN reference requires a clean commit on every chunk (KV_SAVE_STRIDE=1)")
         if kv_save_stride < 0:
             raise ValueError("SANA_WM_STAGE1_KV_SAVE_STRIDE must be >= 0.")
@@ -656,10 +659,16 @@ class SelfForcingFlowEulerCamCtrl(SelfForcingFlowEuler):
             if kv_save_stride == 0:
                 do_kv_save = bool(self.sink_token and chunk_idx == 0)
             if do_kv_save:
+                clean_chunk = latents[:, :, start_f:end_f]
+                if self.clean_history_provider is not None:
+                    clean_chunk = self.clean_history_provider(start_f, end_f)
+                    if (not isinstance(clean_chunk, torch.Tensor) or clean_chunk.shape != latents[:, :, start_f:end_f].shape
+                            or clean_chunk.device != device or not torch.isfinite(clean_chunk).all()):
+                        raise ValueError("invalid diagnostic clean history chunk")
                 latent_model_input = (
-                    torch.cat([latents[:, :, start_f:end_f]] * 2)
+                    torch.cat([clean_chunk] * 2)
                     if do_classifier_free_guidance
-                    else latents[:, :, start_f:end_f]
+                    else clean_chunk
                 )
                 timestep = torch.zeros(latent_model_input.shape[0], device=device)
 
