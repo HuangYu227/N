@@ -27,9 +27,23 @@ def validate_clean_output(output, reference):
         raise FloatingPointError("nonfinite clean model output; transaction not committed")
 
 
-def carry_cache(cache):
-    """Native GDN recurrent/FFN states pass through; anchors only carry FFN slot 9."""
-    return [[None] * 9 + [slot[9]] if i in ANCHORS else list(slot) for i, slot in enumerate(cache)]
+def carry_cache(cache, camera_attention="linear", previous=None):
+    """Carry native GDN/FFN state and, in SANA mode, detached camera K/V."""
+    result = []
+    for i, slot in enumerate(cache):
+        if i not in ANCHORS:
+            result.append(list(slot))
+            continue
+        carried = [None] * 9 + [slot[9]]
+        if camera_attention == "sana":
+            carried[6] = slot[6]
+            for index in (2, 3):
+                current = slot[index]
+                old = previous[i][index] if previous is not None else None
+                carried[index] = (torch.cat((old, current), dim=2) if old is not None and current is not None
+                                  else current if current is not None else old)
+        result.append(carried)
+    return result
 
 
 class TTNSession:
@@ -128,4 +142,4 @@ class TTNSession:
                                       save=True)
         validate_clean_output(out, clean)
         self.runtime.commit_chunk(c)
-        return out, carry_cache(new_cache)
+        return out, carry_cache(new_cache, self.model.ttn_system.config.camera_attention, previous=cache)

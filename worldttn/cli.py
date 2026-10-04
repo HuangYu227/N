@@ -649,6 +649,8 @@ def main():
     parser.add_argument("--sana-config")
     parser.add_argument("--base-weights", help="local mirror of the specified SANA teacher, or hf:// URI")
     parser.add_argument("--adapter", help="TTN checkpoint; stage comes from --stage or reference config")
+    parser.add_argument("--camera-attention", choices=("linear", "sana"),
+                        help="evaluate only: explicitly override the loaded TTN camera mixer/cache semantics")
     parser.add_argument("--train-scope", choices=("ttn", "dit"), default="ttn",
                         help="train: ttn freezes the remaining DiT; dit jointly trains the complete DiT")
     parser.add_argument("--backbone-lr", type=float, default=1e-6,
@@ -672,6 +674,8 @@ def main():
     parser.add_argument("--latent-height", type=int, default=22)
     parser.add_argument("--latent-width", type=int, default=40)
     args = parser.parse_args()
+    if args.camera_attention is not None and args.command != "evaluate":
+        parser.error("--camera-attention is an evaluate-only ablation; train with an explicit reference config")
     if args.train_scope != "ttn" and args.command != "train":
         parser.error("--train-scope dit is only supported for train; inference reads weight scope from checkpoint")
     if not math.isfinite(args.backbone_lr) or args.backbone_lr <= 0:

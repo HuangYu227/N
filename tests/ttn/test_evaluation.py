@@ -136,7 +136,8 @@ def test_selector_rejects_camera_fallback_and_short_horizons():
         select_cases(Dataset(), 7, 2, 3407, {})
 
 
-def test_evaluate_runs_a_complete_identical_pair_and_never_passes_future_gt(tmp_path, monkeypatch):
+@pytest.mark.parametrize("camera_mode", [None, "sana"])
+def test_evaluate_runs_a_complete_identical_pair_and_never_passes_future_gt(tmp_path, monkeypatch, camera_mode):
     from argparse import Namespace
     from dataclasses import dataclass
     from worldttn import evaluation as ev, cli, sana, checkpoint
@@ -192,6 +193,12 @@ def test_evaluate_runs_a_complete_identical_pair_and_never_passes_future_gt(tmp_
     monkeypatch.setattr(sana, "build_sana", build)
     monkeypatch.setattr(sana, "configure_cross_attention", lambda model, backend: {"backend": backend})
     monkeypatch.setattr(checkpoint, "load_checkpoint", lambda path, model: None)
+    camera_overrides = []
+    def configure_camera(model, mode):
+        assert model.adapted, "the SANA baseline must retain its native camera"
+        camera_overrides.append(mode)
+    from worldttn import anchor
+    monkeypatch.setattr(anchor, "configure_camera_attention", configure_camera)
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
     monkeypatch.setattr(cli, "timed_cuda", lambda call: (call(), {"seconds": 1., "peak_allocated_bytes": 10}))
     def rollout(model, config, batch, steps, cfg, cache, *, initial_noise, on_chunk):
@@ -208,7 +215,7 @@ def test_evaluate_runs_a_complete_identical_pair_and_never_passes_future_gt(tmp_
                      dataset_root=None, data_dir=None, vae_cache_dir=None, frames=7, eval_cases=1,
                      revisit_min_gap=3, revisit_distance_fraction=.02, revisit_angle_deg=5., revisit_max_pairs=5,
                      seed=3407, device="cpu", base_weights=None, cross_attn_backend="math", launch={},
-                     steps=20, cfg_scale=4.5, cached_blocks=2)
+                     steps=20, cfg_scale=4.5, cached_blocks=2, camera_attention=camera_mode)
     ev.evaluate_command(args)
     summary = json.loads((tmp_path / "eval/summary.json").read_text())
     assert builds == [False, True]
@@ -216,6 +223,9 @@ def test_evaluate_runs_a_complete_identical_pair_and_never_passes_future_gt(tmp_
     assert summary["common_case_seed_count"] == 1 and summary["ttn_minus_sana"]["final_chunk_latent_mse"] == 0
     assert summary["protocol"]["training_latent_frames"] == 4
     assert summary["protocol"]["stage"] == "A" and summary["protocol"]["step"] == 40
+    assert camera_overrides == ([] if camera_mode is None else [camera_mode])
+    assert summary["protocol"]["checkpoint_camera_attention"] == "linear"
+    assert summary["protocol"]["ttn_camera_attention"] == (camera_mode or "linear")
     assert summary["episodes"][0]["input_sha256"] == summary["episodes"][1]["input_sha256"]
     with pytest.raises(ValueError, match="new evaluation output directory"):
         ev.evaluate_command(args)

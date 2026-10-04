@@ -91,6 +91,7 @@ def read_checkpoint(path, model, resume=False):
         raise ValueError("base weight SHA256 mismatch")
     current = model.ttn_system.config.to_dict()
     stored = dict(payload["config"])
+    stored.setdefault("camera_attention", "linear")
     stage = stored.pop("stage")
     current_stage = current.pop("stage")
     if stored != current: raise ValueError("checkpoint architecture/config/base identity mismatch")

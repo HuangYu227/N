@@ -25,10 +25,14 @@ class TTNConfig:
     inner_clip: float = 1.
     stage: str = "A"
     base_id: str = BASE_ID
+    # Missing in legacy checkpoints: preserve their linear-camera semantics.
+    camera_attention: str = "linear"
 
     def __post_init__(self):
         if self.stage not in ("A", "B", "C"):
             raise ValueError("stage must be A, B or C")
+        if self.camera_attention not in ("linear", "sana"):
+            raise ValueError("camera_attention must be linear or sana")
         if min(self.heads, self.head_dim, self.generators) < 1 or self.head_dim % 8:
             raise ValueError("positive dimensions; UCPE half-head must be divisible by four")
         if not 0 < self.alpha_s < 2 or self.eps <= 0 or min(self.delta_psi, self.eta_psi, self.inner_clip) < 0:

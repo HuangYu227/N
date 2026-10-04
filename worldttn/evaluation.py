@@ -280,6 +280,9 @@ def evaluate_command(args):
                 "interpretation": "GT error includes sample ambiguity; pose candidates require visual validation",
                 "training_run": str(training_run), "checkpoint": str(adapter), "checkpoint_sha256": adapter_digest,
                 "stage": ttn.stage, "step": last_train["step"], "frames": args.frames, "steps": args.steps,
+                "checkpoint_camera_attention": ttn.camera_attention,
+                "ttn_camera_attention": getattr(args, "camera_attention", None) or ttn.camera_attention,
+                "ttn_camera_backend": "flash_or_math" if (getattr(args, "camera_attention", None) or ttn.camera_attention) == "sana" else None,
                 "cfg_scale": args.cfg_scale, "unconditional_text": "encoded empty prompt via SANA _encode_prompts",
                 "cached_blocks": args.cached_blocks, "kv_save_stride": 1, "refiner": None,
                 "flow_shift": config.scheduler.inference_flow_shift, "revisit_options": revisit_options,
@@ -299,6 +302,9 @@ def evaluate_command(args):
         if method == "ttn":
             load_checkpoint(adapter, model)
             if file_sha256(adapter) != adapter_digest: raise ValueError("checkpoint changed during evaluation")
+            if getattr(args, "camera_attention", None) is not None:
+                from .anchor import configure_camera_attention
+                configure_camera_attention(model, args.camera_attention)
         policy = configure_cross_attention(model, args.cross_attn_backend)
         model.eval().requires_grad_(False)
         print("[TTN eval model] " + json.dumps({"method": method, "base": model.base_load_report, "cross_attention": policy}), flush=True)

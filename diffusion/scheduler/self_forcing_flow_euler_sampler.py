@@ -760,7 +760,8 @@ class SelfForcingFlowEulerCamCtrl(SelfForcingFlowEuler):
         for block_id in range(self.num_model_blocks):
             prev_last = kv_cache[prev_cache_idx][block_id]
 
-            if getattr(self.model, "ttn_reference", False) and block_id in (3, 7, 11, 15, 19):
+            if (getattr(self.model, "ttn_reference", False) and block_id in (3, 7, 11, 15, 19)
+                    and self.model.ttn_system.config.camera_attention == "linear"):
                 # Anchors have no attention KV; preserve the original temporal FFN cache.
                 cur_kv_cache[block_id] = [None] * 9 + [prev_last[-1]]
                 continue
@@ -796,7 +797,7 @@ class SelfForcingFlowEulerCamCtrl(SelfForcingFlowEuler):
 
                 for i in valid_cached_chunks:
                     prev = kv_cache[i][block_id]
-                    if prev[0] is None:
+                    if prev[0] is None and prev[2] is None:
                         continue
 
                     for s in _SOFTMAX_CONCAT_SLOTS:

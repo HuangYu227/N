@@ -235,7 +235,7 @@ def train_clip(model,
                 loss.backward()
             _memory_phase(memory_callback, "backward_end", first=first, last=last)
         runtime.detach()
-        episode.cache = carry_cache(episode.cache)
+        episode.cache = carry_cache(episode.cache, model.ttn_system.config.camera_attention)
     params = [p for p in model.parameters() if p.requires_grad]
     grad_norm = parallel.clip_grad_norm(outer_clip) if parallel else torch.nn.utils.clip_grad_norm_(
         params, outer_clip, error_if_nonfinite=True)

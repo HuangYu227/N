@@ -56,6 +56,7 @@ else
   args+=(--alignment-grad-timestep "${ALIGNMENT_GRAD_TIMESTEP:-500}")
 fi
 [[ -z "${ADAPTER:-}" ]] || args+=(--adapter "$ADAPTER")
+[[ -z "${CAMERA_ATTENTION:-}" ]] || args+=(--camera-attention "$CAMERA_ATTENTION")
 [[ -z "${BASE_WEIGHTS:-}" ]] || args+=(--base-weights "$BASE_WEIGHTS")
 [[ -z "${SANA_CONFIG:-}" ]] || args+=(--sana-config "$SANA_CONFIG")
 [[ -z "${CONFIG:-}" ]] || args+=(--config "$CONFIG")

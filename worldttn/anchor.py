@@ -1,4 +1,5 @@
 """Actual Softmax replacement. Imports only torch until camera geometry is requested."""
+from dataclasses import replace
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -31,6 +32,13 @@ class TTNAnchor(nn.Module):
         nn.init.zeros_(self.beta_proj.weight)
         nn.init.zeros_(self.beta_proj.bias)
         self.qkv_store_buffer = None
+        native_camera = getattr(source, "_cached_cam_branch_softmax", None)
+        self._sana_camera_forward = native_camera.__func__ if native_camera is not None else None
+        if native_camera is not None:
+            for name in ("cam_heads", "cam_dim", "conv_q_cam", "conv_k_cam", "conv_v_cam"):
+                setattr(self, name, getattr(source, name))
+        if config.camera_attention == "sana" and self._sana_camera_forward is None:
+            raise ValueError("sana camera requires the original cached SANA camera implementation")
 
     def visual_features(self, x, rotary_emb):
         b, n, c = x.shape
@@ -68,6 +76,9 @@ class TTNAnchor(nn.Module):
         if ttn_chunk_context is None:
             raise ValueError("TTN anchors require an explicit ttn_chunk_context")
         ctx = ttn_chunk_context
+        incoming_cache = kwargs.get("kv_cache")
+        cache = list(incoming_cache) if incoming_cache is not None else [None] * 10
+        cache[0] = cache[1] = None  # Visual history lives in TTN S, never visual K/V.
         diagnostic = kwargs.get("ttn_diagnostic")
         cfg = self.config
         b, n, c = x.shape
@@ -100,12 +111,25 @@ class TTNAnchor(nn.Module):
         raw = raw.transpose(1, 2).reshape(b, n, c)
         if diagnostic is not None: diagnostic("visual_raw", raw)
         if camera_conditions is not None:
-            cq, ck, cv, to = self.camera_features(x, HW, camera_conditions, rotary_emb, kwargs.get("prope_fns"))
-            with torch.autocast(device_type=x.device.type, enabled=False):
-                denom = read.sum(-1).clamp_min(1).float() * self.cam_head_dim**.5
-                camera_state = ck.transpose(-1, -2) @ (cv * read[:, None, :, None]) / denom[:, None, None, None]
-                camera_out = to(cq @ camera_state)  # output transform BEFORE MergeHeads
-                camera_out = camera_out.transpose(1, 2).reshape(b, n, c)
+            if cfg.camera_attention == "sana":
+                # Reuse SANA's projections, Norm, UCPE/RoPE, output transform,
+                # SDPA and native current-chunk cache writes WITHOUT SiLU.
+                # FLASH/MATH preserve SANA's attention/mask mathematics while
+                # excluding the efficient-SDPA backward fault observed on LTU.
+                from torch.nn.attention import sdpa_kernel, SDPBackend
+                camera_kwargs = {key: value for key, value in kwargs.items()
+                                 if key not in ("kv_cache", "save_kv_cache")}
+                with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.MATH]):
+                    camera_out = self._sana_camera_forward(
+                        self, x, HW, camera_conditions, rotary_emb, cache,
+                        kwargs.get("save_kv_cache", False), chunk_size=chunk_size, **camera_kwargs)
+            else:
+                cq, ck, cv, to = self.camera_features(x, HW, camera_conditions, rotary_emb, kwargs.get("prope_fns"))
+                with torch.autocast(device_type=x.device.type, enabled=False):
+                    denom = read.sum(-1).clamp_min(1).float() * self.cam_head_dim**.5
+                    camera_state = ck.transpose(-1, -2) @ (cv * read[:, None, :, None]) / denom[:, None, None, None]
+                    camera_out = to(cq @ camera_state)  # output transform BEFORE MergeHeads
+                    camera_out = camera_out.transpose(1, 2).reshape(b, n, c)
             camera_contribution = self.out_proj_cam(camera_out.to(x.dtype))
             if diagnostic is not None:
                 diagnostic("camera_raw", camera_out.to(x.dtype))
@@ -116,8 +140,22 @@ class TTNAnchor(nn.Module):
         gated = (raw * gate).to(x.dtype)
         if diagnostic is not None: diagnostic("gated_raw", gated)
         out = self.proj(gated) * read[..., None].to(x.dtype)
-        cache = kwargs.get("kv_cache")
-        return (out, [None] * 9 + [cache[9]]) if cache is not None else out
+        if cfg.camera_attention == "sana":
+            cache[6] = x.new_tensor([0.])  # Native concat layout: camera K/V in slots 2/3.
+            cache[4] = cache[5] = cache[7] = cache[8] = None
+        else:
+            cache = [None] * 9 + [cache[9]]
+        return (out, cache) if incoming_cache is not None else out
+
+
+def configure_camera_attention(model, mode):
+    """Explicit evaluation ablation, applied after checkpoint validation/loading."""
+    config = replace(model.ttn_system.config, camera_attention=mode)
+    if mode == "sana" and any(model.blocks[i].attn._sana_camera_forward is None for i in ANCHORS):
+        raise ValueError("original SANA camera implementation is unavailable")
+    model.ttn_system.config = config
+    for i in ANCHORS:
+        model.blocks[i].attn.config = config
 
 
 def install_ttn(model, config):
