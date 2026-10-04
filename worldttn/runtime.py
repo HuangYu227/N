@@ -2,7 +2,8 @@
 from dataclasses import dataclass, field
 import torch
 from torch import nn
-from .core import TTNConfig, Rank2Generators, CayleyFactors
+from .core import ANCHORS, TTNConfig, Rank2Generators, CayleyFactors
+from .stability import committed_anchor_stats, matrix_scale
 from .controller import TransitionController
 
 
@@ -159,6 +160,8 @@ class TTNRuntimeState:
         psi = (self.transition_fast -
                self.config.eta_psi * grad * scale).detach() if self.config.stage == "C" else torch.zeros_like(
                    self.transition_fast)
+        anchor_stats = [committed_anchor_stats(context.candidates[i][2], self.transition_fast[:, i], psi[:, i],
+                        grad[:, i], scale[:, i], context.cbase[:, i], ANCHORS[i], context.prefill_mode) for i in range(5)]
         previous_pose = self.previous_committed_pose.clone()
         committed = [set(s) for s in self.committed_frame_ids]
         for b in range(new_state.shape[0]):
@@ -178,9 +181,11 @@ class TTNRuntimeState:
             "read_frames": context.read_mask.sum(-1).tolist(),
             "write_frames": context.write_mask.sum(-1).tolist(),
             "state_norm": float(new_state.detach().norm()),
+            "state_rms": matrix_scale(new_state)["rms"],
             "psi_norm": float(psi.norm()),
             "psi_update_norm": float((self.config.eta_psi * grad * scale).norm()) if self.config.stage == "C" else 0.,
-            "anchors": [context.candidates[i][2] for i in range(5)]
+            "prefill": context.prefill_mode,
+            "anchors": anchor_stats
         }
 
     def detach(self):

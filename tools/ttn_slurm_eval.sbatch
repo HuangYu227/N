@@ -44,19 +44,22 @@ command="${COMMAND:-evaluate}"
 case "$command" in
   evaluate) frames="${FRAMES:-61}"; suffix=eval ;;
   align-chunk) frames="${FRAMES:-4}"; suffix=align ;;
-  *) echo 'COMMAND must be evaluate or align-chunk' >&2; exit 2 ;;
+  stage-evaluate) frames=61; suffix=stage-eval ;;
+  *) echo 'COMMAND must be evaluate, align-chunk or stage-evaluate' >&2; exit 2 ;;
 esac
 output="${OUTPUT:-$project_root/output/worldttn/${suffix}-${SLURM_JOB_ID}}"
 args=("$command" --parallel single --training-run "$TRAINING_RUN" --output "$output"
       --frames "$frames" --eval-cases "${EVAL_CASES:-1}" --seed "${SEED:-3407}"
       --cross-attn-backend "${CROSS_ATTN_BACKEND:-math}")
-if [[ "$command" == evaluate ]]; then
+if [[ "$command" == evaluate || "$command" == stage-evaluate ]]; then
   args+=(--steps "${STEPS:-20}" --cfg-scale "${CFG_SCALE:-4.5}" --cached-blocks "${CACHED_BLOCKS:-2}")
 else
   args+=(--alignment-grad-timestep "${ALIGNMENT_GRAD_TIMESTEP:-500}")
 fi
 [[ -z "${ADAPTER:-}" ]] || args+=(--adapter "$ADAPTER")
 [[ -z "${CAMERA_ATTENTION:-}" ]] || args+=(--camera-attention "$CAMERA_ATTENTION")
+[[ "${CAMERA_ABLATION:-0}" != 1 ]] || args+=(--camera-ablation)
+[[ -z "${FIXED_CASES:-}" ]] || args+=(--fixed-cases "$FIXED_CASES")
 [[ -z "${BASE_WEIGHTS:-}" ]] || args+=(--base-weights "$BASE_WEIGHTS")
 [[ -z "${SANA_CONFIG:-}" ]] || args+=(--sana-config "$SANA_CONFIG")
 [[ -z "${CONFIG:-}" ]] || args+=(--config "$CONFIG")

@@ -9,7 +9,7 @@ import sys
 import pytest
 
 
-@pytest.mark.parametrize("mode", ["valid", "sana-camera", "align-chunk", "base-python", "multi-node"])
+@pytest.mark.parametrize("mode", ["valid", "sana-camera", "align-chunk", "stage-evaluate", "base-python", "multi-node"])
 def test_eval_launcher_uses_prefix_python_one_task_and_existing_local_cache_worker(tmp_path, mode):
     bash = Path("D:/Git/bin/bash.exe")
     if not bash.exists():
@@ -52,11 +52,14 @@ def test_eval_launcher_uses_prefix_python_one_task_and_existing_local_cache_work
     for name in ("OUTPUT", "FRAMES", "STEPS", "ADAPTER", "BASE_WEIGHTS", "SANA_CONFIG", "CONFIG", "CROSS_ATTN_BACKEND", "CAMERA_ATTENTION", "COMMAND"):
         env.pop(name, None)
     if mode == "align-chunk": env["COMMAND"] = "align-chunk"
+    if mode == "stage-evaluate":
+        env["COMMAND"] = "stage-evaluate"
+        env["FIXED_CASES"] = str(training / "fixed-cases.pt")
     if mode == "sana-camera": env["CAMERA_ATTENTION"] = "sana"
     shell = 'export MSYS_NO_PATHCONV=1 MSYS2_ENV_CONV_EXCL="*"; export PATH="$(cd "$MOCK_BIN" && pwd):$PATH"; bash "$SCRIPT"'
     result = subprocess.run([str(bash), "-c", shell], env=env, capture_output=True, text=True,
                             encoding="utf-8", errors="replace", timeout=30)
-    if mode not in ("valid", "sana-camera", "align-chunk"):
+    if mode not in ("valid", "sana-camera", "align-chunk", "stage-evaluate"):
         assert result.returncode != 0 and not capture.exists()
         return
     assert result.returncode == 0, result.stderr

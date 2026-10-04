@@ -228,6 +228,24 @@ def load_evaluation_run(args):
 
 
 def load_evaluation_cases(config, args):
+    fixed = getattr(args, "fixed_cases", None)
+    if fixed and Path(fixed).is_file():
+        bundle = torch.load(fixed, map_location="cpu", weights_only=False)
+        if bundle.get("format") != "TTN-fixed-cases-v1" or bundle["seed"] != args.seed or len(bundle["cases"]) != args.eval_cases:
+            raise ValueError("fixed case identity/seed/count differs")
+        if bundle["data_identity"] != fixed_data_identity(config):
+            raise ValueError("fixed cases were selected with a different data/text/geometry configuration")
+        cases = []
+        for source in bundle["cases"]:
+            if source["reference"].shape[2] < args.frames: raise ValueError("fixed case is shorter than requested horizon")
+            case = dict(source, reference=source["reference"][:, :, :args.frames].clone(),
+                        camera=source["camera"][:, :args.frames].clone())
+            if source["plucker"] is not None: case["plucker"] = source["plucker"][:, :args.frames].clone()
+            cases.append(case)
+        options = {"min_gap": args.revisit_min_gap, "distance_fraction": args.revisit_distance_fraction,
+                   "angle_deg": args.revisit_angle_deg, "max_pairs": args.revisit_max_pairs}
+        for case in cases: case["revisit_pairs"] = find_revisits(case["camera"][0], **options)
+        return cases, bundle["rejected"], options
     from diffusion.data.datasets.video.sana_wm_zip_latent_data import SanaWMZipLatentDataset
     data = asdict(config.data)
     data.update(num_frames=(args.frames - 1) * config.data.vae_ratio[0] + 1,
@@ -236,7 +254,36 @@ def load_evaluation_cases(config, args):
     revisit_options = {"min_gap": args.revisit_min_gap, "distance_fraction": args.revisit_distance_fraction,
                        "angle_deg": args.revisit_angle_deg, "max_pairs": args.revisit_max_pairs}
     cases, rejected = select_cases(dataset, args.frames, args.eval_cases, args.seed, revisit_options)
+    if fixed:
+        # Atomic exclusive publication also handles two queued evaluators starting together.
+        import uuid
+        path = Path(fixed).resolve()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+        torch.save({"format": "TTN-fixed-cases-v1", "seed": args.seed, "data_identity": fixed_data_identity(config),
+                    "cases": cases, "rejected": rejected}, temporary)
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            return load_evaluation_cases(config, args)
+        finally:
+            temporary.unlink()
     return cases, rejected, revisit_options
+
+
+def fixed_data_identity(config):
+    data = asdict(config.data)
+    # A longer training clip must not silently select a different diagnostic case.
+    data.pop("num_frames", None)
+    return {"data": data, "text_encoder": asdict(config.text_encoder), "vae_ratio": list(config.data.vae_ratio)}
+
+
+def diagnostic_noise(shape, device, seed, horizon=None):
+    horizon = horizon or shape[2]
+    if horizon < shape[2]: raise ValueError("noise horizon is shorter than the diagnostic input")
+    full_shape = (*shape[:2], horizon, *shape[3:])
+    generator = torch.Generator(device=device).manual_seed(seed)
+    return torch.randn(full_shape, generator=generator, device=device)[:, :, :shape[2]].contiguous()
 
 
 def evaluate_command(args):
@@ -254,6 +301,9 @@ def evaluate_command(args):
     if args.cached_blocks == 0 or args.cached_blocks < -1:
         raise ValueError("--cached-blocks must be -1 (unbounded) or positive")
     run, config, ttn, adapter, adapter_digest, last_train = load_evaluation_run(args)
+    from .provenance import camera_contract, implementation_identity
+    camera_policy = camera_contract(ttn.camera_attention, getattr(args, "camera_attention", None),
+                                    ablation=getattr(args, "camera_ablation", False))
     cases, rejected, revisit_options = load_evaluation_cases(config, args)
     output.mkdir(parents=True)
     tokenizer, encoder = get_tokenizer_and_text_encoder(config.text_encoder.text_encoder_name, "cpu")
@@ -280,23 +330,35 @@ def evaluate_command(args):
                 "interpretation": "GT error includes sample ambiguity; pose candidates require visual validation",
                 "training_run": str(training_run), "checkpoint": str(adapter), "checkpoint_sha256": adapter_digest,
                 "stage": ttn.stage, "step": last_train["step"], "frames": args.frames, "steps": args.steps,
+                "train_scope": last_train.get("train_scope", run["arguments"].get("train_scope", "ttn")),
+                "weight_scope": last_train.get("weight_scope", "ttn"),
+                "provenance": implementation_identity(), "training_provenance": run.get("provenance"),
+                "fixed_cases_sha256": file_sha256(args.fixed_cases) if getattr(args, "fixed_cases", None) else None,
+                "noise_frames": getattr(args, "noise_frames", None) or args.frames,
+                **camera_policy,
                 "checkpoint_camera_attention": ttn.camera_attention,
                 "ttn_camera_attention": getattr(args, "camera_attention", None) or ttn.camera_attention,
                 "ttn_camera_backend": "flash_or_math" if (getattr(args, "camera_attention", None) or ttn.camera_attention) == "sana" else None,
                 "cfg_scale": args.cfg_scale, "unconditional_text": "encoded empty prompt via SANA _encode_prompts",
                 "cached_blocks": args.cached_blocks, "kv_save_stride": 1, "refiner": None,
+                "training_history_protocol": run.get("history_protocol", {"clean_commits": "GT", "camera_cache": "all previous chunks within clip"}),
+                "rollout_history": "generated clean chunks; original SANA cache window; TTN S/psi persistent",
                 "flow_shift": config.scheduler.inference_flow_shift, "revisit_options": revisit_options,
                 "excursion_fraction_min": .1, "excursion_angle_deg_min": 15,
                 "training_latent_frames": (run["training"]["data"]["num_frames"] - 1) // config.data.vae_ratio[0] + 1,
                 "config": {name: asdict(getattr(config, name)) for name in ("model", "scheduler", "text_encoder", "data")},
                 "torch": torch.__version__, "cuda": torch.version.cuda,
-                "timing_scope": "sampler only; includes cold kernels, excludes model/text load and metrics",
+                "timing_scope": "instrumented sampler including clean-commit telemetry/progress logs/cold kernels; excludes model/text load and final metrics; not a throughput benchmark",
                 "launch": args.launch, "compile": {name: os.getenv(name) for name in ("GDN_DISABLE_COMPILE", "GDN_DISABLE_COMPLEX_COMPILE")}}
     (output / "manifest.json").write_text(json.dumps({"protocol": protocol, "cases": manifest, "rejected": rejected}, indent=2))
     records = []
     for method in ("sana", "ttn"):
         seed_everything(args.seed)
-        model = build_sana(config, ttn, args.base_weights or run["base"]["source"], args.device, install_adapter=method == "ttn")
+        kwargs = {"install_adapter": method == "ttn"}
+        if method == "ttn" and (last_train.get("weight_scope") == "dit" or
+                run["arguments"].get("train_scope") in ("dit", "ttn-visual")):
+            kwargs["dtype"] = torch.float32  # retain trained masters; BF16 CUDA compute still uses autocast
+        model = build_sana(config, ttn, args.base_weights or run["base"]["source"], args.device, **kwargs)
         if model.base_load_report["sha256"] != run["base"]["sha256"]:
             raise ValueError("paired evaluation base weights differ from training")
         if method == "ttn":
@@ -316,8 +378,7 @@ def evaluate_command(args):
                      "mask": case["mask"].to(args.device), "camera_conditions": case["camera"].to(args.device),
                      "width": gt.shape[-1], "height": gt.shape[-2], "data_info": to_device(default_collate([case["info"]]), args.device)}
             if case["plucker"] is not None: batch["chunk_plucker"] = case["plucker"][None].to(args.device)
-            generator = torch.Generator(device=args.device).manual_seed(case["seed"])
-            noise = torch.randn(gt.shape, generator=generator, device=args.device)
+            noise = diagnostic_noise(gt.shape, args.device, case["seed"], getattr(args, "noise_frames", None))
             noise_hash = tensor_sha256(noise)
             def progress(chunk):
                 print("[TTN eval chunk] " + json.dumps({"method": method, "case": index, **chunk}), flush=True)
@@ -330,6 +391,7 @@ def evaluate_command(args):
                    "mask_valid": int(batch["mask"].sum()), "mask_tokens": batch["mask"].numel(),
                    "metrics": metrics, "timing": timing, "chunks": chunks,
                    "base_sha256": model.base_load_report["sha256"],
+                   "parameter_dtypes": sorted({str(p.dtype) for p in model.parameters()}),
                    "commits": runtime.commit_count if runtime else None,
                    "predictions": runtime.predict_count if runtime else None}
             torch.save({"latents": generated, "method": method, "case_id": case["case_id"], "seed": case["seed"]},

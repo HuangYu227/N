@@ -255,3 +255,39 @@ def test_warmup_submits_joint_phase_only_after_successful_final_checkpoint(chain
         assert len(calls) == 1 and calls[0].unfreeze and calls[0].target_step == 100
         assert calls[0].from_run == plan["output"] and calls[0].after_job == "98765"
     assert bool(calls) == (not fail)
+
+
+def test_periodic_boundaries_and_first_unfrozen_step_are_exact(chain, plan):
+    plan["evaluation"] = {"every": 25}
+    assert chain.segment_stop(plan, 20) == 25
+    assert chain.environment(plan, 20)["MAX_STEPS"] == "25"
+    plan.update(initial_step=50, target_step=500, unfreeze=True)
+    assert chain.segment_stop(plan, 50) == 51
+    assert chain.segment_stop(plan, 71) == 75
+    assert chain.segment_stop(plan, 499) == 500
+
+
+def test_evaluation_submission_pins_snapshot_and_uses_separate_single_gpu(chain, plan, monkeypatch):
+    import tools.ttn_eval_snapshot as snapshots
+    snapshot = Path(plan["output"]) / "immutable-snapshot"
+    monkeypatch.setattr(snapshots, "snapshot_training_run", lambda source: snapshot)
+    plan["evaluation"] = {"every": 25, "seed": 3407, "steps": 20, "cases": 1,
+                          "fixed_cases": "shared/fixed-cases.pt", "output": str(Path(plan["output"]) / "eval")}
+    monkeypatch.setenv("SLURM_JOB_ID", "old")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "old")
+    monkeypatch.setenv("CAMERA_ATTENTION", "linear")
+    monkeypatch.setenv("CAMERA_ABLATION", "1")
+    calls = []
+    def submit(cmd, **kw):
+        calls.append((cmd, kw["env"]))
+        return SimpleNamespace(stdout="123456\n")
+    monkeypatch.setattr(chain.subprocess, "run", submit)
+    chain.submit_evaluation(plan, 25, "123455")
+    cmd, env = calls[0]
+    assert "--nodes=1" in cmd and "--ntasks=1" in cmd and "--gres=gpu:1" in cmd
+    assert "--dependency=afterok:123455" in cmd
+    assert env["TRAINING_RUN"] == str(snapshot) and env["FIXED_CASES"] == "shared/fixed-cases.pt"
+    assert env["COMMAND"] == "stage-evaluate" and env["PYTHON"] == plan["environment"]["PYTHON"]
+    assert not any(k in env for k in ("SLURM_JOB_ID", "ADAPTER", "CUDA_VISIBLE_DEVICES", "CAMERA_ATTENTION", "CAMERA_ABLATION"))
+    row = json.loads((Path(plan["output"]) / "eval_jobs.jsonl").read_text())
+    assert row["step"] == 25 and row["job"] == "123456"

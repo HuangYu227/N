@@ -14,6 +14,7 @@ from .training import train_clip, SANAFlowLoss, chunk_ranges
 from .session import TTNSession
 
 ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_REFERENCE = ROOT / "configs/worldttn/reference_sana_camera.json"
 
 
 def seed_everything(seed):
@@ -287,8 +288,10 @@ def _training_record(model, result, timing, parallel):
     local = {"rank": parallel.rank, "loss": result["loss"], "outer_grad_norm": result["outer_grad_norm"],
              "commits": result["runtime"].commit_count, "predictions": result["runtime"].predict_count,
              "chunks": result["chunks"], "activation_offload": result.get("activation_offload", "none"),
+             "prefill": result.get("prefill"),
              "memory_phases": result.get("memory_phases", []), **timing}
     local["storage"] = result.get("storage")
+    if "anchor_gradients" in result: local["anchor_gradients"] = result["anchor_gradients"]
     from .distributed import gather_records
     if "parameter_update" in result: local["parameter_update"] = result["parameter_update"]
     ranks = gather_records(local)
@@ -307,6 +310,8 @@ def train_command(args):
     from .parallel_checkpoint import validate_training_checkpoint, validate_unfreeze_checkpoint, restore_training_progress
     from .parallel_data import ResumableBatchStream
     from .training_health import audit_training_parameters, FirstUpdateProbe
+    from .provenance import implementation_identity
+    from .stability import stability_rows, progress_line, anchor_gradient_scales
     from .sana import build_sana
     import hashlib
     import inspect
@@ -380,6 +385,10 @@ def train_command(args):
                "training": identity, "base": model.base_load_report, "torch": torch.__version__,
                "launch": getattr(args, "launch", None), "parameters": parameter_report,
                "storage": parallel.storage_record(optimizer),
+               "provenance": implementation_identity(),
+               "camera_attention": model.ttn_system.config.camera_attention,
+               "history_protocol": {"clean_commits": "GT after current noisy loss", "camera_cache": "all previous chunks within clip",
+                                    "prefill": "initial frame once; independent GDN/FFN scratch caches", "telemetry": "detached clean commits; rank/head separated"},
                "implementation": {name: {"path": str(path.resolve()), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
                                   for name, path in sources.items()}}
         if unfreeze:
@@ -387,6 +396,8 @@ def train_command(args):
                                      "optimizer_reset": True, "rng_and_data_cursor_restored": True}
             print(f"[TTN unfreeze] source_step={step} next_step={step + 1} optimizer=reset rng/data=restored", flush=True)
         (output / "run_config.json").write_text(json.dumps(run, indent=2), encoding="utf-8")
+        json_record(output / "implementations.jsonl", {"next_step": step + 1, "train_scope": args.train_scope if hasattr(args, "train_scope") else "ttn",
+                                                     **run["provenance"]})
         print("[TTN trainable] " + json.dumps({k: parameter_report[k] for k in
               ("stage", "train_scope", "weight_scope", "trainable_numel", "frozen_numel", "optimizer_groups")}), flush=True)
     first_update = True
@@ -394,6 +405,7 @@ def train_command(args):
         if stream is not None: batch = _dataset_batch(next(stream), config, args, tokenizer, encoder, encoder_device)
         update_probe = FirstUpdateProbe(model) if first_update else None
         result, timing = timed_cuda(lambda: train_update(model, config, batch, optimizer, k, parallel))
+        result["anchor_gradients"] = anchor_gradient_scales(model)
         result["storage"] = parallel.storage_record(optimizer)
         if update_probe is not None:
             result["parameter_update"] = update_probe.report(optimizer)
@@ -416,8 +428,10 @@ def train_command(args):
             if any(r["missing_core_gradients"] for r in health["ranks"]):
                 raise RuntimeError("first training update disconnected core TTN projections; inspect first_update.json")
         if rank == 0:
+            record["implementation_id"] = run["provenance"]["source_fingerprint"]
             json_record(output / "train.jsonl", record)
-            print(json.dumps(record), flush=True)
+            for row in stability_rows(record): json_record(output / "stability.jsonl", row)
+            print(progress_line(record, args.max_steps), flush=True)
         if step % args.save_every == 0 or step == args.max_steps:
             save_training_checkpoint(output / "last.pt", parallel, optimizer, step,
                                      stream.state_dict() if stream is not None else {}, identity)
@@ -630,13 +644,15 @@ def diagnose_update_command(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("train", "infer", "smoke", "distributed-smoke", "distributed-check", "diagnose-update", "evaluate", "align-chunk"))
+    parser.add_argument("command", choices=("train", "infer", "smoke", "distributed-smoke", "distributed-check", "diagnose-update", "evaluate", "align-chunk", "stage-evaluate"))
     parser.add_argument("--training-run", help="completed training output directory; evaluate restores its config")
     parser.add_argument("--alignment-timesteps", type=int, nargs="+", default=[0, 250, 500, 750, 999],
                         help="align-chunk: fixed training-schedule indices, paired GT/noise, no CFG")
     parser.add_argument("--alignment-grad-timestep", type=int, default=500,
                         help="align-chunk: read-only autograd.grad probe at this index; no optimizer step")
     parser.add_argument("--eval-cases", type=int, default=1, help="deterministic unique example clips, diagnostic only")
+    parser.add_argument("--fixed-cases", help="immutable CPU case bundle pinned by stage evaluation (shared full horizon)")
+    parser.add_argument("--noise-frames", type=int, help="generate noise at this horizon, then take a prefix; use 61 for paired 13/61 diagnostics")
     parser.add_argument("--revisit-min-gap", type=int, default=30, help="minimum revisit separation in latent frames")
     parser.add_argument("--revisit-distance-fraction", type=float, default=.02, help="pose distance / trajectory extent")
     parser.add_argument("--revisit-angle-deg", type=float, default=5.)
@@ -660,12 +676,14 @@ def main():
     parser.add_argument("--vae-cache-dir", help="override the latent cache directory")
     parser.add_argument("--text-encoder-device", choices=("auto", "cpu", "cuda"), default="auto",
                         help="auto keeps the frozen text encoder on CPU for multi-GPU training")
-    parser.add_argument("--config", default=str(ROOT / "configs/worldttn/reference.json"))
+    parser.add_argument("--config", default=str(DEFAULT_REFERENCE),
+                        help="new runs default to C/original SANA camera; legacy linear-camera checkpoints need their explicit config")
     parser.add_argument("--sana-config")
     parser.add_argument("--base-weights", help="local mirror of the specified SANA teacher, or hf:// URI")
     parser.add_argument("--adapter", help="TTN checkpoint; stage comes from --stage or reference config")
     parser.add_argument("--camera-attention", choices=("linear", "sana"),
                         help="evaluate only: explicitly override the loaded TTN camera mixer/cache semantics")
+    parser.add_argument("--camera-ablation", action="store_true", help="evaluate only: allow/label a camera operator different from training")
     parser.add_argument("--train-scope", choices=("ttn", "ttn-visual", "dit"), default="ttn",
                         help="train: ttn-visual also freezes the original camera parameters; dit trains the complete DiT")
     parser.add_argument("--backbone-lr", type=float, default=1e-6,
@@ -693,19 +711,25 @@ def main():
     args = parser.parse_args()
     if args.camera_attention is not None and args.command != "evaluate":
         parser.error("--camera-attention is an evaluate-only ablation; train with an explicit reference config")
+    if args.camera_ablation and args.command != "evaluate": parser.error("--camera-ablation is evaluate-only")
+    if args.noise_frames is not None and (args.command not in ("evaluate", "align-chunk", "stage-evaluate") or args.noise_frames < args.frames):
+        parser.error("--noise-frames must cover the diagnostic horizon")
+    if args.fixed_cases and args.command not in ("evaluate", "align-chunk", "stage-evaluate"): parser.error("--fixed-cases is diagnostic-only")
     if args.train_scope != "ttn" and args.command != "train":
         parser.error("--train-scope is only supported for train; inference reads weight scope from checkpoint")
     if args.unfreeze and (args.command != "train" or args.train_scope != "dit" or not args.adapter or args.resume):
         parser.error("--unfreeze requires train --train-scope dit --adapter and no --resume")
     if not math.isfinite(args.backbone_lr) or args.backbone_lr <= 0:
         parser.error("--backbone-lr must be finite and positive")
-    if args.command == "evaluate":
+    if args.command in ("evaluate", "stage-evaluate"):
         if not args.training_run or args.steps is None:
             parser.error("evaluate requires --training-run and explicit --steps")
         if args.batch_file or args.resume:
             parser.error("evaluate reads real zip data from --training-run; no --batch-file or --resume")
         if args.frames < 4 or args.frames % 3 != 1 or args.eval_cases < 1:
             parser.error("evaluate requires positive cases and 1+3n latent frames")
+    if args.command == "stage-evaluate" and (args.frames != 61 or not args.fixed_cases or args.adapter):
+        parser.error("stage-evaluate requires --frames 61 --fixed-cases and the snapshot's last.pt (no --adapter)")
     if args.command == "align-chunk":
         if not args.training_run or args.frames != 4 or args.eval_cases < 1:
             parser.error("align-chunk requires --training-run, --frames 4 and positive --eval-cases")
@@ -736,7 +760,7 @@ def main():
     if min(args.steps, args.max_steps, args.save_every) < 1: parser.error("step counts must be positive")
     if int(os.environ.get("SANA_CP_SIZE", "1")) > 1: parser.error("TTN reference requires CP=1")
     world = launch["world_size"]
-    if args.command in ("infer", "smoke", "evaluate", "align-chunk") and (world > 1 or args.parallel not in ("auto", "single")):
+    if args.command in ("infer", "smoke", "evaluate", "align-chunk", "stage-evaluate") and (world > 1 or args.parallel not in ("auto", "single")):
         parser.error("infer/smoke/evaluate/align-chunk are single-card; use distributed-smoke for multi-rank training checks")
     if args.command in ("distributed-smoke", "distributed-check") and (world < 2 or args.parallel == "single"):
         parser.error(f"{args.command} requires srun, accelerate launch or torchrun with at least two processes")
@@ -752,8 +776,9 @@ def main():
             print(json.dumps({"distributed": args.launch}), flush=True)
         from .evaluation import evaluate_command
         from .alignment import alignment_command
+        from .stage_evaluation import stage_evaluate_command
         {"train": train_command, "infer": infer_command, "smoke": smoke_command, "evaluate": evaluate_command,
-         "align-chunk": alignment_command,
+         "align-chunk": alignment_command, "stage-evaluate": stage_evaluate_command,
          "distributed-smoke": distributed_smoke_command, "distributed-check": distributed_check_command,
          "diagnose-update": diagnose_update_command}[args.command](args)
     finally:

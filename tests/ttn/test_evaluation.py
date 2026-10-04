@@ -215,7 +215,8 @@ def test_evaluate_runs_a_complete_identical_pair_and_never_passes_future_gt(tmp_
                      dataset_root=None, data_dir=None, vae_cache_dir=None, frames=7, eval_cases=1,
                      revisit_min_gap=3, revisit_distance_fraction=.02, revisit_angle_deg=5., revisit_max_pairs=5,
                      seed=3407, device="cpu", base_weights=None, cross_attn_backend="math", launch={},
-                     steps=20, cfg_scale=4.5, cached_blocks=2, camera_attention=camera_mode)
+                     steps=20, cfg_scale=4.5, cached_blocks=2, camera_attention=camera_mode,
+                     camera_ablation=camera_mode is not None)
     ev.evaluate_command(args)
     summary = json.loads((tmp_path / "eval/summary.json").read_text())
     assert builds == [False, True]

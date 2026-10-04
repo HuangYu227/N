@@ -14,7 +14,7 @@ import torch
 
 from .anchor import TTNAnchor
 from .core import ANCHORS
-from .evaluation import file_sha256, tensor_sha256, load_evaluation_run, load_evaluation_cases
+from .evaluation import file_sha256, tensor_sha256, load_evaluation_run, load_evaluation_cases, diagnostic_noise
 from .session import TTNSession, validate_clean_output
 from .training import SANAFlowLoss
 from .alignment_detail import (comparison_metrics, stage_metrics, block_drift_trace, parameter_fingerprint,
@@ -23,6 +23,32 @@ from .alignment_detail import (comparison_metrics, stage_metrics, block_drift_tr
 
 def attention_output(value):
     return value[0] if isinstance(value, tuple) else value
+
+
+@contextmanager
+def matched_softmax_teacher(teacher, student):
+    """Private diagnostic: same learned mappings/backbone, original Softmax kernels.
+
+    This hybrid teacher is never used as the original-SANA rollout baseline.
+    Restore original parameter values AND dtypes after the diagnostic.
+    """
+    source, target = student.state_dict(), teacher.state_dict()
+    shared = {k: v for k, v in source.items() if not k.startswith("ttn_system.") and ".beta_proj." not in k}
+    if any(k not in target or target[k].shape != v.shape for k, v in shared.items()):
+        raise ValueError("matched teacher requires the same SANA backbone and inherited mappings")
+    backup = {k: target[k].detach().cpu().clone() for k in shared}
+    try:
+        # Match master precision as well as values; do not round FP32 TTN projections to BF16.
+        for name, parameter in teacher.named_parameters():
+            if name in shared: parameter.data = shared[name].detach().to(parameter.device, copy=True)
+        for name, buffer in teacher.named_buffers():
+            if name in shared: buffer.copy_(shared[name])
+        yield {"shared_tensors": len(shared), "reference": "student mappings/backbone with original Softmax; diagnostic hybrid"}
+    finally:
+        for name, parameter in teacher.named_parameters():
+            if name in backup: parameter.data = backup[name].to(parameter.device)
+        for name, buffer in teacher.named_buffers():
+            if name in backup: buffer.copy_(backup[name])
 
 
 @contextmanager
@@ -83,7 +109,6 @@ def probe_chunk(teacher, student, batch, flow_loss, timesteps, noise, *, gradien
     """Compare a fixed noised GT chunk with only frame 0 committed as history."""
     if teacher.training or student.training or any(p.requires_grad for m in (teacher, student) for p in m.parameters()):
         raise ValueError("alignment models must be eval/frozen")
-    if student.ttn_system.config.stage != "A": raise ValueError("this isolation diagnostic is Stage A only")
     clean = batch["clean_latents"].float()
     if clean.ndim != 5 or clean.shape[0] != 1 or clean.shape[2] != 4 or noise.shape != clean.shape:
         raise ValueError("alignment needs one batch, one native first chunk (4 latents), and matching noise")
@@ -163,6 +188,7 @@ def alignment_command(args):
     from .cli import seed_everything, to_device, timed_cuda, json_record
     from .sana import build_sana, configure_cross_attention
     from .checkpoint import load_checkpoint
+    from .provenance import implementation_identity
     from diffusion.model.builder import get_tokenizer_and_text_encoder
     from train_video_scripts.train_sana_wm_stage1 import _encode_prompts
     from torch.utils.data import default_collate
@@ -171,7 +197,6 @@ def alignment_command(args):
     if output.exists(): raise ValueError(f"use a new alignment output directory: {output}")
     if args.frames != 4: raise ValueError("align-chunk requires exactly 4 latent frames")
     run, config, ttn, adapter, digest, last_train = load_evaluation_run(args)
-    if ttn.stage != "A": raise ValueError("align-chunk currently diagnoses Stage A only")
     gradient_timestep = getattr(args, "alignment_grad_timestep", 500)
     if any(t < 0 or t >= config.scheduler.train_sampling_steps for t in [*args.alignment_timesteps, gradient_timestep]):
         raise ValueError("probe timesteps must lie inside the training schedule")
@@ -186,6 +211,13 @@ def alignment_command(args):
     gc.collect()
     output.mkdir(parents=True)
     protocol = {"scope": "single-chunk training-example isolation diagnostic, not a rollout",
+                "provenance": implementation_identity(),
+                "training_provenance": run.get("provenance"),
+                "train_scope": last_train.get("train_scope", run["arguments"].get("train_scope", "ttn")),
+                "camera_attention": ttn.camera_attention,
+                "teacher_modes": ["original_sana", "matched_backbone_softmax"],
+                "fixed_cases_sha256": file_sha256(args.fixed_cases) if getattr(args, "fixed_cases", None) else None,
+                "noise_frames": getattr(args, "noise_frames", None) or args.frames,
                 "training_run": str(Path(args.training_run).resolve()), "checkpoint": str(adapter),
                 "checkpoint_sha256": digest, "base_sha256": run["base"]["sha256"],
                 "ttn_config": ttn.to_dict(), "base_initialization_seed": args.seed,
@@ -206,7 +238,9 @@ def alignment_command(args):
     seed_everything(args.seed)
     teacher = build_sana(config, ttn, args.base_weights or run["base"]["source"], args.device, install_adapter=False)
     seed_everything(args.seed)  # also match any allowed missing base buffer/embedding initialization
-    student = build_sana(config, ttn, args.base_weights or run["base"]["source"], args.device)
+    kwargs = {"dtype": torch.float32} if (last_train.get("weight_scope") == "dit" or
+                run["arguments"].get("train_scope") in ("dit", "ttn-visual")) else {}
+    student = build_sana(config, ttn, args.base_weights or run["base"]["source"], args.device, **kwargs)
     for label, model in (("sana", teacher), ("ttn", student)):
         if model.base_load_report["sha256"] != run["base"]["sha256"]: raise ValueError("base weights differ from training")
         if label == "ttn": load_checkpoint(adapter, model)
@@ -221,14 +255,18 @@ def alignment_command(args):
                  "y": case["y"].to(args.device), "mask": case["mask"].to(args.device),
                  "data_info": to_device(default_collate([case["info"]]), args.device)}
         if case["plucker"] is not None: batch["chunk_plucker"] = case["plucker"][None].to(args.device)
-        generator = torch.Generator(device=args.device).manual_seed(case["seed"])
-        noise = torch.randn(batch["clean_latents"].shape, generator=generator, device=args.device)
+        noise = diagnostic_noise(batch["clean_latents"].shape, args.device, case["seed"], getattr(args, "noise_frames", None))
         result, timing = timed_cuda(lambda: probe_chunk(teacher, student, batch, loss_fn, args.alignment_timesteps, noise,
                                                         gradient_timestep=gradient_timestep))
         row = {"case_id": case["case_id"], "seed": case["seed"], "prompt": case["prompt"],
                "input_sha256": {k: tensor_sha256(v) for k, v in batch.items() if isinstance(v, torch.Tensor)},
                "timing": timing, **result}
         records.append(row)
+        with matched_softmax_teacher(teacher, student) as matched:
+            isolated, isolated_timing = timed_cuda(lambda: probe_chunk(
+                teacher, student, batch, loss_fn, args.alignment_timesteps, noise))
+        row["matched_backbone_softmax"] = {**matched, "timing": isolated_timing, **isolated,
+                                          "parameter_reference": "matched mappings, not initialization; beta remains zero-reference"}
         json_record(output / "episodes.jsonl", row)
         print("[TTN alignment case] " + json.dumps({"case_id": case["case_id"], "seed": case["seed"], "timing": timing,
                                                   "read_only_verified": result["read_only_verified"]}), flush=True)

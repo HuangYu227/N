@@ -70,10 +70,11 @@ def environment(plan, start):
             *PROFILE.values(), "OUTPUT", "ADAPTER", "RESUME", "UNFREEZE", "TRAIN_SCOPE", "MASTER_ADDR", "MASTER_PORT",
             "RANK", "LOCAL_RANK", "WORLD_SIZE", "NODE_RANK", "LOCAL_WORLD_SIZE", "CUDA_VISIBLE_DEVICES",
             "STAGES", "FRAMES", "STEPS", "LATENT_HEIGHT", "LATENT_WIDTH", "DIAGNOSTIC_UNMASK_ALL_VALID",
+            "CAMERA_ATTENTION", "CAMERA_ABLATION", "TRAINING_RUN", "FIXED_CASES", "EVAL_CASES",
         ):
             env.pop(name, None)
     env.update(plan["environment"])
-    env.update(OUTPUT=plan["output"], MAX_STEPS=str(min(start + plan["segment_steps"], plan["target_step"])),
+    env.update(OUTPUT=plan["output"], MAX_STEPS=str(segment_stop(plan, start)),
                # The trainer always saves at MAX_STEPS. Save once per segment
                # instead of also saving at unrelated absolute-step multiples.
                SAVE_EVERY=str(plan["target_step"] + 1),
@@ -86,8 +87,57 @@ def environment(plan, start):
     return env
 
 
-def submit(plan, manifest, start, dependency=None):
+def segment_stop(plan, start):
     stop = min(start + plan["segment_steps"], plan["target_step"])
+    evaluation = plan.get("evaluation")
+    if evaluation:
+        every = evaluation["every"]
+        stop = min(stop, (start // every + 1) * every)
+        if plan.get("unfreeze") and start == plan["initial_step"]: stop = min(stop, start + 1)
+    return stop
+
+
+def evaluation_settings(args, output):
+    if getattr(args, "evaluation", None): return args.evaluation
+    every = getattr(args, "eval_every", 0)
+    if every < 0: raise ValueError("eval-every must be nonnegative; zero explicitly disables periodic evaluation")
+    if not every: return None
+    if getattr(args, "eval_steps", 20) < 1 or getattr(args, "eval_cases", 1) < 1:
+        raise ValueError("positive eval-steps and eval-cases are required")
+    return {"every": every, "seed": getattr(args, "eval_seed", 3407), "steps": getattr(args, "eval_steps", 20),
+            "cases": getattr(args, "eval_cases", 1), "fixed_cases": str(Path(output) / "fixed-cases.pt"),
+            "output": str(Path(output) / "evaluations")}
+
+
+def submit_evaluation(plan, step, parent_job):
+    from tools.ttn_eval_snapshot import snapshot_training_run
+    evaluation = plan["evaluation"]
+    if not parent_job.isdecimal(): raise ValueError("evaluation requires a numeric parent Slurm job")
+    snapshot = snapshot_training_run(plan["output"])
+    output = Path(evaluation["output"]) / f"step-{step:06d}"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    env = environment(plan, step)
+    for key in ("ADAPTER", "RESUME", "UNFREEZE", "MAX_STEPS", "SAVE_EVERY", "TRAIN_SCOPE", "STAGE"):
+        env.pop(key, None)
+    env.update(COMMAND="stage-evaluate", TRAINING_RUN=str(snapshot), OUTPUT=str(output),
+               FIXED_CASES=evaluation["fixed_cases"], EVAL_CASES=str(evaluation["cases"]),
+               SEED=str(evaluation["seed"]), STEPS=str(evaluation["steps"]), CACHED_BLOCKS="2", CFG_SCALE="4.5")
+    command = ["sbatch", "--parsable", "--export=ALL", "--kill-on-invalid-dep=yes", "--job-name=ttn-stage-eval",
+               f"--partition={plan['partition']}", "--nodes=1", "--ntasks=1", "--ntasks-per-node=1",
+               "--gres=gpu:1", "--cpus-per-task=8", "--mem=128G", "--time=01:00:00",
+               f"--chdir={plan['project']}", f"--output={output.parent}/step-{step:06d}-%j.out",
+               f"--dependency=afterok:{parent_job}", str(Path(plan["project"]) / "tools/ttn_slurm_eval.sbatch")]
+    result = subprocess.run(command, env=env, capture_output=True, text=True, check=True)
+    job = result.stdout.strip().split(";")[0]
+    if not job.isdecimal(): raise RuntimeError(f"Unexpected evaluation sbatch response: {result.stdout!r}")
+    with (Path(plan["output"]) / "eval_jobs.jsonl").open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps({"step": step, "job": job, "snapshot": str(snapshot), "output": str(output),
+                                 "train_scope": plan["environment"]["TRAIN_SCOPE"]}) + "\n")
+    print(f"[TTN evaluation queued] step={step} job={job} snapshot={snapshot} output={output}", flush=True)
+
+
+def submit(plan, manifest, start, dependency=None):
+    stop = segment_stop(plan, start)
     command = ["sbatch", "--parsable", "--export=ALL", "--kill-on-invalid-dep=yes",
                "--job-name=ttn-formal", f"--partition={plan['partition']}",
                "--nodes=4", "--ntasks=4", "--ntasks-per-node=1", "--gres=gpu:1",
@@ -142,6 +192,8 @@ def start_chain(args):
             "initial_step": initial, "target_step": args.target_step,
             "segment_steps": args.segment_steps, "partition": args.partition}
     if unfreeze: plan["unfreeze"] = True
+    evaluation = evaluation_settings(args, output)
+    if evaluation: plan["evaluation"] = evaluation
     manifest = output / "chain.json"
     manifest.write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
     print(f"[TTN chain] output={output}", flush=True)
@@ -183,6 +235,8 @@ def fresh_chain(args):
             "segment_steps": args.segment_steps, "partition": args.partition}
     if not args.warmup_only:
         plan.update(joint_output=str(output / "joint"), joint_target_step=args.target_step)
+    evaluation = evaluation_settings(args, output)
+    if evaluation: plan["evaluation"] = evaluation
     manifest = warmup / "chain.json"
     manifest.write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
     print(f"[TTN chain] output={output} warmup=1..{args.warmup_steps} "
@@ -206,12 +260,16 @@ def worker(manifest, start):
                    env=env, cwd=plan["project"], check=True)
     stop = int(env["MAX_STEPS"])
     require_checkpoint(Path(plan["output"]), stop)
+    evaluation = plan.get("evaluation")
+    if evaluation and (stop % evaluation["every"] == 0 or stop == plan["target_step"] or
+                       (plan.get("unfreeze") and start == plan["initial_step"])):
+        submit_evaluation(plan, stop, job)
     if stop < plan["target_step"]:
         submit(plan, manifest, stop, dependency=job)
     elif plan.get("joint_target_step"):
         start_chain(SimpleNamespace(from_run=plan["output"], after_job=job, unfreeze=True,
                                    output=plan["joint_output"], target_step=plan["joint_target_step"],
-                                   segment_steps=plan["segment_steps"], partition=plan["partition"]))
+                                   segment_steps=plan["segment_steps"], partition=plan["partition"], evaluation=evaluation))
     else:
         print(f"[TTN chain] completed target step {stop}", flush=True)
 
@@ -240,6 +298,11 @@ def main():
     fresh.add_argument("--seed", type=int, default=3407)
     fresh.add_argument("--tbptt", type=int, choices=(1, 2, 4), default=2)
     fresh.add_argument("--backbone-lr", type=float, default=1e-6)
+    for command in (start, fresh):
+        command.add_argument("--eval-every", type=int, default=25, help="immutable fixed-case evaluation cadence; zero disables")
+        command.add_argument("--eval-seed", type=int, default=3407)
+        command.add_argument("--eval-steps", type=int, default=20)
+        command.add_argument("--eval-cases", type=int, default=1)
     work = modes.add_parser("worker", help=argparse.SUPPRESS)
     work.add_argument("manifest", type=Path)
     work.add_argument("start_step", type=int)

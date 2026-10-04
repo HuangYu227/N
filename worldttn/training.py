@@ -114,6 +114,7 @@ class ClipTrainingContext:
     records: list = field(default_factory=list)
     total_loss: float = 0.
     memory_callback: object = None
+    prefill_stats: dict = field(default_factory=dict)
 
 
 class TTNTrainingWindow(torch.nn.Module):
@@ -134,6 +135,7 @@ class TTNTrainingWindow(torch.nn.Module):
         if prefill:
             _memory_phase(episode.memory_callback, "prefill_begin")
             session.prefill(episode.clean[:, :, :1], episode.y, episode.mask, episode.data_info)
+            episode.prefill_stats = dict(session.runtime.last_stats, chunk=-1, start=0, end=1)
             _memory_phase(episode.memory_callback, "prefill_end")
             return episode.clean.new_zeros(())
         losses_in_window = []
@@ -155,7 +157,7 @@ class TTNTrainingWindow(torch.nn.Module):
             _memory_phase(episode.memory_callback, "clean_begin", chunk=index, start=start, end=end)
             _, episode.cache = session.clean_forward(episode.clean[:, :, start:end], episode.y, context,
                                                       episode.cache, start, end, episode.mask, episode.data_info)
-            episode.records.append(dict(session.runtime.last_stats))
+            episode.records.append(dict(session.runtime.last_stats, chunk=index, start=start, end=end))
             _memory_phase(episode.memory_callback, "clean_end", chunk=index, start=start, end=end)
         return torch.stack(losses_in_window).sum()
 
@@ -243,4 +245,4 @@ def train_clip(model,
     optimizer.step()  # slow parameters stay fixed throughout every clip's windows
     _memory_phase(memory_callback, "optimizer_end")
     return {"loss": episode.total_loss, "outer_grad_norm": float(grad_norm), "runtime": runtime,
-            "chunks": episode.records}
+            "chunks": episode.records, "prefill": episode.prefill_stats}

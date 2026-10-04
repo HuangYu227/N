@@ -3,7 +3,8 @@ from dataclasses import replace
 import torch
 from torch import nn
 from torch.nn import functional as F
-from .core import ANCHORS, correct, innovation_loss, analytic_psi_gradient
+from .core import ANCHORS, correct, analytic_psi_gradient
+from .stability import clean_anchor_stats, matrix_scale
 from .geometry import apply_complex_rope
 from .runtime import TTNSystem
 
@@ -100,15 +101,15 @@ class TTNAnchor(nn.Module):
                                                      ctx.system.generators.u[self.index].float(),
                                                      ctx.system.generators.v[self.index].float(),
                                                      ctx.cbase[:, self.index], ctx.psi[:, self.index], cfg.delta_psi)
-                stats = {
-                    "write_tokens": int(write.sum()),
-                    "read_tokens": int(read.sum()),
-                    "innovation_loss":
-                    float(innovation_loss(ctx.predicted[:, self.index], k, v, w, write).detach().mean()),
-                    "inner_grad_norm": float(gradient.norm())
-                }
+                stats = clean_anchor_stats(ctx.previous[:, self.index], ctx.predicted[:, self.index],
+                                           state, q, k, v, beta, w, read, write, gradient, cfg)
                 ctx.stage(self.index, state, gradient, stats)
         raw = raw.transpose(1, 2).reshape(b, n, c)
+        if ctx.clean_mode:
+            stats.update(camera_attention=cfg.camera_attention,
+                         camera_cached_tokens=int(incoming_cache[2].shape[2]) if cfg.camera_attention == "sana" and incoming_cache is not None and incoming_cache[2] is not None else 0,
+                         camera_current_tokens=n if camera_conditions is not None else 0,
+                         visual_read=matrix_scale(raw))
         if diagnostic is not None: diagnostic("visual_raw", raw)
         if camera_conditions is not None:
             if cfg.camera_attention == "sana":
@@ -131,6 +132,8 @@ class TTNAnchor(nn.Module):
                     camera_out = to(cq @ camera_state)  # output transform BEFORE MergeHeads
                     camera_out = camera_out.transpose(1, 2).reshape(b, n, c)
             camera_contribution = self.out_proj_cam(camera_out.to(x.dtype))
+            if ctx.clean_mode:
+                stats.update(camera_raw=matrix_scale(camera_out), camera_contribution=matrix_scale(camera_contribution))
             if diagnostic is not None:
                 diagnostic("camera_raw", camera_out.to(x.dtype))
                 diagnostic("camera_contribution", camera_contribution)
@@ -140,6 +143,7 @@ class TTNAnchor(nn.Module):
         gated = (raw * gate).to(x.dtype)
         if diagnostic is not None: diagnostic("gated_raw", gated)
         out = self.proj(gated) * read[..., None].to(x.dtype)
+        if ctx.clean_mode: stats["anchor_output"] = matrix_scale(out)
         if cfg.camera_attention == "sana":
             cache[6] = x.new_tensor([0.])  # Native concat layout: camera K/V in slots 2/3.
             cache[4] = cache[5] = cache[7] = cache[8] = None

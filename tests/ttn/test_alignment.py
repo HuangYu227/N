@@ -247,3 +247,27 @@ def test_alignment_command_loads_real_adapter_identity_and_writes_probe_report(t
     assert report["episodes"][0]["probes"][0]["anchors"][0]["rms_ratio"] > 0
     with pytest.raises(ValueError, match="new alignment output"):
         al.alignment_command(args)
+
+
+@pytest.mark.parametrize("stage", ["B", "C"])
+def test_full_stage_probe_is_read_only_and_matched_teacher_restores_values_and_dtypes(stage):
+    from dataclasses import replace
+    from worldttn.alignment import matched_softmax_teacher
+    teacher, student, batch = models_and_batch()
+    cfg = replace(student.ttn_system.config, stage=stage)
+    student.ttn_system.config = cfg
+    for i in ANCHORS: student.blocks[i].attn.config = cfg
+    with torch.no_grad():
+        student.blocks[3].attn.qkv.weight.add_(.125)
+        student.blocks[4].attn.qkv.weight.add_(.25)
+        student.ttn_system.controller.heads[0].bias.fill_(.1)
+    before = {k: v.clone() for k, v in teacher.state_dict().items()}
+    with matched_softmax_teacher(teacher, student):
+        torch.testing.assert_close(teacher.blocks[3].attn.qkv.weight, student.blocks[3].attn.qkv.weight, rtol=0, atol=0)
+        torch.testing.assert_close(teacher.blocks[4].attn.qkv.weight, student.blocks[4].attn.qkv.weight, rtol=0, atol=0)
+        result = probe_chunk(teacher, student, batch, linear_flow_loss, [500], torch.randn_like(batch["clean_latents"]))
+        assert result["read_only_verified"]["parameters_unchanged"]
+        assert result["probes"][0]["anchors"][0]["stages"]["projected_qkv"]["q"]["relative_l2"] == 0
+    for key, value in teacher.state_dict().items():
+        assert value.dtype == before[key].dtype
+        torch.testing.assert_close(value, before[key], rtol=0, atol=0)
