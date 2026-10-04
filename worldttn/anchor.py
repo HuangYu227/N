@@ -3,7 +3,9 @@ from dataclasses import replace
 import torch
 from torch import nn
 from torch.nn import functional as F
-from .core import ANCHORS, correct, analytic_psi_gradient
+from .core import (ANCHORS, correct, analytic_psi_gradient, correct_with_aux, CorrectionAux,
+                   analytic_psi_gradient_dense_from_aux, analytic_psi_gradient_projected)
+from .performance import DEFAULT_EXECUTION, annotation, audit_layout
 from .stability import clean_anchor_stats, matrix_scale
 from .geometry import apply_complex_rope
 from .runtime import TTNSystem
@@ -82,6 +84,7 @@ class TTNAnchor(nn.Module):
         cache[0] = cache[1] = None  # Visual history lives in TTN S, never visual K/V.
         diagnostic = kwargs.get("ttn_diagnostic")
         cfg = self.config
+        execution = getattr(self, "ttn_execution", DEFAULT_EXECUTION)
         b, n, c = x.shape
         if diagnostic is not None: diagnostic("input", x)
         read, write = ctx.token_masks(n)
@@ -90,19 +93,46 @@ class TTNAnchor(nn.Module):
         if diagnostic is not None: diagnostic("visual_features", (q, k, v))
         with torch.autocast(device_type=x.device.type, enabled=False):
             beta = self.beta_proj(x.float()).sigmoid().transpose(1, 2)
-            state, w = correct(ctx.predicted[:, self.index], k, v, beta, write, cfg.alpha_s, cfg.eps)
-            raw = q @ state
+            predicted = ctx.predicted[:, self.index]
+            audit_layout(self, "clean" if ctx.clean_mode else "diagnostic" if diagnostic is not None else "noisy",
+                         q=q, k=k, v=v, beta=beta, predicted=predicted, write=write)
+            with annotation(execution, "CorrectRead"):
+                if execution.core_backend == "reference":
+                    state, w = correct(predicted, k, v, beta, write, cfg.alpha_s, cfg.eps)
+                    raw = q @ state
+                elif execution.core_backend == "compiled":
+                    from . import compiled
+                    if ctx.clean_mode or diagnostic is not None:
+                        raw, *values = compiled.with_aux(q, k, v, beta, predicted, write, cfg.alpha_s, cfg.eps)
+                        aux = CorrectionAux(*values)
+                        state, w = aux.candidate, aux.w
+                    else:
+                        raw = compiled.read_only(q, k, v, beta, predicted, write, cfg.alpha_s, cfg.eps)
+                else:
+                    aux = correct_with_aux(predicted, k, v, beta, write, cfg.alpha_s, cfg.eps)
+                    state, w = aux.candidate, aux.w
+                    raw = q @ state
             if diagnostic is not None:
                 diagnostic("memory", (ctx.predicted[:, self.index], state, k, v, beta, w, write))
             if ctx.clean_mode:
                 gradient = torch.zeros_like(ctx.psi[:, self.index])
                 if cfg.stage == "C" and not ctx.prefill_mode:
-                    gradient = analytic_psi_gradient(ctx.previous[:, self.index], k, v, w, write,
-                                                     ctx.system.generators.u[self.index].float(),
-                                                     ctx.system.generators.v[self.index].float(),
-                                                     ctx.cbase[:, self.index], ctx.psi[:, self.index], cfg.delta_psi)
-                stats = clean_anchor_stats(ctx.previous[:, self.index], ctx.predicted[:, self.index],
-                                           state, q, k, v, beta, w, read, write, gradient, cfg)
+                    with annotation(execution, "Psi"):
+                        if execution.core_backend == "reference":
+                            gradient = analytic_psi_gradient(ctx.previous[:, self.index], k, v, w, write,
+                                                             ctx.system.generators.u[self.index].float(),
+                                                             ctx.system.generators.v[self.index].float(),
+                                                             ctx.cbase[:, self.index], ctx.psi[:, self.index], cfg.delta_psi)
+                        else:
+                            if ctx.psi_snapshot is None: raise RuntimeError("missing detached Cayley snapshot")
+                            ctx.psi_snapshot.validate(ctx.runtime_id, ctx.revision, ctx.begin_id)
+                            fn = (analytic_psi_gradient_projected if execution.psi_backend == "projected"
+                                  else analytic_psi_gradient_dense_from_aux)
+                            gradient = fn(ctx.previous[:, self.index], aux.kt_weighted_residual,
+                                          ctx.psi_snapshot.for_anchor(self.index), write.sum(-1), cfg.delta_psi)
+                with annotation(execution, "Stats"):
+                    stats = clean_anchor_stats(ctx.previous[:, self.index], ctx.predicted[:, self.index],
+                                               state, q, k, v, beta, w, read, write, gradient, cfg)
                 ctx.stage(self.index, state, gradient, stats)
         raw = raw.transpose(1, 2).reshape(b, n, c)
         if ctx.clean_mode:
@@ -120,17 +150,18 @@ class TTNAnchor(nn.Module):
                 from torch.nn.attention import sdpa_kernel, SDPBackend
                 camera_kwargs = {key: value for key, value in kwargs.items()
                                  if key not in ("kv_cache", "save_kv_cache")}
-                with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.MATH]):
+                with annotation(execution, "Camera"), sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.MATH]):
                     camera_out = self._sana_camera_forward(
                         self, x, HW, camera_conditions, rotary_emb, cache,
                         kwargs.get("save_kv_cache", False), chunk_size=chunk_size, **camera_kwargs)
             else:
-                cq, ck, cv, to = self.camera_features(x, HW, camera_conditions, rotary_emb, kwargs.get("prope_fns"))
-                with torch.autocast(device_type=x.device.type, enabled=False):
-                    denom = read.sum(-1).clamp_min(1).float() * self.cam_head_dim**.5
-                    camera_state = ck.transpose(-1, -2) @ (cv * read[:, None, :, None]) / denom[:, None, None, None]
-                    camera_out = to(cq @ camera_state)  # output transform BEFORE MergeHeads
-                    camera_out = camera_out.transpose(1, 2).reshape(b, n, c)
+                with annotation(execution, "Camera"):
+                    cq, ck, cv, to = self.camera_features(x, HW, camera_conditions, rotary_emb, kwargs.get("prope_fns"))
+                    with torch.autocast(device_type=x.device.type, enabled=False):
+                        denom = read.sum(-1).clamp_min(1).float() * self.cam_head_dim**.5
+                        camera_state = ck.transpose(-1, -2) @ (cv * read[:, None, :, None]) / denom[:, None, None, None]
+                        camera_out = to(cq @ camera_state)  # output transform BEFORE MergeHeads
+                        camera_out = camera_out.transpose(1, 2).reshape(b, n, c)
             camera_contribution = self.out_proj_cam(camera_out.to(x.dtype))
             if ctx.clean_mode:
                 stats.update(camera_raw=matrix_scale(camera_out), camera_contribution=matrix_scale(camera_contribution))

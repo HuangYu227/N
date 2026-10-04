@@ -110,6 +110,10 @@ if [[ "$command" == train || "$command" == distributed-smoke || "$command" == di
   [[ "${CUDA_TRACE:-0}" == 0 ]] || args+=(--cuda-trace)
 fi
 [[ "${DIAGNOSTIC_UNMASK_ALL_VALID:-0}" == 0 ]] || args+=(--diagnostic-unmask-all-valid)
+[[ -z "${TTN_CORE_BACKEND:-}" ]] || args+=(--ttn-core-backend "$TTN_CORE_BACKEND")
+[[ -z "${TTN_PSI_BACKEND:-}" ]] || args+=(--ttn-psi-backend "$TTN_PSI_BACKEND")
+[[ "${TTN_PROFILE:-0}" == 0 ]] || args+=(--ttn-profile)
+[[ "${TTN_LAYOUT_AUDIT:-0}" == 0 ]] || args+=(--ttn-layout-audit)
 [[ -z "${CONFIG:-}" ]] || args+=(--config "$CONFIG")
 [[ -z "${DATA_DIR:-}" ]] || args+=(--data-dir "$DATA_DIR")
 [[ -z "${VAE_CACHE_DIR:-}" ]] || args+=(--vae-cache-dir "$VAE_CACHE_DIR")

@@ -63,6 +63,11 @@ fi
 [[ -z "${BASE_WEIGHTS:-}" ]] || args+=(--base-weights "$BASE_WEIGHTS")
 [[ -z "${SANA_CONFIG:-}" ]] || args+=(--sana-config "$SANA_CONFIG")
 [[ -z "${CONFIG:-}" ]] || args+=(--config "$CONFIG")
+[[ -z "${TTN_CORE_BACKEND:-}" ]] || args+=(--ttn-core-backend "$TTN_CORE_BACKEND")
+[[ -z "${TTN_PSI_BACKEND:-}" ]] || args+=(--ttn-psi-backend "$TTN_PSI_BACKEND")
+[[ "${TTN_PROFILE:-0}" == 0 ]] || args+=(--ttn-profile)
+[[ "${TTN_LAYOUT_AUDIT:-0}" == 0 ]] || args+=(--ttn-layout-audit)
+[[ "${TTN_COMPARE_REFERENCE:-0}" == 0 ]] || args+=(--ttn-compare-reference)
 printf '[TTN eval Slurm] job=%s command=%s TRAINING_RUN=%s frames=%s OUTPUT=%s PYTHON=%s\n' \
   "$SLURM_JOB_ID" "$command" "$TRAINING_RUN" "$frames" "$output" "$PYTHON"
 # The same worker as training creates private node-local /tmp compiler caches.

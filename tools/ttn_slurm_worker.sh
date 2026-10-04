@@ -54,7 +54,11 @@ printf '[TTN compile] host=%s rank=%s PYTHON=%s TMPDIR=%s TORCHINDUCTOR_CACHE_DI
 
 # Keep the launcher alive to clean up on success, failure or Slurm TERM, and
 # propagate Python's status so --kill-on-bad-exit still terminates peer ranks.
-"$PYTHON" -u -m worldttn.cli "$@" &
+case "${TTN_ENTRY_MODULE:-worldttn.cli}" in
+  worldttn.cli) "$PYTHON" -u -m worldttn.cli "$@" & ;;
+  worldttn.benchmark) "$PYTHON" -u -m worldttn.benchmark "$@" & ;;
+  *) echo 'Unsupported TTN_ENTRY_MODULE' >&2; exit 2 ;;
+esac
 child_pid=$!
 set +e
 wait "$child_pid"

@@ -352,16 +352,20 @@ def evaluate_command(args):
                 "launch": args.launch, "compile": {name: os.getenv(name) for name in ("GDN_DISABLE_COMPILE", "GDN_DISABLE_COMPLEX_COMPILE")}}
     (output / "manifest.json").write_text(json.dumps({"protocol": protocol, "cases": manifest, "rejected": rejected}, indent=2))
     records = []
-    for method in ("sana", "ttn"):
+    methods = ("sana", "ttn", "ttn_reference") if getattr(args, "ttn_compare_reference", False) else ("sana", "ttn")
+    for method in methods:
         seed_everything(args.seed)
-        kwargs = {"install_adapter": method == "ttn"}
-        if method == "ttn" and (last_train.get("weight_scope") == "dit" or
+        kwargs = {"install_adapter": method != "sana"}
+        if method != "sana" and (last_train.get("weight_scope") == "dit" or
                 run["arguments"].get("train_scope") in ("dit", "ttn-visual")):
             kwargs["dtype"] = torch.float32  # retain trained masters; BF16 CUDA compute still uses autocast
         model = build_sana(config, ttn, args.base_weights or run["base"]["source"], args.device, **kwargs)
         if model.base_load_report["sha256"] != run["base"]["sha256"]:
             raise ValueError("paired evaluation base weights differ from training")
-        if method == "ttn":
+        if method != "sana":
+            from .performance import configure_from_args, configure_execution, ExecutionOptions, precision_audit
+            execution = configure_execution(model, ExecutionOptions()) if method == "ttn_reference" else configure_from_args(model, args)
+            if method == "ttn": protocol.update(execution=execution, precision=precision_audit())
             load_checkpoint(adapter, model)
             if file_sha256(adapter) != adapter_digest: raise ValueError("checkpoint changed during evaluation")
             if getattr(args, "camera_attention", None) is not None:
@@ -382,8 +386,15 @@ def evaluate_command(args):
             noise_hash = tensor_sha256(noise)
             def progress(chunk):
                 print("[TTN eval chunk] " + json.dumps({"method": method, "case": index, **chunk}), flush=True)
+            def save_state(chunk, state):
+                torch.save({"world_state": state.world_state.detach().cpu(),
+                            "transition_fast": state.transition_fast.detach().cpu(),
+                            "commits": state.commit_count, "predictions": state.predict_count},
+                           output / f"case-{index:03d}-{method}-state-{chunk:03d}.pt")
+            state_kwargs = {"on_state": save_state} if getattr(args, "ttn_compare_reference", False) else {}
             (generated, runtime, chunks), timing = timed_cuda(lambda: rollout(
-                model, config, batch, args.steps, args.cfg_scale, args.cached_blocks, initial_noise=noise, on_chunk=progress))
+                model, config, batch, args.steps, args.cfg_scale, args.cached_blocks, initial_noise=noise, on_chunk=progress,
+                **state_kwargs))
             generated = generated.cpu()
             metrics = latent_metrics(generated, gt, case["revisit_pairs"])
             row = {"case_id": case["case_id"], "seed": case["seed"], "method": method,
@@ -394,7 +405,8 @@ def evaluate_command(args):
                    "parameter_dtypes": sorted({str(p.dtype) for p in model.parameters()}),
                    "commits": runtime.commit_count if runtime else None,
                    "predictions": runtime.predict_count if runtime else None}
-            torch.save({"latents": generated, "method": method, "case_id": case["case_id"], "seed": case["seed"]},
+            torch.save({"latents": generated, "method": method, "case_id": case["case_id"], "seed": case["seed"],
+                        "chunks": [{k: chunk[k] for k in ("chunk", "start", "end")} for chunk in chunks]},
                        output / f"case-{index:03d}-{method}.pt")
             json_record(output / "episodes.jsonl", row)
             records.append(row)
@@ -408,6 +420,10 @@ def evaluate_command(args):
         a, b = records[index], records[index + len(cases)]
         if any(a[name] != b[name] for name in ("case_id", "seed", "input_sha256", "initial_noise_sha256", "base_sha256")):
             raise AssertionError("paired evaluation inputs disagree")
-    result = {"protocol": protocol, **paired_summary(records), "episodes": records}
+    paired_records = [r for r in records if r["method"] in ("sana", "ttn")]
+    result = {"protocol": protocol, **paired_summary(paired_records), "episodes": records}
+    if getattr(args, "ttn_compare_reference", False):
+        from .benchmark import compare_saved_rollouts
+        result["backend_comparison"] = compare_saved_rollouts(output, len(cases))
     (output / "summary.json").write_text(json.dumps(result, indent=2))
-    print("[TTN eval summary] " + json.dumps({"output": str(output), **paired_summary(records)}), flush=True)
+    print("[TTN eval summary] " + json.dumps({"output": str(output), **paired_summary(paired_records)}), flush=True)
