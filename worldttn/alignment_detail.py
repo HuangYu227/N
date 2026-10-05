@@ -89,6 +89,7 @@ def stage_metrics(teacher, student, context, cfg):
         camera_delta = (student["camera_contribution"][mask].float() - teacher["camera_contribution"][mask].float()).norm().item()
         stages["camera_contribution"]["delta_relative_to_teacher_visual_norm"] = camera_delta / visual_norm if visual_norm > 0 else None
     stages["camera_scope"] = "camera_raw after per-head UCPE output transform/merge; contribution after out_proj_cam"
+    if "local_update" in student: stages["local"] = student["local_update"]
     return stages
 
 

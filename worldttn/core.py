@@ -13,7 +13,7 @@ BASE_REVISION = "f9178744c096dcf2a2ea773da183e341bcbeb044"
 @dataclass(frozen=True)
 class TTNConfig:
     """A: identity Predict + Correct/Read; B: learned Predict + Correct/Read;
-    C: B plus a detached, per-clean-chunk first-order update of psi.
+    C: B plus per-clean-chunk psi; default detached, optional live Meta-TTT.
     All stages train the five replacement anchors' projections/Norms/gates/beta.
     """
     heads: int = 20
@@ -28,10 +28,17 @@ class TTNConfig:
     base_id: str = BASE_ID
     # Missing in legacy checkpoints: preserve their linear-camera semantics.
     camera_attention: str = "linear"
+    # Missing in old checkpoints means the original detached Stage C update.
+    local_update: bool = False
+    persistent_meta: bool = False
 
     def __post_init__(self):
         if self.stage not in ("A", "B", "C"):
             raise ValueError("stage must be A, B or C")
+        if not isinstance(self.local_update, bool) or not isinstance(self.persistent_meta, bool):
+            raise ValueError("meta-update flags must be boolean")
+        if (self.local_update or self.persistent_meta) and self.stage != "C":
+            raise ValueError("Local/Persistent Meta-TTT requires Stage C")
         if self.camera_attention not in ("linear", "sana"):
             raise ValueError("camera_attention must be linear or sana")
         if min(self.heads, self.head_dim, self.generators) < 1 or self.head_dim % 8:
@@ -193,6 +200,46 @@ def innovation_loss(pred, k, v, w, mask):
     while count.ndim < k.ndim - 2:
         count = count.unsqueeze(-1)
     return (w * (k @ pred - v).square().sum(-1)).sum(-1) / (2 * k.shape[-1] * count)
+
+
+def innovation_objective(pred, k, v, w, mask, *, normalized, eps=1e-6):
+    """Per-head loss and dL/dS, both live for exact mixed meta derivatives.
+
+    Local divides by weighted V energy; Persistent keeps the existing 2*D*N
+    objective. Select before arithmetic: zero times a padded NaN is still NaN.
+    The normalization denominator is constant wrt psi, NOT wrt outer weights.
+    """
+    count = _effective_count(mask.sum(-1), pred)
+    while mask.ndim < w.ndim: mask = mask.unsqueeze(-2)
+    selected = mask.bool()[..., None]
+    k = torch.where(selected, k, 0.)
+    v = torch.where(selected, v, 0.)
+    w = torch.where(mask, w, 0.)
+    error = k @ pred - v
+    numerator = (w * error.square().sum(-1)).sum(-1)
+    denominator = (eps + (w * v.square().sum(-1)).sum(-1)
+                   if normalized else 2 * k.shape[-1] * count)
+    h = (2 / denominator)[..., None, None] * (k.transpose(-1, -2) @ (w[..., None] * error))
+    return numerator / denominator, h
+
+
+def coefficient_gradient(previous, h, p, l):
+    """Live dL/dC using dR=B^-1(dA)B^-1, B=I-A/2, P=[u1,v1,...].
+
+    R=I+P L P^T, hence B^-1 P=P+.5*P L (P^T P). No dense inverse,
+    detached snapshot, or nested autograd engine is needed in production.
+    """
+    gram = p.transpose(-1, -2) @ p
+    bp = p + .5 * ((p @ l) @ gram)
+    btp = p + .5 * ((p @ l.transpose(-1, -2)) @ gram)
+    x, y = previous @ bp, h @ btp
+    return (x[..., ::2] * y[..., 1::2] - x[..., 1::2] * y[..., ::2]).sum(-2)
+
+
+def clip_inner_gradient(gradient, limit, eps):
+    """Per-head clipping with its scale derivative retained for Meta-TTT."""
+    scale = (limit / gradient.norm(dim=-1, keepdim=True).clamp_min(eps)).clamp_max(1)
+    return gradient * scale, scale
 
 
 @torch.no_grad()

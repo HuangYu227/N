@@ -132,6 +132,17 @@ def test_concurrent_workers_have_separate_local_scratch(worker_setup):
     assert len(scratch_dirs) == 3
 
 
+def test_worker_uses_allowlisted_pytest_entry_and_cleans_scratch(worker_setup):
+    bash, script, capture, writer, personal, env = worker_setup
+    env["TTN_ENTRY_MODULE"] = "pytest"
+    result = subprocess.run([str(bash), str(script), "-q", "tests/ttn/test_meta_core.py"], env=env,
+                            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+    assert result.returncode == 0, result.stderr
+    record = json.loads(capture.read_text())
+    assert record["args"][:3] == ["-u", "-m", "pytest"]
+    assert not Path(record["env"]["TMPDIR"]).parent.exists()
+
+
 def test_worker_forwards_term_and_cleans_its_scratch(worker_setup):
     bash, script, capture, writer, personal, env = worker_setup
     writer.write_text(writer.read_text().replace("sys.exit(int", "import time; time.sleep(60)\nsys.exit(int"),

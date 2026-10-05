@@ -111,24 +111,26 @@ def test_fsdp2_preserves_fp32_ttn_under_bf16_base_and_autocast(tmp_path):
         torch.testing.assert_close(ranks[0]["state"][name], ranks[1]["state"][name], atol=0, rtol=0)
 
 
-def _resume_worker(rank, size, init_uri, output, mode, joint=False, activation_offload="none"):
+def _resume_worker(rank, size, init_uri, output, mode, joint=False, activation_offload="none", meta=False, device="cpu"):
     from worldttn.distributed import ParallelTraining, save_training_checkpoint, restore_training_checkpoint
     from worldttn.checkpoint import load_checkpoint
     import torch.distributed as dist
     import random
     torch.set_num_threads(1)
-    dist.init_process_group("gloo", init_method=init_uri, rank=rank, world_size=size)
+    if device == "cuda": torch.cuda.set_device(0)
+    dist.init_process_group("nccl" if device == "cuda" else "gloo", init_method=init_uri, rank=rank, world_size=size)
     try:
         torch.manual_seed(17)
-        model = TinyWorldModel("C")
+        model = TinyWorldModel("C", local_update=meta, persistent_meta=meta).to(device)
         if joint:
             from worldttn.anchor import configure_train_scope
             configure_train_scope(model, "dit")
         engine = ParallelTraining(model, linear_flow_loss, mode, activation_offload=activation_offload)
         optimizer = make_optimizer(model)
-        clean, noise, t, camera = _rank_inputs(rank)
+        clean, noise, t, camera = [x.to(device) for x in _rank_inputs(rank)]
+        text = torch.zeros(1, 1, 2, 8, device=device)
         kw = dict(width=100, height=100, tbptt=2, activation_offload=activation_offload)
-        train_clip(model, clean, torch.zeros(1, 1, 2, 8), camera, optimizer, linear_flow_loss, t, noise,
+        train_clip(model, clean, text, camera, optimizer, linear_flow_loss, t, noise,
                    parallel=engine, **kw)
         random.seed(200 + rank)
         torch.manual_seed(300 + rank)
@@ -137,14 +139,15 @@ def _resume_worker(rank, size, init_uri, output, mode, joint=False, activation_o
         save_training_checkpoint(path, engine, optimizer, 1, cursor, {"tbptt": 2, "seed": 3407})
         expected_random = (random.random(), torch.rand(3))
         second_noise = torch.randn_like(noise)
-        train_clip(model, clean, torch.zeros(1, 1, 2, 8), camera, optimizer, linear_flow_loss, t, second_noise,
+        train_clip(model, clean, text, camera, optimizer, linear_flow_loss, t, second_noise,
                    parallel=engine, **kw)
         expected = {}
         for name, value in model.state_dict().items():
             if hasattr(value, "full_tensor"): value = value.full_tensor()
             expected[name] = value.clone()
+        expected_optimizer = copy.deepcopy(optimizer.state_dict())
         torch.manual_seed(17)
-        resumed = TinyWorldModel("C")
+        resumed = TinyWorldModel("C", local_update=meta, persistent_meta=meta).to(device)
         if joint: configure_train_scope(resumed, "dit")
         load_checkpoint(path, resumed)
         new_engine = ParallelTraining(resumed, linear_flow_loss, mode, activation_offload=activation_offload)
@@ -153,11 +156,17 @@ def _resume_worker(rank, size, init_uri, output, mode, joint=False, activation_o
         assert step == 1 and data == cursor
         assert random.random() == expected_random[0]
         assert torch.equal(torch.rand(3), expected_random[1])
-        train_clip(resumed, clean, torch.zeros(1, 1, 2, 8), camera, new_optimizer, linear_flow_loss, t,
+        train_clip(resumed, clean, text, camera, new_optimizer, linear_flow_loss, t,
                    torch.randn_like(noise), parallel=new_engine, **kw)
         for name, value in resumed.state_dict().items():
             if hasattr(value, "full_tensor"): value = value.full_tensor()
             torch.testing.assert_close(value, expected[name], atol=0, rtol=0)
+        if meta:
+            actual_optimizer = new_optimizer.state_dict()
+            assert expected_optimizer["param_groups"] == actual_optimizer["param_groups"]
+            for key, values in expected_optimizer["state"].items():
+                for field, value in values.items():
+                    torch.testing.assert_close(value, actual_optimizer["state"][key][field], atol=0, rtol=0)
         with pytest.raises(ValueError, match="training configuration"):
             restore_training_checkpoint(path, new_engine, new_optimizer, {"tbptt": 4, "seed": 3407})
         payload = torch.load(path, weights_only=False)

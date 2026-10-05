@@ -9,7 +9,7 @@ import sys
 import pytest
 
 
-@pytest.mark.parametrize("task,fail", [(0, False), (1, False), (2, False), (3, False), (0, True)])
+@pytest.mark.parametrize("task,fail", [(0, False), (1, False), (2, False), (3, False), (4, False), (5, False), (0, True)])
 def test_array_is_single_gpu_sequential_and_forwards_intervention(task, fail, tmp_path):
     bash = Path("D:/Git/bin/bash.exe")
     if not bash.exists():
@@ -56,9 +56,9 @@ def test_array_is_single_gpu_sequential_and_forwards_intervention(task, fail, tm
     assert records[0][-1] == "running" and records[-1][-1] == ("failed" if fail else "completed")
     args = next(row for row in records if row[0] == "srun")
     assert "--nodes=1" in args and "--ntasks=1" in args and "--gres=gpu:1" in args
-    assert args[args.index("--ttn-ablation") + 1] == ("full", "no-ttt", "identity", "full")[task]
+    assert args[args.index("--ttn-ablation") + 1] == ("full", "no-ttt", "identity", "full", "no-local", "no-persistent")[task]
     assert args[args.index("--history-source") + 1] == ("gt" if task == 3 else "generated")
     assert "--state-diagnostics" in args and args[args.index("--frames") + 1] == "61"
     methods_index = args.index("--eval-methods")
-    assert args[methods_index + 1] == ("ttn" if task in (1, 2) else "sana")
+    assert args[methods_index + 1] == ("ttn" if task in (1, 2, 4, 5) else "sana")
     assert "#SBATCH --array=0-3%1" in (repo / "tools/ttn_slurm_mechanism.sbatch").read_text()

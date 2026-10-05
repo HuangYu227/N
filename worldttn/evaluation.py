@@ -371,6 +371,7 @@ def evaluate_command(args):
                 "training_run": str(training_run), "checkpoint": str(adapter), "checkpoint_sha256": adapter_digest,
                 "stage": ttn.stage, "step": last_train["step"], "frames": args.frames, "steps": args.steps,
                 "ttn_ablation": ablation, "history_source": history, "eval_methods": list(methods),
+                "meta_ttt": {"local_update": ttn.local_update, "persistent_meta": ttn.persistent_meta},
                 "state_diagnostics": diagnostics,
                 "history_access": "GT slice after current denoising; commits TTN + GDN/camera/FFN caches; output remains generated"
                     if history == "gt" else "one observed frame; generated chunks update all history",

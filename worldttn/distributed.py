@@ -27,11 +27,11 @@ def _expose_clean_state(module, args, kwargs, output):
     context = kwargs.get("ttn_chunk_context")
     if context is None:
         context = next((arg for arg in args if isinstance(arg, TTNChunkContext)), None)
-    state = None
+    state = gradient = None
     if context is not None and context.clean_mode:
         candidate = context.candidates.get(module.attn.index)
-        if candidate is not None: state = candidate[0]
-    return output, state
+        if candidate is not None: state, gradient = candidate[:2]
+    return output, state, gradient
 
 
 def _restore_block_output(module, args, output):

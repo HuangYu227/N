@@ -1,0 +1,12 @@
+{
+  "sana_config": "configs/worldttn/sana_teacher_single_gpu.yaml",
+  "ttn": {
+    "heads": 20, "head_dim": 112, "generators": 16,
+    "alpha_s": 0.5, "eps": 0.000001, "delta_psi": 1,
+    "eta_psi": 0.01, "inner_clip": 1, "stage": "C", "camera_attention": "sana",
+    "local_update": true, "persistent_meta": true,
+    "base_id": "hf://Efficient-Large-Model/SANA-WM_chunk_causal/dit/sana_wm_chunk_causal_1600m_720p.safetensors"
+  },
+  "tbptt": 2,
+  "learning_rate": 0.00001
+}

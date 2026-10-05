@@ -18,6 +18,7 @@ def audit_training_parameters(model, optimizer):
     if stage != "A":
         required.update(("ttn_system.generators.u", "ttn_system.generators.v"))
         required.update(f"ttn_system.controller.heads.{i}.weight" for i in range(5))
+    if model.ttn_system.config.local_update: required.add("ttn_system.local_eta_logits")
     if required - named.keys(): raise ValueError(f"missing registered TTN parameters: {sorted(required - named.keys())}")
     expected = trainable_parameter_names(model)
     actual = {name for name, p in named.items() if p.requires_grad}
@@ -58,7 +59,7 @@ class FirstUpdateProbe:
         self.before = {n: _local_cpu(p).clone() for n, p in self.parameters.items()}
 
     def report(self, optimizer):
-        groups, missing, missing_backbone, components = {}, [], [], {}
+        groups, missing, missing_backbone, components, origins = {}, [], [], {}, {}
         backbone = {"parameters": 0, "parameters_with_grad": 0, "updated_parameters": 0,
                     "changed_elements": 0, "optimizer_state_parameters": 0}
         core = {f"blocks.{i}.attn.{group}.weight" for i in ANCHORS for group in ("qkv", "proj", "output_gate")}
@@ -69,6 +70,10 @@ class FirstUpdateProbe:
                                            "optimizer_state_parameters": 0})
             initial, current = self.before[name].double(), _local_cpu(p).double()
             delta = current - initial
+            origin = "ttn_new" if is_ttn_new_parameter(name) else "sana_inherited"
+            total = origins.setdefault(origin, {"grad_squared": 0., "delta_squared": 0., "parameters": 0})
+            total["parameters"] += 1
+            total["delta_squared"] += delta.square().sum().item()
             changed = int(delta.count_nonzero())
             row["initial_squared"] += initial.square().sum().item()
             row["delta_squared"] += delta.square().sum().item()
@@ -94,6 +99,10 @@ class FirstUpdateProbe:
             else:
                 grad = _local_cpu(p.grad).double()
                 row["grad_squared"] += grad.square().sum().item()
+                total["grad_squared"] += grad.square().sum().item()
+        for total in origins.values():
+            total["grad_norm"] = math.sqrt(total.pop("grad_squared"))
+            total["delta_norm"] = math.sqrt(total.pop("delta_squared"))
         for row in groups.values():
             initial = math.sqrt(row.pop("initial_squared"))
             row["delta_norm"] = math.sqrt(row.pop("delta_squared"))
@@ -101,6 +110,6 @@ class FirstUpdateProbe:
             row["initial_norm"] = initial
             row["update_ratio"] = row["delta_norm"] / initial if initial else None
         self.before.clear()
-        return {"scope": "actual first optimizer step of this invocation; gradients after clipping; rank-local shards for FSDP2",
-                "groups": groups, "missing_core_gradients": missing,
+        return {"scope": "actual optimizer update; gradients after clipping; rank-local shards for FSDP2",
+                "groups": groups, "by_origin": origins, "missing_core_gradients": missing,
                 "backbone": {**backbone, "by_component": components}, "missing_backbone_gradients": missing_backbone}

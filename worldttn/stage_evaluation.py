@@ -33,7 +33,17 @@ def stage_evaluate_command(args):
                   "--cfg-scale", str(args.cfg_scale), "--cached-blocks", str(args.cached_blocks)],
         "align": ["align-chunk", "--frames", "4", "--alignment-timesteps", "500", "--alignment-grad-timestep", "500"],
     }
-    result = {"status": "running", "training_run": args.training_run, "provenance": implementation_identity(), "results": {}}
+    from tools.ttn_eval_snapshot import expected_evaluation_children
+    run = json.loads((Path(args.training_run) / "run_config.json").read_text(encoding="utf-8"))
+    if "no-local" in expected_evaluation_children(run):
+        # Periodic contribution checks use the short prefix; long interventions
+        # use the sequential mechanism array, keeping the short partition limit.
+        for name in ("no-local", "no-persistent"):
+            commands[name] = ["evaluate", "--frames", "13", "--steps", str(args.steps), "--state-diagnostics",
+                "--cfg-scale", str(args.cfg_scale), "--cached-blocks", str(args.cached_blocks),
+                "--ttn-ablation", name, "--eval-methods", "ttn"]
+    result = {"status": "running", "training_run": args.training_run, "provenance": implementation_identity(),
+              "expected_children": list(commands), "results": {}}
     status = output / "summary.json"
     def publish():
         tmp = output / "summary.tmp"

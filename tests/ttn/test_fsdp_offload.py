@@ -14,20 +14,31 @@ def _available():
     return hasattr(fsdp, "fully_shard") and hasattr(torch.cpu, "Stream")
 
 
-def _offload_worker(rank, size, uri, output, k, amp):
+def _offload_worker(rank, size, uri, output, k, amp, meta=False, device="cpu"):
     from worldttn.distributed import ParallelTraining
     from worldttn.training_health import FirstUpdateProbe
     import torch.distributed as dist
     torch.set_num_threads(1)
-    dist.init_process_group("gloo", init_method=uri, rank=rank, world_size=size)
+    if device == "cuda": torch.cuda.set_device(0)
+    dist.init_process_group("nccl" if device == "cuda" else "gloo", init_method=uri, rank=rank, world_size=size)
     try:
         torch.manual_seed(17)
-        model = TinyWorldModel("C")
+        model = TinyWorldModel("C", local_update=meta, persistent_meta=meta).to(device)
         configure_train_scope(model, "dit")
+        live = []
+        if meta:
+            def retain_gradient(module, args, out):
+                context = args[2]
+                if context.clean_mode:
+                    g = context.candidates[0][1]
+                    if g.requires_grad:
+                        g.retain_grad()
+                        live.append(g)
+            model.blocks[3].register_forward_hook(retain_gradient)
         engine = ParallelTraining(model, linear_flow_loss, "fsdp2", activation_offload="cpu")
         optimizer = make_optimizer(model)
         probe = FirstUpdateProbe(model)
-        clean, noise, t, camera = _rank_inputs(rank)
+        clean, noise, t, camera = [x.to(device) for x in _rank_inputs(rank)]
         copies = []
         original = torch.autograd.graph.save_on_cpu
         class RecordCopies(original):
@@ -41,12 +52,17 @@ def _offload_worker(rank, size, uri, output, k, amp):
                     return packed
                 self.pack_hook = record
         torch.autograd.graph.save_on_cpu = RecordCopies
-        with torch.autocast("cpu", dtype=torch.bfloat16, enabled=amp):
-            result = train_clip(model, clean, torch.zeros(1, 1, 2, 8), camera, optimizer, linear_flow_loss,
+        with torch.autocast(device, dtype=torch.bfloat16, enabled=amp):
+            result = train_clip(model, clean, torch.zeros(1, 1, 2, 8, device=device), camera, optimizer, linear_flow_loss,
                                 t, noise, width=100, height=100, tbptt=k, parallel=engine,
                                 activation_offload="cpu")
         torch.autograd.graph.save_on_cpu = original
         health = probe.report(optimizer)
+        if meta:
+            assert len(live) == 4
+            assert live[0].grad is not None and live[0].grad.norm() > 0
+            assert live[1].grad is None and live[2].grad is not None and live[2].grad.norm() > 0 and live[3].grad is None
+            assert result["optimizer_updates"]["groups"]["ttn_system.local_eta_logits"]["delta_norm"] > 0
         assert copies and all(copied for copied, _ in copies), "CPU tests must really copy saved tensors"
         assert not health["missing_core_gradients"]
         assert health["backbone"]["by_component"]["ffn"]["updated_parameters"] > 0
@@ -71,11 +87,12 @@ def _offload_worker(rank, size, uri, output, k, amp):
 
 
 @pytest.mark.skipif(not _available(), reason="CPU FSDP2 not available")
-@pytest.mark.parametrize("k,amp", [(1, False), (2, False), (4, False), (1, True), (2, True), (4, True)])
-def test_fsdp_cpu_offload_real_copies_match_global_batch_and_keep_runtime_local(tmp_path, k, amp):
-    torch.multiprocessing.spawn(_offload_worker, args=(2, _init_uri(), str(tmp_path), k, amp), nprocs=2)
+@pytest.mark.parametrize("k,amp,meta", [(1, False, False), (2, False, False), (4, False, False),
+                                      (1, True, False), (2, True, False), (4, True, False), (2, False, True), (2, True, True)])
+def test_fsdp_cpu_offload_real_copies_match_global_batch_and_keep_runtime_local(tmp_path, k, amp, meta):
+    torch.multiprocessing.spawn(_offload_worker, args=(2, _init_uri(), str(tmp_path), k, amp, meta), nprocs=2)
     torch.manual_seed(17)
-    model = TinyWorldModel("C")
+    model = TinyWorldModel("C", local_update=meta, persistent_meta=meta)
     configure_train_scope(model, "dit")
     clean, noise, t, camera = [torch.cat(values) for values in zip(*[_rank_inputs(r) for r in range(2)])]
     with torch.autocast("cpu", dtype=torch.bfloat16, enabled=amp):
@@ -89,7 +106,7 @@ def test_fsdp_cpu_offload_real_copies_match_global_batch_and_keep_runtime_local(
         # Match those local batches instead of loosening FP32 tolerances for
         # a batch-2 matmul, which rounds after summing the two contributions.
         torch.manual_seed(17)
-        model = TinyWorldModel("C")
+        model = TinyWorldModel("C", local_update=meta, persistent_meta=meta)
         configure_train_scope(model, "dit")
         optimizer = make_optimizer(model)
         step, optimizer.step = optimizer.step, lambda: None

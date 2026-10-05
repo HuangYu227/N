@@ -26,12 +26,12 @@ class ProjectionContract(nn.Module):
         nn.init.constant_(self.beta_proj.weight, 17.)
 
 
-def context(cfg, b=1, f=2):
-    sys = TTNSystem(cfg)
-    r = TTNRuntimeState.create(cfg, b, "cpu")
-    p = torch.eye(4).expand(b, f, 4, 4)
-    intr = torch.tensor([100., 100., 50., 50.]).expand(b, f, 4)
-    return r, r.begin_chunk(sys, p, intr, torch.arange(f).expand(b, -1), torch.ones(b, f, dtype=torch.bool), 100, 100)
+def context(cfg, b=1, f=2, device="cpu"):
+    sys = TTNSystem(cfg).to(device)
+    r = TTNRuntimeState.create(cfg, b, device)
+    p = torch.eye(4, device=device).expand(b, f, 4, 4)
+    intr = torch.tensor([100., 100., 50., 50.], device=device).expand(b, f, 4)
+    return r, r.begin_chunk(sys, p, intr, torch.arange(f, device=device).expand(b, -1), torch.ones(b, f, dtype=torch.bool, device=device), 100, 100)
 
 
 def test_stage_a_reuses_projection_and_shared_silu_gate_without_sdpa(monkeypatch):

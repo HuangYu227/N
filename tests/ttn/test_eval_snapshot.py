@@ -97,6 +97,20 @@ def test_manual_keep_protects_non_key_model(snapshot, tmp_path):
     assert (frozen / "last.pt").is_file()
 
 
+def test_meta_snapshot_waits_for_contribution_children_before_release(snapshot, tmp_path):
+    source = make_run(tmp_path)
+    config = json.loads((source / "run_config.json").read_text())
+    config["training"] = {"meta_ttt": {"local_update": True, "persistent_meta": True}}
+    (source / "run_config.json").write_text(json.dumps(config))
+    frozen = snapshot.snapshot_training_run(source, retain_model=False)
+    result = {"status": "completed", "training_run": str(frozen), "identity": {"step": 156},
+              "results": {"long": {}, "short": {}, "align": {}}}
+    with pytest.raises(ValueError): snapshot.release_evaluation_model(frozen, result)
+    assert (frozen / "last.pt").is_file()
+    result["results"].update({"no-local": {}, "no-persistent": {}})
+    assert snapshot.release_evaluation_model(frozen, result)["status"] == "released"
+
+
 @pytest.mark.parametrize("damage", ["running", "failed", "step", "source", "missing-child", "replacement", "symlink"])
 def test_model_release_protects_pending_failed_different_or_replaced_snapshots(snapshot, tmp_path, damage):
     source = make_run(tmp_path)

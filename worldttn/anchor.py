@@ -4,9 +4,10 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from .core import (ANCHORS, correct, analytic_psi_gradient, correct_with_aux, CorrectionAux,
-                   analytic_psi_gradient_dense_from_aux, analytic_psi_gradient_projected)
+                   analytic_psi_gradient_dense_from_aux, analytic_psi_gradient_projected,
+                   CayleyFactors, write_weights, innovation_objective, coefficient_gradient, clip_inner_gradient)
 from .performance import DEFAULT_EXECUTION, annotation, audit_layout
-from .stability import clean_anchor_stats, matrix_scale
+from .stability import clean_anchor_stats, local_anchor_stats, matrix_scale
 from .geometry import apply_complex_rope
 from .runtime import TTNSystem
 
@@ -88,12 +89,31 @@ class TTNAnchor(nn.Module):
         b, n, c = x.shape
         if diagnostic is not None: diagnostic("input", x)
         read, write = ctx.token_masks(n)
-        x = x * read[..., None].to(x.dtype)
+        x = (torch.where(read[..., None], x, 0.) if cfg.local_update or cfg.persistent_meta
+             else x * read[..., None].to(x.dtype))
         q, k, v = self.visual_features(x, rotary_emb)
         if diagnostic is not None: diagnostic("visual_features", (q, k, v))
         with torch.autocast(device_type=x.device.type, enabled=False):
             beta = self.beta_proj(x.float()).sigmoid().transpose(1, 2)
             predicted = ctx.predicted[:, self.index]
+            local_enabled = cfg.local_update and not ctx.clean_mode and not ctx.prefill_mode and ctx.ablation in ("full", "no-persistent")
+            if local_enabled:
+                support, query = ctx.support_query_masks(n, HW)
+                factors = ctx.live_factors
+                if factors is None: raise RuntimeError("Local Meta-TTT requires live Cayley factors")
+                w = write_weights(beta, write, cfg.eps)
+                _, h = innovation_objective(predicted, k, v, w, support, normalized=True, eps=cfg.eps)
+                gradient = coefficient_gradient(ctx.previous[:, self.index], h,
+                                                factors.p[self.index], factors.l[:, self.index])
+                clipped, scale = clip_inner_gradient(gradient, cfg.inner_clip, cfg.eps)
+                eta = F.softplus(ctx.system.local_eta_logits[self.index])
+                local = -eta * clipped
+                if support.any():
+                    persistent = cfg.delta_psi * ctx.psi[:, self.index].tanh() if ctx.ablation == "full" else 0
+                    coeff = ctx.cbase[:, self.index] + persistent + local.tanh()
+                    adapted = CayleyFactors(ctx.system.generators.u[self.index].float(),
+                                           ctx.system.generators.v[self.index].float(), coeff).right(ctx.previous[:, self.index])
+                    predicted = torch.where(support.any(-1)[:, None, None, None], adapted, predicted)
             audit_layout(self, "clean" if ctx.clean_mode else "diagnostic" if diagnostic is not None else "noisy",
                          q=q, k=k, v=v, beta=beta, predicted=predicted, write=write)
             with annotation(execution, "CorrectRead"):
@@ -112,13 +132,33 @@ class TTNAnchor(nn.Module):
                     aux = correct_with_aux(predicted, k, v, beta, write, cfg.alpha_s, cfg.eps)
                     state, w = aux.candidate, aux.w
                     raw = q @ state
+            if (cfg.local_update or cfg.persistent_meta) and not ctx.clean_mode and not ctx.prefill_mode:
+                if not local_enabled:
+                    support, query = ctx.support_query_masks(n, HW)
+                    gradient = clipped = local = torch.zeros_like(ctx.psi[:, self.index])
+                    scale = torch.ones_like(gradient[..., :1])
+                    eta = F.softplus(ctx.system.local_eta_logits[self.index]) if cfg.local_update else None
+                with annotation(execution, "LocalStats"):
+                    stats = local_anchor_stats(ctx.previous[:, self.index], ctx.predicted[:, self.index], predicted,
+                                               state, k, v, w, support, query, gradient, clipped, scale, local, eta, cfg.eps)
+                    stats.update(ctx.noise_info, enabled=local_enabled)
+                    ctx.local_stats[self.index] = stats
+                if diagnostic is not None: diagnostic("local_update", stats)
             if diagnostic is not None:
-                diagnostic("memory", (ctx.predicted[:, self.index], state, k, v, beta, w, write))
+                diagnostic("memory", (predicted, state, k, v, beta, w, write))
             if ctx.clean_mode:
                 gradient = torch.zeros_like(ctx.psi[:, self.index])
                 if cfg.stage == "C" and not ctx.prefill_mode:
                     with annotation(execution, "Psi"):
-                        if execution.core_backend == "reference":
+                        if cfg.persistent_meta:
+                            if ctx.ablation in ("full", "no-local"):
+                                factors = ctx.live_factors
+                                if factors is None: raise RuntimeError("Persistent Meta-TTT requires live Cayley factors")
+                                _, h = innovation_objective(predicted, k, v, w, write, normalized=False, eps=cfg.eps)
+                                gc = coefficient_gradient(ctx.previous[:, self.index], h,
+                                                          factors.p[self.index], factors.l[:, self.index])
+                                gradient = cfg.delta_psi * (1 - ctx.psi[:, self.index].tanh().square()) * gc
+                        elif execution.core_backend == "reference":
                             gradient = analytic_psi_gradient(ctx.previous[:, self.index], k, v, w, write,
                                                              ctx.system.generators.u[self.index].float(),
                                                              ctx.system.generators.v[self.index].float(),
@@ -225,7 +265,7 @@ def is_ttn_parameter(name):
 
 def is_ttn_new_parameter(name):
     """Parameter origin, independent of the replacement module's ownership."""
-    return name.startswith(("ttn_system.controller.", "ttn_system.generators.")) or any(
+    return name == "ttn_system.local_eta_logits" or name.startswith(("ttn_system.controller.", "ttn_system.generators.")) or any(
         name.startswith(f"blocks.{i}.attn.beta_proj.") for i in ANCHORS)
 
 

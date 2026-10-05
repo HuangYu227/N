@@ -30,18 +30,21 @@ def native_camera_source(cached_sana):
 
 
 @pytest.mark.parametrize("save", [False, True])
-def test_restored_camera_matches_original_output_cache_and_gradients(cached_sana, save):
+@pytest.mark.parametrize("meta", [False, True])
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable"))])
+def test_restored_camera_matches_original_output_cache_and_gradients(cached_sana, save, meta, device):
     torch.manual_seed(7)
-    source = native_camera_source(cached_sana)
-    cfg = TTNConfig(heads=2, head_dim=8, generators=3, camera_attention="sana")
+    source = native_camera_source(cached_sana).to(device)
+    cfg = TTNConfig(heads=2, head_dim=8, generators=3, camera_attention="sana",
+                    stage="C" if meta else "A", local_update=meta, persistent_meta=meta)
     anchor = TTNAnchor(source, 0, cfg)
-    runtime, ctx = context(cfg, f=4)
+    runtime, ctx = context(cfg, f=4, device=device)
     state, psi = runtime.world_state.clone(), runtime.transition_fast.clone()
-    x = torch.randn(1, 4, 16, dtype=torch.float64, requires_grad=True)
-    camera = torch.ones(1, 4, 20, dtype=torch.float64)
+    x = torch.randn(1, 4, 16, dtype=torch.float64, device=device, requires_grad=True)
+    camera = torch.ones(1, 4, 20, dtype=torch.float64, device=device)
     fns = (lambda z: z * 2, lambda z: z * .5, lambda z: z * 3)
     incoming = [None] * 10
-    incoming[2] = torch.randn(1, 2, 3, 8, dtype=torch.float64)
+    incoming[2] = torch.randn(1, 2, 3, 8, dtype=torch.float64, device=device)
     incoming[3] = torch.randn_like(incoming[2])
     incoming[9] = torch.randn(1)
     before = [v.clone() if isinstance(v, torch.Tensor) else v for v in incoming]

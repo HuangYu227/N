@@ -163,7 +163,7 @@ def test_mechanism_options_reject_training_before_cuda_check():
     assert result.returncode != 0 and "evaluate-only" in result.stderr
 
 
-def mechanism_files(output):
+def mechanism_files(output, meta=False):
     from worldttn.evaluation import latent_metrics
     from worldttn.mechanism_evaluation import VARIANTS, IDENTITY
     protocol = {key: "same" for key in IDENTITY}
@@ -176,13 +176,26 @@ def mechanism_files(output):
                     initial_noise_sha256="noise", base_sha256="base",
                     metrics=latent_metrics(generated, gt, [], training_frames=13),
                     prefix_13_metrics=latent_metrics(generated[:, :, :13], gt[:, :, :13], [], training_frames=13))
-    for variant, (ablation, history, methods) in VARIANTS.items():
+    variants = dict(VARIANTS, **({"no-local": ("no-local", "generated", ["ttn"]),
+                               "no-persistent": ("no-persistent", "generated", ["ttn"])} if meta else {}))
+    protocol["meta_ttt"] = {"local_update": meta, "persistent_meta": meta}
+    for variant, (ablation, history, methods) in variants.items():
         folder = output / variant
         folder.mkdir(parents=True)
         p = dict(protocol, ttn_ablation=ablation, history_source=history, eval_methods=methods)
-        values = {"full": 4., "no-ttt": 3., "identity": 5., "gt-history": 2.}
+        values = {"full": 4., "no-ttt": 3., "identity": 5., "gt-history": 2., "no-local": 6., "no-persistent": 7.}
         records = [record(method, values[variant] if method == "ttn" else .5 if history == "gt" else 1.) for method in methods]
         (folder / "summary.json").write_text(json.dumps({"protocol": p, "episodes": records}))
+
+
+def test_meta_collector_requires_both_contributions_and_reports_separate_contrasts(tmp_path):
+    from worldttn.mechanism_evaluation import collect_mechanisms
+    mechanism_files(tmp_path, meta=True)
+    result = collect_mechanisms(tmp_path)
+    assert result["status"] == "completed" and len(result["results"]) == 6
+    assert result["contrasts"]["local_minus_no_local"]["long"]["mean_future_latent_mse"] == pytest.approx(-2.)
+    (tmp_path / "no-persistent/summary.json").unlink()
+    assert collect_mechanisms(tmp_path)["status"] == "running"
 
 
 @pytest.mark.parametrize("corrupt", [None, "checkpoint", "noise", "history"])

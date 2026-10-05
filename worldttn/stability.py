@@ -64,6 +64,46 @@ def distribution(value):
 
 
 @torch.no_grad()
+def local_anchor_stats(previous, before, adapted, candidate, k, v, w, support, query,
+                       gradient, clipped, scale, local, eta, eps):
+    """Detached evidence: query after Correct also consumes its own observations."""
+    predictions = [k.detach() @ s.detach() for s in (before, adapted, candidate)]
+    def partition(mask):
+        count = mask.sum(-1)[:, None]
+        selected = mask[:, None, :, None]
+        target = torch.where(selected, v.detach(), 0.)
+        weights = torch.where(mask[:, None], w.detach(), 0.)
+        energy = (weights * target.square().sum(-1)).sum(-1)
+        result = {"tokens_per_branch": mask.sum(-1).cpu().tolist()}
+        for label, prediction in zip(("before", "after_transport", "after_correct"), predictions):
+            residual = torch.where(selected, prediction - v.detach(), 0.)
+            loss = (weights * residual.square().sum(-1)).sum(-1)/(eps + energy)
+            rms = (residual.square().sum((-1, -2))/(count * v.shape[-1]).clamp_min(1)).sqrt()
+            result["loss_" + label] = [[x if count[b, 0] else None for x in row]
+                                     for b, row in enumerate(loss.cpu().tolist())]
+            result["residual_rms_" + label] = [[x if count[b, 0] else None for x in row]
+                                             for b, row in enumerate(rms.cpu().tolist())]
+        return result
+    change = (adapted.detach() - before.detach()).flatten(-2).norm(dim=-1)
+    reference = before.detach().flatten(-2).norm(dim=-1)
+    relative = (change/reference.clamp_min(eps)).cpu().tolist()
+    return {"objective": "weighted_v_energy_support", "eta": float(eta.detach()) if eta is not None else None,
+            "support": partition(support), "query": partition(query),
+            "state_old": matrix_scale(previous), "state_before_local": matrix_scale(before),
+            "state_after_local": matrix_scale(adapted), "state_after_correct_temporary": matrix_scale(candidate),
+            "per_head": {"raw_grad_norm": gradient.detach().norm(dim=-1).cpu().tolist(),
+                         "clipped_grad_norm": clipped.detach().norm(dim=-1).cpu().tolist(),
+                         "clip_scale": scale.detach().squeeze(-1).cpu().tolist(),
+                         "psi_norm": local.detach().norm(dim=-1).cpu().tolist(),
+                         "tanh_saturation_fraction": (local.detach().tanh().abs() > .99).float().mean(-1).cpu().tolist(),
+                         "transport_change_norm": change.cpu().tolist(),
+                         "transport_change_relative": [[x if reference[b, h] > eps else None for h, x in enumerate(row)]
+                                                       for b, row in enumerate(relative)]},
+            "clip_fraction": float((scale.detach() < 1).float().mean()),
+            "measurement": "current noisy features; pre-Correct query held out of inner loss only; detached FP32"}
+
+
+@torch.no_grad()
 def clean_anchor_stats(previous, predicted, candidate, q, k, v, beta, w, read, write, gradient, cfg):
     """Token scales use explicit masks. Head arrays are [batch, head].
 
@@ -112,7 +152,7 @@ def clean_anchor_stats(previous, predicted, candidate, q, k, v, beta, w, read, w
     return {"write_tokens": int(write.sum()), "read_tokens": int(read.sum()),
             "write_tokens_per_branch": write.sum(-1).cpu().tolist(),
             "innovation_loss": loss.mean().item(), "inner_grad_norm": gradient.detach().norm().item(),
-            "state_pred": pred, "state": matrix_scale(candidate), "correction": matrix_scale(correction),
+            "state_old": old, "state_pred": pred, "state": matrix_scale(candidate), "correction": matrix_scale(correction),
             "predict_norm_relative_change": (pred["norm"] - old["norm"]) / old["norm"] if old["norm"] > cfg.eps else None,
             "beta": distribution(selected_beta), "w": distribution(selected_w),
             "per_head": heads, "measurement": "clean/pre-Correct innovation; masked new write tokens; FP32; detached"}

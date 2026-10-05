@@ -30,7 +30,9 @@ class ExecutionOptions:
 DEFAULT_EXECUTION = ExecutionOptions()
 
 
-def validate_execution(options, stage, ablation="full", diagnostics=False):
+def validate_execution(options, stage, ablation="full", diagnostics=False, *, meta=False):
+    if meta and (options.core_backend != "reference" or options.psi_backend != "reference"):
+        raise ValueError("Meta-TTT requires reference/reference; detached optimized backends are incompatible")
     if options.core_backend != "reference" and (stage != "C" or ablation != "full" or diagnostics):
         raise ValueError("optimized TTN execution requires Full Stage C without mechanism diagnostics; use reference/reference")
 
@@ -39,12 +41,15 @@ def execution_report(model):
     options = getattr(getattr(model, "ttn_system", None), "ttn_execution", DEFAULT_EXECUTION)
     implementation = ("original_dense" if options.core_backend == "reference" else
                       "dense_reused" if options.psi_backend == "reference" else "projected")
+    cfg = getattr(getattr(model, "ttn_system", None), "config", None)
+    if cfg is not None and (cfg.local_update or cfg.persistent_meta): implementation = "live_projected_meta"
     return {**asdict(options), "psi_implementation": implementation, "triton_available": False}
 
 
 def configure_execution(model, options=None):
     options = options or DEFAULT_EXECUTION
-    validate_execution(options, model.ttn_system.config.stage)
+    cfg = model.ttn_system.config
+    validate_execution(options, cfg.stage, meta=cfg.local_update or cfg.persistent_meta)
     model.ttn_system.ttn_execution = options
     for block in model.blocks:
         if hasattr(block.attn, "beta_proj") and hasattr(block.attn, "index"):
@@ -65,7 +70,9 @@ def configure_from_args(model, args):
     diagnostic = (getattr(args, "state_diagnostics", False) or getattr(args, "command", "") in
                   ("mechanism-evaluate", "align-chunk", "stage-evaluate") or
                   getattr(args, "history_source", "generated") != "generated")
-    validate_execution(options, model.ttn_system.config.stage, getattr(args, "ttn_ablation", "full"), diagnostic)
+    cfg = model.ttn_system.config
+    validate_execution(options, cfg.stage, getattr(args, "ttn_ablation", "full"), diagnostic,
+                       meta=cfg.local_update or cfg.persistent_meta)
     return configure_execution(model, options)
 
 

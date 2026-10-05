@@ -28,12 +28,12 @@ class TinyBlock(nn.Module):
 class TinyWorldModel(nn.Module):
     """Small functional model exercising the real adapter and session contracts on CPU."""
 
-    def __init__(self, stage="C"):
+    def __init__(self, stage="C", **meta):
         super().__init__()
         self.blocks = nn.ModuleList()
         for _ in range(20):
             self.blocks.append(TinyBlock())
-        install_ttn(self, TTNConfig(heads=2, head_dim=8, generators=3, stage=stage))
+        install_ttn(self, TTNConfig(heads=2, head_dim=8, generators=3, stage=stage, **meta))
         self.saved_features = []
 
     def forward(self, x, t, y, kv_cache, ttn_chunk_context, save_kv_cache=False, **kw):

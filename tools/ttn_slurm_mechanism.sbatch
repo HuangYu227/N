@@ -15,12 +15,14 @@
 set -euo pipefail
 : "${MECHANISM_OUTPUT:?Use tools/ttn_submit_mechanism.py}"
 : "${PYTHON:?Use the absolute Python path from the existing prefix environment}"
-case "${SLURM_ARRAY_TASK_ID:?Submit as the four-task array}" in
+case "${SLURM_ARRAY_TASK_ID:?Submit as the mechanism array}" in
   0) variant=full;       export TTN_ABLATION=full HISTORY_SOURCE=generated EVAL_METHODS='sana ttn' ;;
   1) variant=no-ttt;     export TTN_ABLATION=no-ttt HISTORY_SOURCE=generated EVAL_METHODS=ttn ;;
   2) variant=identity;   export TTN_ABLATION=identity HISTORY_SOURCE=generated EVAL_METHODS=ttn ;;
   3) variant=gt-history; export TTN_ABLATION=full HISTORY_SOURCE=gt EVAL_METHODS='sana ttn' ;;
-  *) echo 'Expected array task 0..3' >&2; exit 2 ;;
+  4) variant=no-local; export TTN_ABLATION=no-local HISTORY_SOURCE=generated EVAL_METHODS=ttn ;;
+  5) variant=no-persistent; export TTN_ABLATION=no-persistent HISTORY_SOURCE=generated EVAL_METHODS=ttn ;;
+  *) echo 'Expected array task 0..5' >&2; exit 2 ;;
 esac
 export COMMAND=evaluate FRAMES=61 STATE_DIAGNOSTICS=1
 export OUTPUT="$MECHANISM_OUTPUT/$variant"

@@ -57,6 +57,11 @@ printf '[TTN compile] host=%s rank=%s PYTHON=%s TMPDIR=%s TORCHINDUCTOR_CACHE_DI
 case "${TTN_ENTRY_MODULE:-worldttn.cli}" in
   worldttn.cli) "$PYTHON" -u -m worldttn.cli "$@" & ;;
   worldttn.benchmark) "$PYTHON" -u -m worldttn.benchmark "$@" & ;;
+  pytest)
+    if [[ -n "${META_TEST_OUTPUT:-}" ]]; then
+      "$PYTHON" -c 'import sys,torch; assert sys.version_info[:2] == (3,11); assert torch.__version__ == "2.9.1+cu128"; assert torch.cuda.is_available() and torch.cuda.device_count() == 1, "one visible CUDA GPU required for acceptance"'
+    fi
+    "$PYTHON" -u -m pytest "$@" & ;;
   *) echo 'Unsupported TTN_ENTRY_MODULE' >&2; exit 2 ;;
 esac
 child_pid=$!

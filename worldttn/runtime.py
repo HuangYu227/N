@@ -1,8 +1,9 @@
 """Explicit episode state and five-anchor clean transactions, independent of SANA caches."""
 from dataclasses import dataclass, field
+import math
 import torch
 from torch import nn
-from .core import ANCHORS, TTNConfig, Rank2Generators, CayleyFactors, DetachedCayleySnapshot
+from .core import ANCHORS, TTNConfig, Rank2Generators, CayleyFactors, DetachedCayleySnapshot, clip_inner_gradient
 from .performance import DEFAULT_EXECUTION, annotation, validate_execution
 from .stability import committed_anchor_stats, matrix_scale, write_direction_stats
 from .controller import TransitionController
@@ -15,6 +16,9 @@ class TTNSystem(nn.Module):
         self.config = config
         self.generators = Rank2Generators(config)
         self.controller = TransitionController(config)
+        if config.local_update:
+            # Constant initialization consumes no RNG and preserves inherited seeds.
+            self.local_eta_logits = nn.Parameter(torch.full((5,), math.log(math.expm1(.01))))
         self.requires_grad_(config.stage != "A")
 
 
@@ -37,22 +41,39 @@ class TTNChunkContext:
     begin_id: int = 0
     psi_snapshot: DetachedCayleySnapshot | None = None
     write_history: tuple = ()
+    live_factors: CayleyFactors | None = None
+    local_stats: dict = field(default_factory=dict)
+    ablation: str = "full"
+    noise_info: dict = field(default_factory=dict)
 
     def for_clean(self):
         return TTNChunkContext(self.predicted, self.previous, self.psi, self.cbase, self.system, self.frame_ids,
                                self.poses, self.read_mask, self.write_mask, self.revision, self.runtime_id, True,
                                self.prefill_mode, begin_id=self.begin_id, psi_snapshot=self.psi_snapshot,
-                               write_history=self.write_history)
+                               write_history=self.write_history, live_factors=self.live_factors,
+                               local_stats=self.local_stats, ablation=self.ablation)
 
     def token_masks(self, n):
         f = self.frame_ids.shape[-1]
         if n % f: raise ValueError("token count must be divisible by frame count")
         return self.read_mask.repeat_interleave(n // f, -1), self.write_mask.repeat_interleave(n // f, -1)
 
+    def support_query_masks(self, n, hw):
+        """Checkerboard in actual T/H/W order with absolute latent frame IDs."""
+        if hw is None or len(hw) != 3:
+            raise ValueError("Local support requires the actual token grid (T,H,W)")
+        t, h, w = hw
+        if any(not isinstance(i, int) or i < 1 for i in hw) or t != self.frame_ids.shape[-1] or t*h*w != n:
+            raise ValueError("Local token grid, frame IDs and token count disagree")
+        xy = torch.arange(h, device=self.frame_ids.device)[:, None] + torch.arange(w, device=self.frame_ids.device)
+        parity = ((self.frame_ids[..., None, None] + xy) % 2 == 0).flatten(1)
+        write = self.token_masks(n)[1]
+        return parity & write, ~parity & write
+
     def stage(self, index, state, gradient, stats):
         if not self.clean_mode: raise RuntimeError("temporary contexts cannot stage commits")
         if index in self.candidates: raise RuntimeError("anchor executed twice in clean transaction")
-        self.candidates[index] = (state, gradient.detach(), stats)
+        self.candidates[index] = (state, gradient if self.system.config.persistent_meta else gradient.detach(), stats)
 
 
 @dataclass
@@ -84,8 +105,10 @@ class TTNRuntimeState:
 
     @classmethod
     def create(cls, config, batch_size, device, *, ablation="full", diagnostics=False):
-        if ablation not in ("full", "no-ttt", "identity"):
+        if ablation not in ("full", "no-ttt", "identity", "no-local", "no-persistent"):
             raise ValueError("unknown TTN runtime ablation")
+        if ablation in ("no-local", "no-persistent") and not (config.local_update or config.persistent_meta):
+            raise ValueError("Local/Persistent contribution controls require Meta-TTT")
         if ablation != "full" and torch.is_grad_enabled():
             raise ValueError("TTN runtime ablations are inference-only")
         s = torch.zeros(batch_size,
@@ -128,8 +151,10 @@ class TTNRuntimeState:
         if prefill and (self.prefilled or self.commit_count): raise RuntimeError("prefill already completed")
         previous_pose = poses[:, 0] if prefill else self.previous_committed_pose
         options = getattr(system, "ttn_execution", DEFAULT_EXECUTION)
-        validate_execution(options, self.config.stage, self.ablation, self.diagnostics)
+        meta = self.config.local_update or self.config.persistent_meta
+        validate_execution(options, self.config.stage, self.ablation, self.diagnostics, meta=meta)
         snapshot = None
+        live_factors = None
         history = self.write_history
         with annotation(options, "Predict"), torch.autocast(device_type=self.world_state.device.type, enabled=False):
             if self.config.stage == "A" or prefill or self.ablation == "identity":
@@ -138,7 +163,7 @@ class TTNRuntimeState:
             else:
                 cbase = system.controller(poses, intrinsics, previous_pose, write, width, height)
                 coeff = cbase + (self.config.delta_psi * self.transition_fast.tanh()
-                                 if self.config.stage == "C" and self.ablation == "full" else 0)
+                                 if self.config.stage == "C" and self.ablation in ("full", "no-local") else 0)
                 live_factors = CayleyFactors(system.generators.u.float(), system.generators.v.float(), coeff)
                 predicted = live_factors.right(self.world_state)
                 with torch.no_grad():
@@ -159,7 +184,8 @@ class TTNRuntimeState:
                                self.revision,
                                id(self),
                                prefill_mode=prefill, begin_id=self.predict_count, psi_snapshot=snapshot,
-                               write_history=history)
+                               write_history=history, live_factors=live_factors if meta else None,
+                               ablation=self.ablation)
 
     def prefill(self, context):
         if self.prefilled or self.commit_count: raise RuntimeError("initial image can only be prefilled once")
@@ -185,12 +211,27 @@ class TTNRuntimeState:
             gradients.append(g)
         new_state = torch.stack(states, 1)
         grad = torch.stack(gradients, 1)
-        scale = (self.config.inner_clip / grad.norm(dim=-1, keepdim=True).clamp_min(self.config.eps)).clamp_max(1)
-        psi = (self.transition_fast -
-               self.config.eta_psi * grad * scale).detach() if self.config.stage == "C" and self.ablation == "full" else torch.zeros_like(
-                   self.transition_fast)
+        clipped, scale = clip_inner_gradient(grad, self.config.inner_clip, self.config.eps)
+        psi = (self.transition_fast - self.config.eta_psi * clipped
+               if self.config.stage == "C" and self.ablation in ("full", "no-local") else torch.zeros_like(self.transition_fast))
+        if not self.config.persistent_meta: psi = psi.detach()
+        if psi.dtype != torch.float32 or not torch.isfinite(psi).all():
+            raise ValueError("nonfinite or non-FP32 Persistent psi; transaction not committed")
         anchor_stats = [committed_anchor_stats(context.candidates[i][2], self.transition_fast[:, i], psi[:, i],
                         grad[:, i], scale[:, i], context.cbase[:, i], ANCHORS[i], context.prefill_mode) for i in range(5)]
+        if self.config.local_update or self.config.persistent_meta:
+            for i, stats in enumerate(anchor_stats):
+                heads = stats["per_head"]
+                stats["persistent"] = {"objective": "raw_weighted_innovation", "eta": self.config.eta_psi,
+                    "meta_gradient_enabled": self.config.persistent_meta and grad.requires_grad and self.ablation in ("full", "no-local") and not context.prefill_mode,
+                    "update_enabled": self.ablation in ("full", "no-local") and not context.prefill_mode,
+                    "prefill": context.prefill_mode,
+                    "per_head": {"raw_grad_norm": heads["inner_grad_norm"],
+                                 "clipped_grad_norm": heads["inner_grad_clipped_norm"],
+                                 "clip_scale": heads["inner_clip_scale"], "psi_norm": heads["psi_norm"],
+                                 "update_norm": heads["psi_update_norm"],
+                                 "tanh_saturation_fraction": (psi[:, i].detach().tanh().abs() > .99).float().mean(-1).cpu().tolist()}}
+                stats["local"] = context.local_stats.get(i, {"enabled": False, "reason": "prefill/clean-only"})
         history = context.write_history
         if not context.prefill_mode:
             correction = (new_state.detach() - context.predicted.detach()).clone()
@@ -203,7 +244,7 @@ class TTNRuntimeState:
             for i, stats in enumerate(anchor_stats):
                 stats.update(state_dynamics(context.previous[:, i], context.predicted[:, i],
                                             new_state[:, i], self.config.eps),
-                             inner_update_applied=self.config.stage == "C" and self.ablation == "full" and not context.prefill_mode)
+                             inner_update_applied=self.config.stage == "C" and self.ablation in ("full", "no-local") and not context.prefill_mode)
         previous_pose = self.previous_committed_pose.clone()
         committed = [set(s) for s in self.committed_frame_ids]
         for b in range(new_state.shape[0]):
@@ -225,9 +266,9 @@ class TTNRuntimeState:
             "write_frames": context.write_mask.sum(-1).tolist(),
             "state_norm": float(new_state.detach().norm()),
             "state_rms": matrix_scale(new_state)["rms"],
-            "psi_norm": float(psi.norm()),
-            "psi_update_norm": float((self.config.eta_psi * grad * scale).norm())
-                if self.config.stage == "C" and self.ablation == "full" else 0.,
+            "psi_norm": float(psi.detach().norm()),
+            "psi_update_norm": float((self.config.eta_psi * grad * scale).detach().norm())
+                if self.config.stage == "C" and self.ablation in ("full", "no-local") else 0.,
             "prefill": context.prefill_mode,
             "anchors": anchor_stats
         }

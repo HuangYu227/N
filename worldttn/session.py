@@ -27,6 +27,17 @@ def validate_clean_output(output, reference):
         raise FloatingPointError("nonfinite clean model output; transaction not committed")
 
 
+def record_noise(context, timestep, noise_sigma=None, sampled_timestep=None):
+    """Detached noisy-call metadata shared by training and the native sampler."""
+    config = context.system.config
+    if not (config.local_update or config.persistent_meta): return
+    sigma = timestep.float()/1000 if noise_sigma is None else noise_sigma
+    context.noise_info = {"noise_timestep": timestep.detach().float().cpu().tolist(),
+                          "noise_sigma": sigma.detach().float().cpu().tolist()}
+    if sampled_timestep is not None:
+        context.noise_info["sampled_timestep"] = sampled_timestep.detach().cpu().tolist()
+
+
 def carry_cache(cache, camera_attention="linear", previous=None):
     """Carry native GDN/FFN state and, in SANA mode, detached camera K/V."""
     result = []
@@ -87,8 +98,10 @@ class TTNSession:
             [width / self.width, height / self.height, width / self.width, height / self.height])
         return camera
 
-    def forward(self, x, t, y, context, cache, start, end, mask=None, data_info=None, save=False):
+    def forward(self, x, t, y, context, cache, start, end, mask=None, data_info=None, save=False,
+                *, noise_sigma=None, sampled_timestep=None):
         b = x.shape[0]
+        record_noise(context, t, noise_sigma, sampled_timestep)
         kw = {}
         for name, tensor in self.extras.items():
             if isinstance(tensor, torch.Tensor):
@@ -147,4 +160,5 @@ class TTNSession:
         self.runtime.commit_chunk(c)
         # Detached factors are clean-only; outer predicted/state graphs remain live.
         context.psi_snapshot = c.psi_snapshot = None
+        context.live_factors = c.live_factors = None
         return out, carry_cache(new_cache, self.model.ttn_system.config.camera_attention, previous=cache)

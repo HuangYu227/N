@@ -65,14 +65,18 @@ def test_fixed_cases_are_prefixes_not_reselected_when_training_horizon_changes(t
 
 
 @pytest.mark.parametrize("failure", [False, True])
-def test_periodic_evaluation_uses_private_subprocesses_and_publishes_progress(tmp_path, monkeypatch, failure):
-    args = SimpleNamespace(output=str(tmp_path / "eval"), training_run="immutable-snapshot", frames=61,
+@pytest.mark.parametrize("meta", [False, True])
+def test_periodic_evaluation_uses_private_subprocesses_and_publishes_progress(tmp_path, monkeypatch, failure, meta):
+    snapshot = tmp_path / "immutable-snapshot"
+    snapshot.mkdir()
+    (snapshot / "run_config.json").write_text(json.dumps({"training": {"meta_ttt": {"local_update": meta, "persistent_meta": meta}}}))
+    args = SimpleNamespace(output=str(tmp_path / "eval"), training_run=str(snapshot), frames=61,
         fixed_cases=str(tmp_path / "cases.pt"), seed=3407, eval_cases=1, cross_attn_backend="math", device="cpu",
         steps=20, cfg_scale=4.5, cached_blocks=2)
     calls = []
     def run(command, **kw):
         calls.append(command)
-        assert command[command.index("--training-run") + 1] == "immutable-snapshot"
+        assert command[command.index("--training-run") + 1] == str(snapshot)
         assert command[command.index("--noise-frames") + 1] == "61"
         assert "--camera-attention" not in command and "--resume" not in command
         out = Path(command[command.index("--output") + 1])
@@ -88,5 +92,10 @@ def test_periodic_evaluation_uses_private_subprocesses_and_publishes_progress(tm
     else: stage_evaluate_command(args)
     result = json.loads((tmp_path / "eval/summary.json").read_text())
     assert result["status"] == ("failed" if failure else "completed")
-    assert len(calls) == (2 if failure else 3)
-    assert set(result["results"]) == ({"long"} if failure else {"long", "short", "align"})
+    expected = {"long", "short", "align"} | ({"no-local", "no-persistent"} if meta else set())
+    assert len(calls) == (2 if failure else len(expected))
+    assert set(result["results"]) == ({"long"} if failure else expected)
+    if meta and not failure:
+        for command in calls[3:]:
+            assert command[command.index("--frames") + 1] == "13"
+            assert command[command.index("--ttn-ablation") + 1] in ("no-local", "no-persistent")

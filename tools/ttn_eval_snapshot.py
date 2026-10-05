@@ -12,6 +12,13 @@ import sys
 import uuid
 
 
+def expected_evaluation_children(run):
+    training = run.get("training", {})
+    config = training.get("meta_ttt", training.get("ttn", {}))
+    return {"long", "short", "align"} | ({"no-local", "no-persistent"}
+        if config.get("local_update", False) or config.get("persistent_meta", False) else set())
+
+
 def snapshot_training_run(source, *, retain_model=True):
     source = Path(source).resolve()
     run = json.loads((source / "run_config.json").read_text(encoding="utf-8"))
@@ -70,7 +77,8 @@ def release_evaluation_model(snapshot, result):
     if (meta.get("format") != "TTN-evaluation-snapshot-v2" or meta.get("retain_model") is not False
             or (snapshot / ".keep").exists()):
         return {"status": "retained"}
-    if (result.get("status") != "completed" or set(result.get("results", {})) != {"long", "short", "align"}
+    run = json.loads((snapshot / "run_config.json").read_text(encoding="utf-8"))
+    if (result.get("status") != "completed" or set(result.get("results", {})) != expected_evaluation_children(run)
             or result.get("identity", {}).get("step") != meta["step"]
             or Path(result.get("training_run", "")).resolve() != snapshot):
         raise ValueError("evaluation must complete against this exact snapshot before releasing its model")

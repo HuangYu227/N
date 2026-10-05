@@ -297,6 +297,13 @@ def _training_identity(args, config, settings, k):
     elif getattr(args, "train_scope", "ttn") in ("ttn-visual", "ttn-new"):
         identity.update(train_scope=args.train_scope, optimizer_foreach=False)
     if getattr(args, "optimizer_policy", None) == "origin": identity["optimizer_policy"] = "origin"
+    ttn = settings.get("ttn", {})
+    if ttn.get("local_update", False) or ttn.get("persistent_meta", False):
+        identity["meta_ttt"] = {"version": "dual-psi-v1", "local_update": ttn.get("local_update", False),
+                                "persistent_meta": ttn.get("persistent_meta", False),
+                                "local_objective": "weighted_v_energy_support", "persistent_objective": "raw_weighted_innovation",
+                                "support": "absolute_frame_xy_checkerboard", "local_eta_init": .01, "local_delta": 1.,
+                                "noise_gate": False}
     return identity
 
 
@@ -310,6 +317,8 @@ def _training_record(model, result, timing, parallel):
     if "anchor_gradients" in result: local["anchor_gradients"] = result["anchor_gradients"]
     from .distributed import gather_records
     if "parameter_update" in result: local["parameter_update"] = result["parameter_update"]
+    for key in ("optimizer_updates", "exposure"):
+        if key in result: local[key] = result[key]
     ranks = gather_records(local)
     return {"loss": sum(record["loss"] for record in ranks) / parallel.world,
             "outer_grad_norm": result["outer_grad_norm"], "ranks": ranks,
@@ -460,7 +469,9 @@ def train_command(args):
                "execution": execution_report(model), "resume_execution": resume_execution, "precision": precision_audit(),
                "camera_attention": model.ttn_system.config.camera_attention,
                "history_protocol": {"clean_commits": "GT after current noisy loss", "camera_cache": "all previous chunks within clip",
-                                    "prefill": "initial frame once; independent GDN/FFN scratch caches", "telemetry": "detached clean commits; rank/head separated"},
+                                    "prefill": "initial frame once; independent GDN/FFN scratch caches", "telemetry": "detached statistics; rank/head separated",
+                                    "persistent_gradient": "live inside TBPTT" if model.ttn_system.config.persistent_meta else "detached",
+                                    "local_lifecycle": "ephemeral per noisy call" if model.ttn_system.config.local_update else "disabled"},
                "implementation": {name: {"path": str(path.resolve()), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
                                   for name, path in sources.items()}}
         if unfreeze:
@@ -486,7 +497,8 @@ def train_command(args):
         args._failure_phase = "training-update"
         iteration_started = time.perf_counter()
         if stream is not None: batch = _dataset_batch(next(stream), config, args, tokenizer, encoder, encoder_device)
-        update_probe = FirstUpdateProbe(model) if first_update else None
+        meta = model.ttn_system.config.local_update or model.ttn_system.config.persistent_meta
+        update_probe = FirstUpdateProbe(model) if first_update and not meta else None
         from .benchmark import profiler_update
         with profiler_update(getattr(args, "ttn_profiler_trace", None) if first_update else None, rank):
             result, timing = timed_cuda(lambda: train_update(model, config, batch, optimizer, k, parallel))
@@ -494,6 +506,9 @@ def train_command(args):
         result["storage"] = parallel.storage_record(optimizer)
         if update_probe is not None:
             result["parameter_update"] = update_probe.report(optimizer)
+            first_update = False
+        elif first_update and "optimizer_updates" in result:
+            result["parameter_update"] = result["optimizer_updates"]
             first_update = False
         step += 1
         record = {"step": step, "stage": model.ttn_system.config.stage, "tbptt": k,
@@ -768,7 +783,7 @@ def main():
                         help="align-chunk: read-only autograd.grad probe at this index; no optimizer step")
     parser.add_argument("--eval-cases", type=int, default=1, help="deterministic unique example clips, diagnostic only")
     parser.add_argument("--fixed-cases", help="immutable CPU case bundle pinned by stage evaluation (shared full horizon)")
-    parser.add_argument("--ttn-ablation", choices=("full", "no-ttt", "identity"), default="full",
+    parser.add_argument("--ttn-ablation", choices=("full", "no-ttt", "identity", "no-local", "no-persistent"), default="full",
                         help="evaluate only: runtime intervention on the same C checkpoint, without changing stage/weights")
     parser.add_argument("--history-source", choices=("generated", "gt"), default="generated",
                         help="evaluate only: gt commits current GT after prediction to ALL caches; output stays generated")

@@ -84,9 +84,13 @@ class SANAFlowLoss:
                  data_info,
                  loss_mask,
                  on_prediction=None):
-
+        config = context.system.config  # Teacher replay intentionally has no TTN module.
+        noise_info = {}
+        if config.local_update or config.persistent_meta:
+            noise_info = {"noise_sigma": torch.as_tensor(self.scheduler.sigmas, device=clean.device,
+                                                        dtype=torch.float32)[t.long()], "sampled_timestep": t}
         def model_call(x, timestep, **unused):
-            result, _ = session.forward(x, timestep, y, context, cache, start, end, mask, data_info)
+            result, _ = session.forward(x, timestep, y, context, cache, start, end, mask, data_info, **noise_info)
             if on_prediction is not None: on_prediction(result)
             return result
 
@@ -233,7 +237,7 @@ def train_clip(model,
                              dtype=torch.get_autocast_dtype(clean.device.type),
                              cache_enabled=False) if parallel is not None and parallel.mode == "fsdp2" else nullcontext()
         # DDP no_sync still encloses both forward and backward. CPU storage
-        # preserves the full window's S graph and detached inner updates.
+        # preserves the full window's S/optional Persistent-meta graph.
         with sync, amp, activation_storage(activation_offload):
             loss = runner(episode, first, last, on_prediction=on_prediction)
             _memory_phase(memory_callback, "backward_begin", first=first, last=last)
@@ -248,8 +252,19 @@ def train_clip(model,
     grad_norm = parallel.clip_grad_norm(outer_clip) if parallel else torch.nn.utils.clip_grad_norm_(
         params, outer_clip, error_if_nonfinite=True)
     _memory_phase(memory_callback, "optimizer_begin")
+    meta = model.ttn_system.config.local_update or model.ttn_system.config.persistent_meta
+    probe = None
+    if meta:
+        from .training_health import FirstUpdateProbe
+        probe = FirstUpdateProbe(model)
     with annotation(execution, "Optimizer"):
         optimizer.step()  # slow parameters stay fixed throughout every clip's windows
+    updates = probe.report(optimizer) if probe is not None else None
     _memory_phase(memory_callback, "optimizer_end")
-    return {"loss": episode.total_loss, "outer_grad_norm": float(grad_norm), "runtime": runtime,
-            "chunks": episode.records, "prefill": episode.prefill_stats}
+    result = {"loss": episode.total_loss, "outer_grad_norm": float(grad_norm), "runtime": runtime,
+              "chunks": episode.records, "prefill": episode.prefill_stats,
+              "exposure": {"clips": b, "valid_latent_frames": int(valid.sum()),
+                  "predicted_latent_frames": int(loss_valid.sum()),
+                  "predicted_chunks": sum(int((loss_valid[:, start:end].any(-1)).sum()) for start, end in episode.ranges)}}
+    if updates is not None: result["optimizer_updates"] = updates
+    return result

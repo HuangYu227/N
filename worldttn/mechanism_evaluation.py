@@ -12,6 +12,8 @@ VARIANTS = {
     "identity": ("identity", "generated", ["ttn"]),
     "gt-history": ("full", "gt", ["sana", "ttn"]),
 }
+META_VARIANTS = {**VARIANTS, "no-local": ("no-local", "generated", ["ttn"]),
+                 "no-persistent": ("no-persistent", "generated", ["ttn"])}
 IDENTITY = ("stage", "step", "checkpoint_sha256", "fixed_cases_sha256", "frames", "noise_frames",
             "steps", "cfg_scale", "cached_blocks", "flow_shift", "ttn_camera_attention",
             "cross_attn_backend", "training_latent_frames", "provenance")
@@ -28,7 +30,15 @@ def collect_mechanisms(output):
     output = Path(output)
     summaries, statuses = {}, {}
     identity = None
-    for name, (ablation, history, methods) in VARIANTS.items():
+    full = output / "full/summary.json"
+    meta = json.loads(full.read_text())["protocol"].get("meta_ttt", {}) if full.is_file() else {}
+    plan_path = output / "plan.json"
+    plan = json.loads(plan_path.read_text()) if plan_path.is_file() else {}
+    names = plan.get("variants", list(META_VARIANTS if any(meta.values()) else VARIANTS))
+    if names not in (list(VARIANTS), list(META_VARIANTS)):
+        raise ValueError("unexpected mechanism variants")
+    variants = {name: META_VARIANTS[name] for name in names}
+    for name, (ablation, history, methods) in variants.items():
         folder = output / name
         status = output / f"{name}-status.json"
         statuses[name] = json.loads(status.read_text()) if status.is_file() else {"status": "pending"}
@@ -41,6 +51,7 @@ def collect_mechanisms(output):
         if not protocol["state_diagnostics"] or protocol["stage"] != "C":
             raise ValueError("mechanism comparisons require C checkpoints and state diagnostics")
         current = {key: protocol[key] for key in IDENTITY}
+        current["meta_ttt"] = protocol.get("meta_ttt", {"local_update": False, "persistent_meta": False})
         if identity is not None and current != identity:
             raise ValueError("mechanism runs used different checkpoints/cases/sampling/source")
         identity = current
@@ -60,9 +71,7 @@ def collect_mechanisms(output):
     base = rows("full", "sana")
     baseline_ttn = rows("full", "ttn")
     signatures = ("input_sha256", "initial_noise_sha256", "base_sha256")
-    plan_path = output / "plan.json"
     if plan_path.is_file():
-        plan = json.loads(plan_path.read_text())
         original = json.loads((Path(plan["source_evaluation"]) / "long/summary.json").read_text())
         for field in ("checkpoint_sha256", "fixed_cases_sha256", "stage", "step", "frames", "steps",
                       "cfg_scale", "cached_blocks", "flow_shift", "ttn_camera_attention"):
@@ -94,7 +103,7 @@ def collect_mechanisms(output):
         for horizon, field in (("long", "metrics"), ("short", "prefix_13_metrics")):
             records = [dict(r, metrics=r[field]) for method in (reference, current) for r in method.values()]
             comparisons[horizon] = paired_summary(records)
-        result["results"][name] = {"history_source": VARIANTS[name][1], **comparisons}
+        result["results"][name] = {"history_source": variants[name][1], **comparisons}
     def contrast(a, b, method="ttn"):
         return {h: {metric: result["results"][a][h]["metrics"][metric][method] - values[method]
                     if values[method] is not None and result["results"][a][h]["metrics"][metric][method] is not None else None
@@ -104,17 +113,19 @@ def collect_mechanisms(output):
         result["contrasts"]["controller_no_ttt_minus_identity"] = contrast("no-ttt", "identity")
     if "no-ttt" in summaries:
         result["contrasts"]["online_ttt_minus_no_ttt"] = contrast("full", "no-ttt")
+    for name, key in (("no-local", "local_minus_no_local"), ("no-persistent", "persistent_minus_no_persistent")):
+        if name in summaries: result["contrasts"][key] = contrast("full", name)
     if "gt-history" in summaries:
         result["contrasts"]["ttn_gt_history_minus_generated_history"] = contrast("gt-history", "full")
         result["contrasts"]["sana_gt_history_minus_generated_history"] = contrast("gt-history", "full", "sana")
-    if len(summaries) == len(VARIANTS): result["status"] = "completed"
+    if len(summaries) == len(variants): result["status"] = "completed"
     return result
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output")
-    parser.add_argument("--variant", choices=VARIANTS)
+    parser.add_argument("--variant", choices=META_VARIANTS)
     parser.add_argument("--status", choices=("running", "completed", "failed"))
     args = parser.parse_args()
     output = Path(args.output).resolve()
@@ -129,7 +140,7 @@ def main():
         atomic_json(output / "summary.json", {"status": "failed", "error": str(error)})
         raise
     atomic_json(output / "summary.json", result)
-    print(f"[TTN mechanisms] status={result['status']} completed={len(result['results'])}/4 output={output}", flush=True)
+    print(f"[TTN mechanisms] status={result['status']} completed={len(result['results'])}/{len(result['variants'])} output={output}", flush=True)
     if result["status"] == "completed":
         if "full_c_reproduction" in result:
             print("[TTN Full C reproduction] " + json.dumps(result["full_c_reproduction"]), flush=True)

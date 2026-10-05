@@ -35,7 +35,10 @@ def prepare(evaluation, output=None, fixed_cases=None):
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     output = Path(output).resolve() if output else evaluation.parent / f"mechanisms-step-{protocol['step']:06d}-{stamp}"
     if output.exists(): raise ValueError("use a new mechanism output directory")
+    from worldttn.mechanism_evaluation import VARIANTS, META_VARIANTS
+    variants = META_VARIANTS if any(protocol.get("meta_ttt", {}).values()) else VARIANTS
     return {"output": str(output), "source_evaluation": str(evaluation), "snapshot": str(snapshot),
+            "variants": list(variants), "array": f"0-{len(variants)-1}%1",
             "fixed_cases": str(cases.resolve()), "checkpoint_sha256": protocol["checkpoint_sha256"],
             "fixed_cases_sha256": protocol["fixed_cases_sha256"], "step": protocol["step"],
             "steps": protocol["steps"], "cfg_scale": protocol["cfg_scale"], "cached_blocks": protocol["cached_blocks"],
@@ -72,7 +75,8 @@ def main():
         EVAL_CASES=str(plan["eval_cases"]), SEED=str(plan["seed"]), CROSS_ATTN_BACKEND=plan["cross_attn_backend"])
     for name in ("GDN_DISABLE_COMPILE", "GDN_DISABLE_COMPLEX_COMPILE"):
         if plan["compile"].get(name) is not None: env[name] = plan["compile"][name]
-    command = ["sbatch", "--parsable", "--export=ALL", f"--partition={args.partition}", f"--chdir={project}",
+    array = plan.get("array", "0-3%1")
+    command = ["sbatch", "--parsable", "--export=ALL", f"--partition={args.partition}", f"--chdir={project}", f"--array={array}",
                f"--output={plan['output']}/slurm-%A_%a.out", str(project / "tools/ttn_slurm_mechanism.sbatch")]
     if args.dry_run:
         print(json.dumps({"plan": plan, "command": command}, indent=2))
@@ -83,7 +87,7 @@ def main():
     response = subprocess.run(command, env=env, capture_output=True, text=True, check=True)
     job = response.stdout.strip().split(";")[0]
     if not job.isdecimal(): raise RuntimeError(f"unexpected sbatch response: {response.stdout!r}")
-    (output / "job.json").write_text(json.dumps({"job": job, "array": "0-3%1"}) + "\n")
+    (output / "job.json").write_text(json.dumps({"job": job, "array": array}) + "\n")
     print(f"MECHANISM_JOB={job}\nMECHANISM_OUTPUT={output}", flush=True)
 
 

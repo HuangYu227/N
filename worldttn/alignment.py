@@ -58,7 +58,8 @@ def replay_anchors(teacher, student, context, records=None):
     teacher_stages, student_stages = {i: {} for i in ANCHORS}, {i: {} for i in ANCHORS}
     def emit(values):
         def save(name, value):
-            values[name] = tuple(t.detach() for t in value) if isinstance(value, tuple) else value.detach()
+            values[name] = (value if isinstance(value, dict) else
+                            tuple(t.detach() for t in value) if isinstance(value, tuple) else value.detach())
         return save
     def teacher_pre(index):
         def prepare(module, inputs, kwargs):
