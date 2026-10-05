@@ -9,15 +9,16 @@
 - `.checkpoint-owner.json` 限定自动清理所属实验；旧格式、外国 owner、部分写入、未知文件的目录不自动删除。`.keep` 或同输出根目录内的 checkpoint `.pt` 引用固定整套 bundle；外部评估快照只需要保留模型硬链接。
 - 保存前要求空闲空间覆盖 `1.15 × (两份新增模型 + 所有新增 rank 分片) + 2 GiB`；两份模型预算包含不支持硬链接时的发布复制。已有 bundle 在预算期间继续保留。
 - 保存锁协调同输出根目录的保存、清理与快照创建；冲突最多等待600秒，获取锁后再检查磁盘预算。正常错误会解锁。SIGKILL 可能留下锁，确认相应作业退出后人工处理；不会自动删除陌生锁或部分目录。
-- 文件系统阶段的 rank 错误通过 collective 传播后终止保存；硬 SIGKILL/通信故障仍依靠 Slurm 和进程组 timeout 结束。保存失败时不会提交后继。
+- gather 前的 reshard/state/局部 detach 准备及每次 gather 后的 rank0 CPU 拷贝都通过 `_phase` 同步局部错误，再进入下一次 tensor collective；还会核对各 rank 的模型键顺序/shape/dtype。`full_tensor()` 通信本身失败时记录参数名和原异常后退出，不再用可能已失效的进程组尝试同步错误。硬 SIGKILL/通信故障仍依靠 Slurm `--kill-on-bad-exit=1` 和进程组 timeout 结束。保存失败时不会提交后继。
 - 原日志170 / checkpoint160 的恢复以验证过的160为起点，明确登记未保存161..170，在新目录续训。`--after-job` 等待活跃父任务时暂用其声明终点，worker 必须在启动前重新验证。
-- benchmark/profile/layout 默认没有 checkpoint I/O；`--benchmark-save-checkpoint` 显式开启。checkpoint 输入推导 scope 并恢复原数据/profile，仍严格检查 exact-resume 配置。
+- benchmark/profile/layout 默认没有 checkpoint I/O；`--benchmark-save-checkpoint` 显式开启。checkpoint 输入推导 scope 并恢复原数据/profile，仍严格检查 exact-resume 配置。execution core/ψ backend 进入训练 identity；正式 resume/unfreeze 不能切换 backend。旧 identity 缺少该字段时按 reference/reference 兼容。只有 benchmark 允许 backend 差异，其他数据/scope/TBPTT 等配置仍严格相同；`run_config.resume_execution` 和 `[TTN resume execution]` 记录这次豁免。
+- 旧格式 saver 不遵守新增保存锁。对旧源创建 benchmark 快照必须先停止写入，再传 `--source-stopped`；存在 `squeue` 时自动检查本用户的 TTN 作业，运行或排队均拒绝，查询失败也拒绝。没有 Slurm 时该选项是人工确认，创建期间不能重启源写入进程。新 manifest bundle 继续由保存锁协调。
 - `failure-job*-rank*-pid*.json` 记录首个 Python 异常及 phase/step；空间耗尽可能使 JSON 写入失败，原 stderr traceback 仍保留。job 登记包含 stdout/stderr/workdir，导出不再向 sacct 查询不支持的日志路径字段。
 - 仅 Full Stage C 可选 reuse/reference、reuse/projected、compiled/projected；Identity、No-TTT、GT-history、teacher 对齐、阶段诊断要求 reference。
 
 ## 本地验证结果
 
-- 最终完整 `tests/ttn`：505 passed、3 skipped、6 warnings，620.32秒。环境为 Python3.10.16 / PyTorch2.11.0+cpu。
+- 本轮完整 `tests/ttn`：514 passed、3 skipped、6 warnings，626.24秒。环境为 Python3.10.16 / PyTorch2.11.0+cpu。包含局部 gather 准备/CPU 拷贝故障注入、tensor collective 原异常记录、backend resume/unfreeze 约束、实际 benchmark 豁免及旧源停训检查。整合提交37506aa的505项通过记录也保留在交付目录；A100证据仍待集群验收。
 - 同基线392b89f的 reference 比对：CPU小模型、Full Stage C、非零controller、TBPTT=2；参数、梯度、Adam状态、S/ψ等862个张量逐位一致。
 - 整合的加速回归覆盖 reuse/reference、reuse/projected 的输出、S/ψ、outer gradients、optimizer update、TBPTT=1/2/4；使用原有容差。compiled 的CPU检查采用 aot_eager，不代表生产CUDA/Inductor已验收。
 - 5个启动脚本与文档7段Bash指令通过语法检查；补丁在干净392b89f基线上通过 `git apply --check`。
@@ -61,13 +62,16 @@ export SOURCE_RUN="$ROOT/WorldTTN/output/worldttn/ucpe-C-20261004T063947Z/joint"
 
 ## 2. 固定完整基准快照
 
+这里的 SOURCE_RUN 来自旧保存器，先只读检查作业列表。确认源训练和续训链已结束，且快照创建期间不会重新提交源训练，再执行带 `--source-stopped` 的创建命令；本步骤不会取消任何作业。脚本保守阻止本用户所有名称以 `ttn` 开头的运行/排队任务，便于此次停训验收。
+
 ```bash
+squeue --me --noheader --format='%i|%j'
 export BENCHMARK_SNAPSHOT="$PROJECT_ROOT/output/benchmark-snapshot-$(date -u +%Y%m%dT%H%M%SZ)"
-"$PYTHON" -m tools.ttn_benchmark_snapshot --training-run "$SOURCE_RUN" --output "$BENCHMARK_SNAPSHOT"
+"$PYTHON" -m tools.ttn_benchmark_snapshot --training-run "$SOURCE_RUN" --output "$BENCHMARK_SNAPSHOT" --source-stopped
 "$PYTHON" -m tools.ttn_check_checkpoint "$BENCHMARK_SNAPSHOT/last.pt"
 ```
 
-模型与 optimizer/RNG/cursor 都硬链接到快照，不复制几十GiB。创建时持有源保存锁，与正在保存的源协调等待，避免快照使正常训练失败。快照独立于源后续保留清理。
+模型与 optimizer/RNG/cursor 都硬链接到快照，不复制几十GiB。创建时持有源保存锁；新保存器会协调等待，旧保存器必须保持停止。快照独立于源后续保留清理。
 
 ## 3. A100 算子正确性，再做真实四卡 update 验收
 
@@ -99,7 +103,7 @@ TTN_CORE_BACKEND=reuse TTN_PSI_BACKEND=projected \
   sbatch --time=01:00:00 tools/ttn_slurm_benchmark.sbatch
 ```
 
-每组查看 `output/benchmark-JOBID/performance.json`、`first_update.json`、`train.jsonl`、`slurm-ttn-perf-JOBID.out`。要求四 rank 有限、核心梯度无缺失、同一checkpoint/hash/training identity/scope，冷 update 单列；稳定耗时取最慢 rank。检查不存在 `last.pt` 或 `last-resume-*`，排除保存开销。比较逐步 loss 及现有容差内的行为，不能仅凭速度批准切换。
+每组查看 `output/benchmark-JOBID/performance.json`、`first_update.json`、`train.jsonl`、`slurm-ttn-perf-JOBID.out`。要求四 rank 有限、核心梯度无缺失、同一checkpoint/hash/scope，除 execution backend 外 training identity 相同，冷 update 单列；稳定耗时取最慢 rank。V1/V2的 `resume_execution.benchmark_override` 应为 true，V0为 false。检查不存在 `last.pt` 或 `last-resume-*`，排除保存开销。比较逐步 loss 及现有容差内的行为，不能仅凭速度批准切换。
 
 真实尺寸 CUDA/offload backward 回归测试单独申请一张GPU，并在进程启动前建立本地编译缓存：
 
@@ -143,4 +147,4 @@ FRAMES=61 TTN_CORE_BACKEND=reuse TTN_PSI_BACKEND=projected \
 
 对V1/V3重复上述两个长度；V3仅在前面的 compiled 正确性通过后执行。阶段teacher/mechanism评估继续 reference/reference。
 
-本地验证使用 CPU PyTorch 2.11，不能代替 LTU Python3.11 / PyTorch2.9.1+cu128。只有 A100 正确性和稳定窗口数据齐全后，才讨论加速默认值、H1/H2 和下一轮训练。
+本地验证使用 CPU PyTorch 2.11，不能代替 LTU Python3.11 / PyTorch2.9.1+cu128。A100 gate 通过后的下一批是 H1/H2 实现和评估，不直接开始 retraining；加速默认值也要以 A100 正确性、耗时和显存结果为依据。

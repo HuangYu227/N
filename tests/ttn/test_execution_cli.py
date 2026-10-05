@@ -108,6 +108,45 @@ def test_benchmark_derives_scope_and_refuses_explicit_mismatch(tmp_path):
     with pytest.raises(ValueError, match="exact resume"): resolve_train_scope(args)
 
 
+@pytest.mark.parametrize("benchmark", [False, True])
+def test_resume_execution_identity_only_allows_benchmark_backend_override(benchmark):
+    from worldttn.parallel_checkpoint import validate_training_checkpoint
+    old = {"tbptt": 2, "execution": {"core_backend": "reference", "psi_backend": "reference"}}
+    new = {"tbptt": 2, "execution": {"core_backend": "reuse", "psi_backend": "projected"}}
+    payload = {"distributed": {"format": "TTN-parallel-resume-v1", "mode": "fsdp2",
+                              "world_size": 4, "resume_dir": "shards", "training_config": old}}
+    if benchmark:
+        report = validate_training_checkpoint(payload, "fsdp2", 4, new, benchmark=True)
+        assert report["benchmark_override"] is True
+        assert report["saved"] == old["execution"] and report["requested"] == new["execution"]
+    else:
+        with pytest.raises(ValueError, match="training configuration"):
+            validate_training_checkpoint(payload, "fsdp2", 4, new)
+    with pytest.raises(ValueError, match="training configuration"):
+        validate_training_checkpoint(payload, "fsdp2", 4, {**new, "tbptt": 4}, benchmark=True)
+    assert payload["distributed"]["training_config"] == old  # No mutation of saved identity.
+
+
+def test_legacy_resume_execution_defaults_to_reference():
+    from worldttn.parallel_checkpoint import validate_training_checkpoint
+    payload = {"distributed": {"format": "TTN-parallel-resume-v1", "mode": "fsdp2", "world_size": 4,
+                              "resume_dir": "shards", "training_config": {"tbptt": 2}}}
+    config = {"tbptt": 2, "execution": {"core_backend": "reference", "psi_backend": "reference"}}
+    assert not validate_training_checkpoint(payload, "fsdp2", 4, config)["benchmark_override"]
+    with pytest.raises(ValueError, match="training configuration"):
+        validate_training_checkpoint(payload, "fsdp2", 4,
+                                     {**config, "execution": {"core_backend": "reuse", "psi_backend": "reference"}})
+
+
+def test_training_identity_records_backend_for_formal_and_benchmark_runs():
+    from worldttn.cli import _training_identity
+    from test_parallel_cli import CPUFlowConfig
+    args = SimpleNamespace(seed=3407, batch_file="batch.pt", train_scope="dit",
+                           ttn_core_backend="reuse", ttn_psi_backend="projected")
+    identity = _training_identity(args, SimpleNamespace(scheduler=CPUFlowConfig()), {}, 2)
+    assert identity["execution"] == {"core_backend": "reuse", "psi_backend": "projected"}
+
+
 @pytest.mark.parametrize("kind", ["throughput", "profile", "layouts"])
 @pytest.mark.parametrize("optin", [False, True])
 def test_real_training_loop_only_publishes_benchmark_bundle_when_opted_in(tmp_path, monkeypatch, kind, optin):
@@ -127,6 +166,7 @@ def test_real_training_loop_only_publishes_benchmark_bundle_when_opted_in(tmp_pa
     def build(args):
         torch.manual_seed(17)
         model = TinyWorldModel("C"); model.base_load_report = {"sha256": None}
+        cli.configure_from_args(model, args)
         return model, SimpleNamespace(scheduler=CPUFlowConfig()), {"learning_rate": 1e-5}
     def update(model, config, batch, optimizer, k, parallel):
         return train_clip(model, batch["clean_latents"], batch["y"], camera, optimizer,
@@ -145,9 +185,26 @@ def test_real_training_loop_only_publishes_benchmark_bundle_when_opted_in(tmp_pa
         ttn_layout_audit=kind == "layouts", ttn_profiler_trace="trace" if kind == "profile" else None,
         benchmark_save_checkpoint=optin)
     cli.train_command(args)
-    records = [json.loads(line) for line in (output / "train.jsonl").read_text().splitlines()]
+    records = [json.loads(line) for line in (output / "train.jsonl").read_text(encoding="utf-8").splitlines()]
     assert len(records) == (2 if kind == "throughput" else 1)
     assert (output / "last.pt").exists() is optin
     assert bool(list(output.glob("last-resume-*"))) is optin
     if optin: assert audit_checkpoint(output / "last.pt")["step"] == records[-1]["step"]
     if kind == "throughput": assert (output / "performance.json").is_file()
+    if kind == "throughput" and optin:
+        # Exercise both CLI validation and actual optimizer/RNG restoration.
+        checkpoint = output / "last.pt"
+        before = checkpoint.read_bytes()
+        args.adapter, args.resume = str(checkpoint), True
+        args.output = str(tmp_path / "resumed-benchmark")
+        args.ttn_core_backend, args.ttn_psi_backend = "reuse", "projected"
+        args.benchmark_save_checkpoint = False
+        cli.train_command(args)
+        run = json.loads((tmp_path / "resumed-benchmark" / "run_config.json").read_text(encoding="utf-8"))
+        assert run["resume_execution"]["benchmark_override"] is True
+        assert run["training"]["execution"] == {"core_backend": "reuse", "psi_backend": "projected"}
+        assert checkpoint.read_bytes() == before
+        assert not (tmp_path / "resumed-benchmark" / "last.pt").exists()
+        args.ttn_benchmark_stable_steps = 0
+        with pytest.raises(ValueError, match="training configuration"):
+            cli.train_command(args)

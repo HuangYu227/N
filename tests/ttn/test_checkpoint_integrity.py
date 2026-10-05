@@ -100,6 +100,35 @@ def test_retention_ignores_legacy_partial_foreign_and_unknown_files(tmp_path, en
     with pytest.raises(ValueError): integrity.audit_checkpoint(tmp_path / "bad.pt")
 
 
+def test_failed_tensor_collective_records_parameter_and_does_not_try_another_collective(tmp_path, engine, monkeypatch):
+    path = tmp_path / "last.pt"; save(path, engine, 1)
+    before = path.read_bytes()
+    original = saving.offline_state_dict
+    def state(model):
+        values = dict(original(model))
+        name = next(iter(values)); tensor = values[name]
+        class BrokenShard:
+            shape, dtype = tensor.shape, tensor.dtype
+            def numel(self): return tensor.numel()
+            def element_size(self): return tensor.element_size()
+            def detach(self): return self
+            def full_tensor(self): raise OSError("tensor collective failed")
+        values[name] = BrokenShard()
+        return values
+    monkeypatch.setattr(saving, "offline_state_dict", state)
+    phases, phase = [], saving._phase
+    def track(*args, **kwargs):
+        phases.append(args[2])
+        return phase(*args, **kwargs)
+    monkeypatch.setattr(saving, "_phase", track)
+    with pytest.raises(OSError, match="tensor collective failed"): save(path, engine, 2)
+    assert phases[-1] == "model-gather-prepare"
+    error = json.loads(next(tmp_path.glob("failure-*.json")).read_text())
+    assert error["phase"].startswith("model-gather:") and error["step"] == 2
+    assert path.read_bytes() == before and integrity.audit_checkpoint(path)["step"] == 1
+    assert not (tmp_path / ".checkpoint-save.lock").exists()
+
+
 def test_publication_copy_fallback_and_failure_preserve_alias(tmp_path, monkeypatch):
     source = tmp_path / "model.pt"; source.write_bytes(b"new")
     dest = tmp_path / "last.pt"; dest.write_bytes(b"old")

@@ -40,7 +40,7 @@ def _unpack(value, parameter):
 
 
 def _phase(parallel, path, label, action, step=None):
-    """Propagate local filesystem errors BEFORE any subsequent collective."""
+    """Propagate local errors BEFORE any subsequent tensor collective."""
     try:
         result = {"rank": parallel.rank, "value": action(), "error": None}
     except Exception as error:
@@ -52,6 +52,30 @@ def _phase(parallel, path, label, action, step=None):
     errors = [f"rank {r['rank']}: {r['error']}" for r in results if r["error"]]
     if errors: raise RuntimeError(f"checkpoint {label} failed; " + "; ".join(errors))
     return [r["value"] for r in results]
+
+
+def _gather_model(parallel, path, step):
+    values, adapter = {}, {}
+    def prepare():
+        parallel.reshard()
+        values.update({name: value.detach() for name, value in offline_state_dict(parallel.model).items()})
+        return [(name, tuple(value.shape), str(value.dtype), hasattr(value, "full_tensor"))
+                for name, value in values.items()]
+    schemas = _phase(parallel, path, "model-gather-prepare", prepare, step)
+    if any(schema != schemas[0] for schema in schemas):
+        raise ValueError("checkpoint model gather schema/order differs between ranks")
+    for name, value in values.items():
+        try:
+            if hasattr(value, "full_tensor"): value = value.full_tensor()  # EVERY rank
+        except Exception as error:
+            record_failure(Path(path).parent, f"model-gather:{name}", error, rank=parallel.rank, step=step)
+            # A failed tensor collective may invalidate the process group; exit,
+            # rather than attempting another collective to propagate this error.
+            raise
+        def copy():
+            if parallel.rank == 0: adapter[name] = value.cpu()
+        _phase(parallel, path, f"model-copy:{name}", copy, step)
+    return adapter
 
 
 def preflight_checkpoint(path, parallel, optimizer):
@@ -93,12 +117,7 @@ def save_training_checkpoint(path, parallel, optimizer, step, data_state=None, t
         # A snapshot may have held the lock long enough for free space to change.
         budget = preflight_checkpoint(path, parallel, optimizer)
         _phase(parallel, path, "bundle-create", lambda: folder.mkdir(exist_ok=False) if parallel.rank == 0 else None, step)
-        parallel.reshard()
-        adapter = {}
-        for name, value in offline_state_dict(parallel.model).items():
-            value = value.detach()
-            if hasattr(value, "full_tensor"): value = value.full_tensor()  # collective on EVERY rank
-            if parallel.rank == 0: adapter[name] = value.cpu()
+        adapter = _gather_model(parallel, path, step)
         def write_shard():
             shard = {
                 "format": "TTN-parallel-resume-v1", "rank": parallel.rank, "world_size": parallel.world,
@@ -141,21 +160,34 @@ def save_training_checkpoint(path, parallel, optimizer, step, data_state=None, t
             except OSError as error: print(f"[TTN checkpoint] could not release save lock: {error}", flush=True)
 
 
-def validate_training_checkpoint(payload, mode, world, training_config):
+def _resume_identity(config):
+    config = dict(config or {})
+    config.setdefault("execution", {"core_backend": "reference", "psi_backend": "reference"})
+    return config
+
+
+def validate_training_checkpoint(payload, mode, world, training_config, *, benchmark=False):
     meta = payload.get("distributed", {})
     if meta.get("format") != "TTN-parallel-resume-v1":
         raise ValueError("resume requires a distributed training checkpoint")
     if meta.get("mode") != mode or meta.get("world_size") != world:
         raise ValueError("optimizer resume requires the same backend and world size")
-    if meta.get("training_config") != (training_config or {}):
+    saved, requested = _resume_identity(meta.get("training_config")), _resume_identity(training_config)
+    report = {"saved": saved["execution"], "requested": requested["execution"],
+              "benchmark_override": bool(benchmark and saved["execution"] != requested["execution"])}
+    if benchmark:
+        saved.pop("execution"); requested.pop("execution")
+    if saved != requested:
         raise ValueError("resume training configuration mismatch")
     if Path(meta["resume_dir"]).name != meta["resume_dir"]:
         raise ValueError("invalid resume directory")
+    return report
 
 
 def validate_unfreeze_checkpoint(payload, mode, world, training_config):
     meta = payload.get("distributed", {})
-    old_config = meta.get("training_config", {})
+    old_config = _resume_identity(meta.get("training_config"))
+    training_config = _resume_identity(training_config)
     validate_training_checkpoint(payload, mode, world, old_config)
     if (payload.get("train_scope") != "ttn-visual" or payload.get("stage") != "C"
             or payload["config"].get("camera_attention") != "sana"
@@ -191,7 +223,7 @@ def restore_training_progress(path, parallel, training_config):
     return int(payload["step"]), shard["data"]
 
 
-def restore_training_checkpoint(path, parallel, optimizer, training_config=None):
+def restore_training_checkpoint(path, parallel, optimizer, training_config=None, *, benchmark=False):
     """Restore optimizer/RNG/cursor AFTER loading adapter into the unwrapped model.
 
     Call load_checkpoint before constructing ParallelTraining; loading ordinary
@@ -201,7 +233,8 @@ def restore_training_checkpoint(path, parallel, optimizer, training_config=None)
     reports = _phase(parallel, path, "resume-integrity", lambda: audit_checkpoint(path) if parallel.rank == 0 else None)
     if parallel.rank == 0: print("[TTN resume integrity] " + json.dumps(reports[0]), flush=True)
     payload = read_checkpoint(path, parallel.model, resume=True)
-    validate_training_checkpoint(payload, parallel.mode, parallel.world, training_config)
+    execution = validate_training_checkpoint(payload, parallel.mode, parallel.world, training_config, benchmark=benchmark)
+    if parallel.rank == 0: print("[TTN resume execution] " + json.dumps(execution), flush=True)
     folder = bundle_directory(path, payload["distributed"])
     shard = _rank_shard(path, payload, parallel)
     state = shard["optimizer"]

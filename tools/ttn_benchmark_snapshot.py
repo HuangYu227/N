@@ -9,6 +9,8 @@ import json
 import os
 from pathlib import Path
 import shlex
+import shutil
+import subprocess
 import torch
 import uuid
 
@@ -27,10 +29,23 @@ def benchmark_environment(snapshot):
     return profile
 
 
-def snapshot_training_bundle(source, output):
+def snapshot_training_bundle(source, output, *, source_stopped=False):
     source, output = Path(source).resolve(), Path(output).resolve()
     lock = source / ".checkpoint-save.lock"
     if output.exists(): raise FileExistsError(output)
+    if (source / "last.pt").is_file():
+        meta = torch.load(source / "last.pt", map_location="cpu", weights_only=False, mmap=True).get("distributed")
+        if meta and not meta.get("manifest"):
+            if not source_stopped:
+                raise ValueError("legacy saver ignores the snapshot lock; stop its training and pass --source-stopped")
+            if shutil.which("squeue"):
+                query = subprocess.run(["squeue", "--me", "--noheader", "--format=%i|%j"],
+                                       capture_output=True, text=True, timeout=20, check=True)
+                # ponytail: conservatively block all own TTN jobs; track source-specific
+                # writers if concurrent legacy experiments need snapshotting.
+                jobs = [line for line in query.stdout.splitlines()
+                        if "|" in line and line.split("|", 1)[1].strip().startswith("ttn")]
+                if jobs: raise RuntimeError("legacy source must stay stopped; active/queued TTN jobs: " + ", ".join(jobs))
     # Hold the same lock as publication/retention while pinning immutable files.
     from worldttn.checkpoint_integrity import acquire_checkpoint_lock, release_checkpoint_lock
     token = "benchmark-snapshot-" + uuid.uuid4().hex
@@ -81,14 +96,16 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--training-run")
     parser.add_argument("--output")
+    parser.add_argument("--source-stopped", action="store_true",
+                        help="confirm legacy source writers are stopped and will remain stopped while pinning")
     parser.add_argument("--print-env", help="read-only: emit shell-quoted saved training profile for the benchmark launcher")
     args = parser.parse_args()
     if args.print_env:
-        if args.training_run or args.output: parser.error("--print-env is separate from snapshot creation")
+        if args.training_run or args.output or args.source_stopped: parser.error("--print-env is separate from snapshot creation")
         for key, value in benchmark_environment(args.print_env).items(): print(f"export {key}={shlex.quote(value)}")
         return
     if not args.training_run or not args.output: parser.error("snapshot creation requires --training-run and --output")
-    print(snapshot_training_bundle(args.training_run, args.output), flush=True)
+    print(snapshot_training_bundle(args.training_run, args.output, source_stopped=args.source_stopped), flush=True)
 
 
 if __name__ == "__main__": main()

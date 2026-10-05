@@ -288,6 +288,8 @@ def _training_identity(args, config, settings, k):
             "timestep": {name: getattr(train, name, None) for name in (
                 "chunk_sampling_strategy", "same_timestep_prob", "chunk_mixture_probs", "noise_multiplier")},
             "batch_file": args.batch_file,
+            "execution": {"core_backend": getattr(args, "ttn_core_backend", "reference"),
+                          "psi_backend": getattr(args, "ttn_psi_backend", "reference")},
             "data": None if args.batch_file else asdict(config.data)}
     # Preserve existing frozen-backbone resume identities exactly.
     if getattr(args, "train_scope", "ttn") == "dit":
@@ -360,6 +362,7 @@ def train_command(args):
     identity = _training_identity(args, config, settings, k)
     payload = read_checkpoint(args.adapter, model, resume=args.resume) if args.adapter else None
     unfreeze = getattr(args, "unfreeze", False)
+    resume_execution = None
     if unfreeze:
         if args.resume or not payload or getattr(args, "train_scope", "ttn") != "dit":
             raise ValueError("unfreeze requires --adapter, --train-scope dit and no --resume")
@@ -367,7 +370,7 @@ def train_command(args):
             raise ValueError("unfreeze requires a separate output directory")
         validate_unfreeze_checkpoint(payload, mode, world, identity)
     if args.resume and payload.get("distributed"):
-        validate_training_checkpoint(payload, mode, world, identity)
+        resume_execution = validate_training_checkpoint(payload, mode, world, identity, benchmark=benchmark_run(args))
     elif args.resume and mode != "single":
         raise ValueError("multi-GPU resume requires optimizer shards; use --adapter without --resume for initialization")
     if payload: apply_checkpoint_weights(model, payload)
@@ -410,7 +413,8 @@ def train_command(args):
     if args.resume:
         args._failure_phase = "checkpoint-restore"
         if payload.get("distributed"):
-            step, cursor = restore_training_checkpoint(args.adapter, parallel, optimizer, identity)
+            step, cursor = restore_training_checkpoint(args.adapter, parallel, optimizer, identity,
+                                                      benchmark=benchmark_run(args))
         else:
             step = load_checkpoint(args.adapter, model, optimizer, resume=True)
     elif unfreeze:
@@ -439,7 +443,7 @@ def train_command(args):
                "launch": getattr(args, "launch", None), "parameters": parameter_report,
                "storage": parallel.storage_record(optimizer),
                "provenance": implementation_identity(),
-               "execution": execution_report(model), "precision": precision_audit(),
+               "execution": execution_report(model), "resume_execution": resume_execution, "precision": precision_audit(),
                "camera_attention": model.ttn_system.config.camera_attention,
                "history_protocol": {"clean_commits": "GT after current noisy loss", "camera_cache": "all previous chunks within clip",
                                     "prefill": "initial frame once; independent GDN/FFN scratch caches", "telemetry": "detached clean commits; rank/head separated"},

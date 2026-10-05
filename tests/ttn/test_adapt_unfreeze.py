@@ -92,7 +92,8 @@ def test_unfreeze_restores_progress_only_and_refuses_exact_resume_with_changed_s
     assert not torch.equal(before_camera, model2.blocks[3].attn.q_proj_cam.weight)
     assert all(int(s["step"]) == 1 for s in optimizer2.state.values())
     payload = torch.load(path, weights_only=False)
-    for change in ({"tbptt": 4}, {"seed": 1}):
+    for change in ({"tbptt": 4}, {"seed": 1},
+                   {"execution": {"core_backend": "reuse", "psi_backend": "projected"}}):
         with pytest.raises(ValueError, match="training configuration"):
             validate_unfreeze_checkpoint(payload, "single", 1, {**joint_identity, **change})
     with pytest.raises(ValueError, match="backend and world"):

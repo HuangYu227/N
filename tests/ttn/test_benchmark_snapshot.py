@@ -4,8 +4,9 @@ import pytest
 import torch
 
 
-def test_benchmark_snapshot_pins_weights_optimizer_rng_and_cursor(tmp_path):
+def test_benchmark_snapshot_pins_weights_optimizer_rng_and_cursor(tmp_path, monkeypatch):
     from tools.ttn_benchmark_snapshot import snapshot_training_bundle
+    monkeypatch.setattr("tools.ttn_benchmark_snapshot.shutil.which", lambda _: None)
     source = tmp_path / "training"; source.mkdir()
     folder = source / "last-resume-00000025-abc"; folder.mkdir()
     payload = {"format": "TTN-SANA-WM-v0.1", "step": 25, "stage": "C", "base_sha256": "base", "train_scope": "ttn-visual",
@@ -17,7 +18,7 @@ def test_benchmark_snapshot_pins_weights_optimizer_rng_and_cursor(tmp_path):
     (source / "run_config.json").write_text(json.dumps({"base": {"sha256": "base"}}))
     (source / "train.jsonl").write_text(json.dumps({"stage": "C", "step": 25}) + "\n" + json.dumps({"stage": "C", "step": 26}) + "\n")
     target = tmp_path / "pinned"
-    snapshot_training_bundle(source, target)
+    snapshot_training_bundle(source, target, source_stopped=True)
     torch.save({"step": 26}, source / "next.pt")
     os.replace(source / "next.pt", source / "last.pt")
     assert torch.load(target / "last.pt", weights_only=False)["step"] == 25
@@ -28,8 +29,9 @@ def test_benchmark_snapshot_pins_weights_optimizer_rng_and_cursor(tmp_path):
     with pytest.raises(FileExistsError): snapshot_training_bundle(source, target)
 
 
-def test_benchmark_snapshot_rejects_evaluation_only_and_missing_shards(tmp_path):
+def test_benchmark_snapshot_rejects_evaluation_only_and_missing_shards(tmp_path, monkeypatch):
     from tools.ttn_benchmark_snapshot import snapshot_training_bundle
+    monkeypatch.setattr("tools.ttn_benchmark_snapshot.shutil.which", lambda _: None)
     source = tmp_path / "training"; source.mkdir()
     (source / "run_config.json").write_text("{}")
     (source / "train.jsonl").write_text('{"step": 1, "stage": "C"}')
@@ -37,7 +39,7 @@ def test_benchmark_snapshot_rejects_evaluation_only_and_missing_shards(tmp_path)
     with pytest.raises(ValueError, match="resume"):
         snapshot_training_bundle(source, tmp_path / "evaluation-only")
     torch.save({"step": 1, "distributed": {"resume_dir": "shards", "world_size": 2}}, source / "last.pt")
-    with pytest.raises(FileNotFoundError): snapshot_training_bundle(source, tmp_path / "missing")
+    with pytest.raises(FileNotFoundError): snapshot_training_bundle(source, tmp_path / "missing", source_stopped=True)
 
 
 def test_new_bundle_snapshot_copies_manifest_and_survives_source_retention(tmp_path):
@@ -115,3 +117,39 @@ def test_snapshot_unlock_failure_preserves_original_read_error(tmp_path, monkeyp
                         lambda *a: (_ for _ in ()).throw(OSError("release I/O failure")))
     with pytest.raises(ValueError, match="original missing shard"):
         snapshots.snapshot_training_bundle(source, tmp_path / "snapshot")
+
+
+def test_legacy_snapshot_requires_stopped_source_and_checks_slurm_before_mutation(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from tools import ttn_benchmark_snapshot as snapshots
+    source = tmp_path / "source"; source.mkdir()
+    torch.save({"distributed": {"resume_dir": "legacy", "world_size": 4}}, source / "last.pt")
+    target = tmp_path / "snapshot"
+    monkeypatch.setattr(snapshots.shutil, "which", lambda name: "squeue")
+    queries = []
+    def running(command, **kwargs):
+        queries.append(command)
+        return SimpleNamespace(stdout="423146|ttn-formal\n")
+    monkeypatch.setattr(snapshots.subprocess, "run", running)
+    with pytest.raises(ValueError, match="source-stopped"):
+        snapshots.snapshot_training_bundle(source, target)
+    assert queries == [] and not target.exists() and not (source / ".checkpoint-save.lock").exists()
+    with pytest.raises(RuntimeError, match="423146"):
+        snapshots.snapshot_training_bundle(source, target, source_stopped=True)
+    assert len(queries) == 1 and not target.exists() and not (source / ".checkpoint-save.lock").exists()
+    monkeypatch.setattr(snapshots.subprocess, "run", lambda *a, **k: SimpleNamespace(stdout=""))
+    monkeypatch.setattr(snapshots, "_snapshot_training_bundle", lambda *a: target)
+    assert snapshots.snapshot_training_bundle(source, target, source_stopped=True) == target
+
+
+def test_legacy_source_slurm_query_failure_is_not_treated_as_stopped(tmp_path, monkeypatch):
+    import subprocess
+    from tools import ttn_benchmark_snapshot as snapshots
+    source = tmp_path / "source"; source.mkdir()
+    torch.save({"distributed": {"resume_dir": "legacy", "world_size": 4}}, source / "last.pt")
+    monkeypatch.setattr(snapshots.shutil, "which", lambda name: "squeue")
+    monkeypatch.setattr(snapshots.subprocess, "run",
+                        lambda *a, **k: (_ for _ in ()).throw(subprocess.CalledProcessError(1, "squeue")))
+    with pytest.raises(subprocess.CalledProcessError):
+        snapshots.snapshot_training_bundle(source, tmp_path / "snapshot", source_stopped=True)
+    assert not (tmp_path / "snapshot").exists() and not (source / ".checkpoint-save.lock").exists()
