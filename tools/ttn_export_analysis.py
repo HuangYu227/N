@@ -91,51 +91,51 @@ def checkpoint_audit(joint):
     return result
 
 
-def slurm_evidence(jobs, destination, warnings):
+def slurm_evidence(jobs, destination, warnings, registered=()):
     if not jobs:
         return
-    commands = {
-        "accounting.txt": ["sacct", "-j", ",".join(jobs), "--parsable2",
-                           "--format=JobID,JobName,State,ExitCode,Elapsed,ReqMem,MaxRSS"],
-        "log_paths.txt": ["sacct", "-X", "-j", ",".join(jobs), "--noheader", "--parsable2",
-                          "--format=JobID%40,JobName%100,StdOut%1000,StdErr%1000,WorkDir%1000"],
-    }
     destination.mkdir(parents=True, exist_ok=True)
-    for filename, command in commands.items():
+    by_job = {str(row["job"]): row for row in registered if row.get("job")}
+    def collect(row):
+        job = str(row["job"])
+        for pattern in {row.get("stdout"), row.get("stderr")}:
+            if not pattern or pattern in {"Unknown", "None", "(null)"}: continue
+            base, _, task = job.partition("_")
+            name = pattern.replace("%j", job).replace("%A", base).replace("%x", row.get("job_name", ""))
+            if task: name = name.replace("%a", task)
+            path = Path(name)
+            if not path.is_absolute(): path = Path(row.get("workdir") or ".") / path
+            if path.is_file():
+                digest = hashlib.sha256(str(path).encode()).hexdigest()[:10]
+                try: shutil.copy2(path, destination / f"{job}-{digest}-{path.name}")
+                except OSError as error: warnings.append(f"Cannot copy Slurm log {path}: {error}")
+            else:
+                warnings.append(f"Slurm log path missing or unresolved: {path}")
+    # These accounting fields exist on LTU; log paths come from our registry or scontrol.
+    command = ["sacct", "-j", ",".join(jobs), "--parsable2",
+               "--format=JobID,JobName,State,ExitCode,Elapsed,ReqMem,MaxRSS"]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=30)
+        (destination / "accounting.txt").write_text(result.stdout + result.stderr, encoding="utf-8")
+        if result.returncode: warnings.append(f"sacct unavailable/failed: {result.stderr.strip()}")
+    except (OSError, subprocess.TimeoutExpired) as error:
+        warnings.append(f"Slurm accounting unavailable: {error}")
+    for job in jobs:
+        row = by_job.get(job)
+        if row and (row.get("stdout") or row.get("stderr")):
+            collect(row)
+            continue
         try:
-            result = subprocess.run(command, capture_output=True, text=True, timeout=30)
-            (destination / filename).write_text(result.stdout + result.stderr, encoding="utf-8")
+            result = subprocess.run(["scontrol", "show", "job", job, "-o"], capture_output=True, text=True, timeout=30)
+            (destination / f"scontrol-{job}.txt").write_text(result.stdout + result.stderr, encoding="utf-8")
             if result.returncode:
-                warnings.append(f"sacct unavailable/failed: {result.stderr.strip()}")
+                warnings.append(f"scontrol job {job} unavailable; registered/local logs retained: {result.stderr.strip()}")
                 continue
-            if filename != "log_paths.txt":
-                continue
-            for line in result.stdout.splitlines():
-                fields = line.split("|")
-                if len(fields) < 5:
-                    continue
-                job, job_name, stdout, stderr, workdir = (x.strip() for x in fields[:5])
-                for pattern in {stdout, stderr}:
-                    if not pattern or pattern in {"Unknown", "None", "(null)"}:
-                        continue
-                    # Allocation log patterns normally use %j, %A or %x.
-                    base, _, task = job.partition("_")
-                    name = pattern.replace("%j", job).replace("%A", base).replace("%x", job_name)
-                    if task:
-                        name = name.replace("%a", task)
-                    path = Path(name)
-                    if not path.is_absolute():
-                        path = Path(workdir) / path
-                    if path.is_file():
-                        digest = hashlib.sha256(str(path).encode()).hexdigest()[:10]
-                        try:
-                            shutil.copy2(path, destination / f"{job}-{digest}-{path.name}")
-                        except OSError as error:
-                            warnings.append(f"Cannot copy Slurm log {path}: {error}")
-                    else:
-                        warnings.append(f"Slurm log path missing or unresolved: {path}")
+            fields = dict(re.findall(r"(?:^| )([A-Za-z][A-Za-z0-9_]*)=(.*?)(?= [A-Za-z][A-Za-z0-9_]*=|$)", result.stdout.strip()))
+            collect({"job": job, "job_name": fields.get("JobName", ""), "stdout": fields.get("StdOut"),
+                     "stderr": fields.get("StdErr"), "workdir": fields.get("WorkDir")})
         except (OSError, subprocess.TimeoutExpired) as error:
-            warnings.append(f"Slurm accounting unavailable: {error}")
+            warnings.append(f"Slurm log lookup unavailable: {error}")
 
 
 def export_analysis(run, mechanism, output, first=100, last=170, *, slurm=True):
@@ -193,6 +193,9 @@ def export_analysis(run, mechanism, output, first=100, last=170, *, slurm=True):
         for name in ("run_config.json", "first_update.json", "chain.json"):
             if (joint / name).is_file():
                 shutil.copy2(joint / name, raw / name)
+        for pattern in ("failure-job*.json", "chain-status-*.json"):
+            for evidence in joint.glob(pattern):
+                if evidence.is_file(): shutil.copy2(evidence, raw / evidence.name)
         with (raw / "train-steps.jsonl").open("w", encoding="utf-8") as stream:
             for record in json_lines(joint / "train.jsonl", warnings):
                 observed = record.get("step", observed)
@@ -297,6 +300,7 @@ def export_analysis(run, mechanism, output, first=100, last=170, *, slurm=True):
                 for key, delta in entries.items():
                     writers["mechanism_contrasts"].writerow(dict(contrast=name, horizon=horizon, metric=key, delta=delta))
     jobs = set()
+    registered = []
     for filename in ("jobs.jsonl", "eval_jobs.jsonl", "implementations.jsonl"):
         path = joint / filename
         if path.is_file():
@@ -305,6 +309,7 @@ def export_analysis(run, mechanism, output, first=100, last=170, *, slurm=True):
             relevant = (row.get("stop_step", -1) >= first and row.get("start_step", last) < last) if filename == "jobs.jsonl" else first <= row.get("step", -1) <= last
             if relevant and str(row.get("job", "")).isdecimal():
                 jobs.add(str(row["job"]))
+                registered.append(row)
     job = json_file(mechanism / "job.json", warnings).get("job")
     if str(job).isdecimal():
         jobs.add(str(job))
@@ -314,7 +319,7 @@ def export_analysis(run, mechanism, output, first=100, last=170, *, slurm=True):
             shutil.copy2(path, raw / path.name)
     audit["selected_jobs"] = sorted(jobs)
     if slurm:
-        slurm_evidence(sorted(jobs), output / "raw/slurm", warnings)
+        slurm_evidence(sorted(jobs), output / "raw/slurm", warnings, registered)
     else:
         warnings.append("Slurm accounting explicitly skipped")
     def fmt(value):

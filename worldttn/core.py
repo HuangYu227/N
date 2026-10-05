@@ -1,5 +1,6 @@
 """Persistent matrix correction and rank-2 Cayley transport (no token-pair matrix)."""
 from dataclasses import dataclass, asdict
+from typing import NamedTuple
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -105,6 +106,86 @@ def correct(pred, k, v, beta, mask, alpha_s=.5, eps=1e-6):
     residual = v - k @ pred
     candidate = pred + (alpha_s / denom)[..., None, None] * (k.transpose(-1, -2) @ (w[..., None] * residual))
     return candidate, w
+
+
+class CorrectionAux(NamedTuple):
+    candidate: torch.Tensor
+    w: torch.Tensor
+    prediction: torch.Tensor
+    residual: torch.Tensor
+    kt_weighted_residual: torch.Tensor
+    denom: torch.Tensor
+
+
+def correct_with_aux(pred, k, v, beta, mask, alpha_s=.5, eps=1e-6):
+    """Same operation ordering as reference; live outer results are not detached."""
+    w = write_weights(beta, mask, eps)
+    denom = eps + (w * k.square().sum(-1)).sum(-1)
+    prediction = k @ pred
+    residual = v - prediction
+    kt_weighted_residual = k.transpose(-1, -2) @ (w[..., None] * residual)
+    candidate = pred + (alpha_s / denom)[..., None, None] * kt_weighted_residual
+    return CorrectionAux(candidate, w, prediction, residual, kt_weighted_residual, denom)
+
+
+@dataclass(frozen=True)
+class DetachedCayleySnapshot:
+    """Own stack/solve outputs; detached read-only views never alias U/V storage."""
+    p: torch.Tensor
+    l: torch.Tensor
+    psi: torch.Tensor
+    cbase: torch.Tensor
+    owner: tuple
+
+    @classmethod
+    def from_live(cls, factors, psi, cbase, owner):
+        return cls(factors.p.detach(), factors.l.detach(), psi.detach(), cbase.detach(), owner)
+
+    def for_anchor(self, index):
+        return type(self)(self.p[index], self.l[:, index], self.psi[:, index], self.cbase[:, index], self.owner)
+
+    def validate(self, runtime_id, revision, begin_id):
+        if self.owner != (runtime_id, revision, begin_id):
+            raise RuntimeError("Cayley snapshot belongs to a different begin_chunk")
+
+    def right(self, x, inverse_b=False, transpose=False):
+        l = self.l.transpose(-1, -2) if transpose else self.l
+        return x + (.5 if inverse_b else 1.) * ((x @ self.p) @ l) @ self.p.transpose(-1, -2)
+
+
+def _effective_count(count, previous):
+    count = count.to(dtype=previous.dtype).clamp_min(1)
+    while count.ndim < previous.ndim - 2: count = count.unsqueeze(-1)
+    return count
+
+
+@torch.no_grad()
+def analytic_psi_gradient_dense_from_aux(previous, kt_weighted_residual, snapshot, count, delta_psi):
+    """V1: reuse auxiliary tensors, keep the original dense J/F contraction."""
+    previous, kt_weighted_residual = previous.detach(), kt_weighted_residual.detach()
+    count = _effective_count(count, previous)
+    h = -kt_weighted_residual / (count[..., None, None] * previous.shape[-1])
+    j = previous.transpose(-1, -2) @ h
+    f = snapshot.right(j.transpose(-1, -2), inverse_b=True).transpose(-1, -2)
+    f = snapshot.right(f, inverse_b=True, transpose=True)
+    u, v = snapshot.p[..., ::2].transpose(-1, -2), snapshot.p[..., 1::2].transpose(-1, -2)
+    gc = torch.einsum("...md,...de,...me->...m", u, f, v) - torch.einsum("...md,...de,...me->...m", v, f, u)
+    return delta_psi * (1 - snapshot.psi.tanh().square()) * gc
+
+
+@torch.no_grad()
+def analytic_psi_gradient_projected(previous, kt_weighted_residual, snapshot, count, delta_psi):
+    """V2: O(d^2 M+d M^2), independent of tokens after Correct's G_K reuse."""
+    previous, kt_weighted_residual = previous.detach(), kt_weighted_residual.detach()
+    pt = snapshot.p.transpose(-1, -2)
+    tp = snapshot.right(pt, inverse_b=True, transpose=True).transpose(-1, -2)
+    ttp = snapshot.right(pt, inverse_b=True).transpose(-1, -2)
+    x = previous @ tp
+    y = -kt_weighted_residual @ ttp
+    gc = (x[..., ::2] * y[..., 1::2] - x[..., 1::2] * y[..., ::2]).sum(-2)
+    count = _effective_count(count, previous)
+    gc = gc / (count[..., None] * previous.shape[-1])
+    return delta_psi * (1 - snapshot.psi.tanh().square()) * gc
 
 
 def innovation_loss(pred, k, v, w, mask):

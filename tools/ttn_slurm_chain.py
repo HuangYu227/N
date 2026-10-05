@@ -21,6 +21,7 @@ PROFILE = {
     "batch_file": "BATCH_FILE", "seed": "SEED", "tbptt": "TBPTT",
     "backbone_lr": "BACKBONE_LR", "text_encoder_device": "TEXT_ENCODER_DEVICE",
     "activation_offload": "ACTIVATION_OFFLOAD", "cross_attn_backend": "CROSS_ATTN_BACKEND",
+    "ttn_core_backend": "TTN_CORE_BACKEND", "ttn_psi_backend": "TTN_PSI_BACKEND",
 }
 
 
@@ -40,8 +41,26 @@ def last_step(run):
 
 
 def require_checkpoint(run, expected):
+    from worldttn.checkpoint_integrity import audit_checkpoint
     if last_step(run) != expected or not (Path(run) / "last.pt").is_file():
         raise ValueError(f"{run}: expected a completed step-{expected} run and last.pt")
+    report = audit_checkpoint(Path(run) / "last.pt", expected)
+    verify_training_record(run, report)
+    return report
+
+
+def verify_training_record(run, checkpoint):
+    record = None
+    with (Path(run) / "train.jsonl").open(encoding="utf-8") as stream:
+        for line in stream:
+            try: row = json.loads(line)
+            except json.JSONDecodeError: continue
+            if row.get("step") == checkpoint["step"]: record = row
+    if record is None:
+        raise ValueError(f"{run}: no completed training record for checkpoint step {checkpoint['step']}")
+    for key in ("stage", "train_scope"):
+        if checkpoint.get(key) is not None and record.get(key) != checkpoint[key]:
+            raise ValueError(f"{run}: training record {key} differs from checkpoint step {checkpoint['step']}")
 
 
 def parent_dependency(job):
@@ -71,6 +90,7 @@ def environment(plan, start):
             "RANK", "LOCAL_RANK", "WORLD_SIZE", "NODE_RANK", "LOCAL_WORLD_SIZE", "CUDA_VISIBLE_DEVICES",
             "STAGES", "FRAMES", "STEPS", "LATENT_HEIGHT", "LATENT_WIDTH", "DIAGNOSTIC_UNMASK_ALL_VALID",
             "CAMERA_ATTENTION", "CAMERA_ABLATION", "TRAINING_RUN", "FIXED_CASES", "EVAL_CASES",
+            "TTN_PROFILE", "TTN_LAYOUT_AUDIT", "TTN_COMPARE_REFERENCE", "BENCHMARK_SAVE_CHECKPOINT",
         ):
             env.pop(name, None)
     env.update(plan["environment"])
@@ -122,6 +142,7 @@ def submit_evaluation(plan, step, parent_job):
     env.update(COMMAND="stage-evaluate", TRAINING_RUN=str(snapshot), OUTPUT=str(output),
                FIXED_CASES=evaluation["fixed_cases"], EVAL_CASES=str(evaluation["cases"]),
                SEED=str(evaluation["seed"]), STEPS=str(evaluation["steps"]), CACHED_BLOCKS="2", CFG_SCALE="4.5")
+    env.update(TTN_CORE_BACKEND="reference", TTN_PSI_BACKEND="reference")
     command = ["sbatch", "--parsable", "--export=ALL", "--kill-on-invalid-dep=yes", "--job-name=ttn-stage-eval",
                f"--partition={plan['partition']}", "--nodes=1", "--ntasks=1", "--ntasks-per-node=1",
                "--gres=gpu:1", "--cpus-per-task=8", "--mem=128G", "--time=01:00:00",
@@ -132,6 +153,8 @@ def submit_evaluation(plan, step, parent_job):
     if not job.isdecimal(): raise RuntimeError(f"Unexpected evaluation sbatch response: {result.stdout!r}")
     with (Path(plan["output"]) / "eval_jobs.jsonl").open("a", encoding="utf-8") as stream:
         stream.write(json.dumps({"step": step, "job": job, "snapshot": str(snapshot), "output": str(output),
+                                 "stdout": str(output.parent / f"step-{step:06d}-{job}.out"),
+                                 "stderr": str(output.parent / f"step-{step:06d}-{job}.out"), "workdir": plan["project"],
                                  "train_scope": plan["environment"]["TRAIN_SCOPE"]}) + "\n")
     print(f"[TTN evaluation queued] step={step} job={job} snapshot={snapshot} output={output}", flush=True)
 
@@ -151,7 +174,9 @@ def submit(plan, manifest, start, dependency=None):
     job = result.stdout.strip().split(";")[0]
     if not job.isdecimal():
         raise RuntimeError(f"Unexpected sbatch response: {result.stdout!r}")
-    record = {"job": job, "dependency": dependency, "start_step": start, "stop_step": stop}
+    record = {"job": job, "dependency": dependency, "start_step": start, "stop_step": stop,
+              "stdout": str(Path(plan["output"]) / f"slurm-{job}.out"),
+              "stderr": str(Path(plan["output"]) / f"slurm-{job}.out"), "workdir": plan["project"]}
     with (Path(plan["output"]) / "jobs.jsonl").open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(record) + "\n")
     print(f"[TTN chain] job={job} steps={start + 1}..{stop} target={plan['target_step']}", flush=True)
@@ -169,12 +194,27 @@ def start_chain(args):
         raise ValueError("Expected an existing 4-rank FSDP2 full Stage C/DiT training run")
     if unfreeze and run["training"].get("train_scope") != "ttn-visual":
         raise ValueError("unfreeze source must be a visual warmup run")
-    initial = int(original["max_steps"])
-    if args.target_step <= initial or args.segment_steps < 1:
-        raise ValueError("Target must exceed the source run's final target; segment steps must be positive")
     dependency = parent_dependency(args.after_job) if args.after_job else None
-    if not dependency:
-        require_checkpoint(source, initial)
+    if dependency:
+        # This explicit dependency waits for the source's declared endpoint;
+        # worker must still validate the actually published checkpoint.
+        initial = int(original["max_steps"])
+        checkpoint_report = {"status": "awaiting_parent", "step": initial}
+    else:
+        from worldttn.checkpoint_integrity import audit_checkpoint
+        checkpoint_report = audit_checkpoint(source / "last.pt")
+        verify_training_record(source, checkpoint_report)
+        initial = int(checkpoint_report["step"])
+        observed = last_step(source)
+        if observed is None or observed < initial:
+            raise ValueError("published checkpoint has no matching completed training history")
+        checkpoint_report["last_logged_step"] = observed
+        checkpoint_report["unsaved_steps"] = [initial + 1, observed] if observed > initial else None
+        if observed > initial:
+            print(f"[TTN recovery] saved={initial} logged={observed}; unsaved steps {initial + 1}..{observed}; "
+                  "resume in a new output, original logs preserved", flush=True)
+    if args.target_step <= initial or args.segment_steps < 1:
+        raise ValueError("Target must exceed the verified checkpoint step; segment steps must be positive")
     root = Path(os.environ.get("ROOT", project.parent)).resolve()
     python = root / "envs/worldttn/bin/python"
     if not python.is_file():
@@ -189,7 +229,7 @@ def start_chain(args):
               project / "output/worldttn" / f"formal-C-{stamp}-{uuid.uuid4().hex[:6]}")
     output.mkdir(parents=True, exist_ok=False)
     plan = {"source": str(source), "project": str(project), "output": str(output), "environment": profile,
-            "initial_step": initial, "target_step": args.target_step,
+            "initial_step": initial, "target_step": args.target_step, "source_checkpoint": checkpoint_report,
             "segment_steps": args.segment_steps, "partition": args.partition}
     if unfreeze: plan["unfreeze"] = True
     evaluation = evaluation_settings(args, output)
@@ -244,23 +284,30 @@ def fresh_chain(args):
     submit(plan, manifest, 0)
 
 
-def worker(manifest, start):
-    plan = json.loads(manifest.read_text(encoding="utf-8"))
+def _worker(plan, manifest, start, status):
     if start < plan["initial_step"] or start >= plan["target_step"]:
         raise ValueError("Invalid segment start")
     source = Path(plan["source"] if start == plan["initial_step"] else plan["output"])
-    if not (plan.get("fresh") and start == 0): require_checkpoint(source, start)
+    if not (plan.get("fresh") and start == 0):
+        if start == plan["initial_step"] and plan.get("source_checkpoint", {}).get("unsaved_steps"):
+            from worldttn.checkpoint_integrity import audit_checkpoint
+            verify_training_record(source, audit_checkpoint(source / "last.pt", start))
+        else:
+            require_checkpoint(source, start)
     job = os.environ.get("SLURM_JOB_ID", "")
     if not job.isdecimal() or os.environ.get("SLURM_NTASKS") != "4":
         raise ValueError("Chain worker requires a four-task sbatch allocation")
     env = environment(plan, start)
     # For training inside THIS allocation retain Slurm's allocation metadata.
     env.update({key: value for key, value in os.environ.items() if key.startswith("SLURM_")})
+    status["phase"] = "training"
     subprocess.run(["bash", str(Path(plan["project"]) / "tools/ttn_slurm_train.sbatch")],
                    env=env, cwd=plan["project"], check=True)
     stop = int(env["MAX_STEPS"])
+    status["phase"] = "checkpoint-validation"
     require_checkpoint(Path(plan["output"]), stop)
     evaluation = plan.get("evaluation")
+    status["phase"] = "successor-submission"
     if evaluation and (stop % evaluation["every"] == 0 or stop == plan["target_step"] or
                        (plan.get("unfreeze") and start == plan["initial_step"])):
         submit_evaluation(plan, stop, job)
@@ -272,6 +319,27 @@ def worker(manifest, start):
                                    segment_steps=plan["segment_steps"], partition=plan["partition"], evaluation=evaluation))
     else:
         print(f"[TTN chain] completed target step {stop}", flush=True)
+
+
+def worker(manifest, start):
+    from worldttn.checkpoint_integrity import atomic_json
+    from worldttn.failure import record_failure
+    plan = json.loads(manifest.read_text(encoding="utf-8"))
+    job = os.environ.get("SLURM_JOB_ID", "local")
+    status = {"job": job, "start_step": start, "status": "running", "phase": "source-validation",
+              "stdout": str(Path(plan["output"]) / f"slurm-{job}.out")}
+    target = Path(plan["output"]) / f"chain-status-{job}.json"
+    atomic_json(status, target)
+    try:
+        _worker(plan, manifest, start, status)
+        status.update(status="completed", phase="completed")
+    except Exception as error:
+        record_failure(plan["output"], status["phase"], error, rank="chain", step=start)
+        status.update(status="failed", error=str(error))
+        raise
+    finally:
+        try: atomic_json(status, target)
+        except OSError as error: print(f"[TTN chain] could not write status: {error}", file=sys.stderr, flush=True)
 
 
 def main():

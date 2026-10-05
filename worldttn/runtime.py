@@ -2,7 +2,8 @@
 from dataclasses import dataclass, field
 import torch
 from torch import nn
-from .core import ANCHORS, TTNConfig, Rank2Generators, CayleyFactors
+from .core import ANCHORS, TTNConfig, Rank2Generators, CayleyFactors, DetachedCayleySnapshot
+from .performance import DEFAULT_EXECUTION, annotation, validate_execution
 from .stability import committed_anchor_stats, matrix_scale
 from .controller import TransitionController
 
@@ -33,11 +34,13 @@ class TTNChunkContext:
     clean_mode: bool = False
     prefill_mode: bool = False
     candidates: dict = field(default_factory=dict)
+    begin_id: int = 0
+    psi_snapshot: DetachedCayleySnapshot | None = None
 
     def for_clean(self):
         return TTNChunkContext(self.predicted, self.previous, self.psi, self.cbase, self.system, self.frame_ids,
                                self.poses, self.read_mask, self.write_mask, self.revision, self.runtime_id, True,
-                               self.prefill_mode)
+                               self.prefill_mode, begin_id=self.begin_id, psi_snapshot=self.psi_snapshot)
 
     def token_masks(self, n):
         f = self.frame_ids.shape[-1]
@@ -119,7 +122,10 @@ class TTNRuntimeState:
                                          device=write.device)
         if prefill and (self.prefilled or self.commit_count): raise RuntimeError("prefill already completed")
         previous_pose = poses[:, 0] if prefill else self.previous_committed_pose
-        with torch.autocast(device_type=self.world_state.device.type, enabled=False):
+        options = getattr(system, "ttn_execution", DEFAULT_EXECUTION)
+        validate_execution(options, self.config.stage, self.ablation, self.diagnostics)
+        snapshot = None
+        with annotation(options, "Predict"), torch.autocast(device_type=self.world_state.device.type, enabled=False):
             if self.config.stage == "A" or prefill or self.ablation == "identity":
                 cbase = torch.zeros_like(self.transition_fast)
                 predicted = self.world_state
@@ -127,8 +133,11 @@ class TTNRuntimeState:
                 cbase = system.controller(poses, intrinsics, previous_pose, write, width, height)
                 coeff = cbase + (self.config.delta_psi * self.transition_fast.tanh()
                                  if self.config.stage == "C" and self.ablation == "full" else 0)
-                factors = CayleyFactors(system.generators.u.float(), system.generators.v.float(), coeff)
-                predicted = factors.right(self.world_state)
+                live_factors = CayleyFactors(system.generators.u.float(), system.generators.v.float(), coeff)
+                predicted = live_factors.right(self.world_state)
+                if options.core_backend != "reference" and self.config.stage == "C":
+                    snapshot = DetachedCayleySnapshot.from_live(live_factors, self.transition_fast, cbase,
+                                                               (id(self), self.revision, self.predict_count + 1))
         self.predict_count += 1
         return TTNChunkContext(predicted,
                                self.world_state,
@@ -141,7 +150,7 @@ class TTNRuntimeState:
                                write,
                                self.revision,
                                id(self),
-                               prefill_mode=prefill)
+                               prefill_mode=prefill, begin_id=self.predict_count, psi_snapshot=snapshot)
 
     def prefill(self, context):
         if self.prefilled or self.commit_count: raise RuntimeError("initial image can only be prefilled once")
@@ -151,6 +160,8 @@ class TTNRuntimeState:
     def commit_chunk(self, context):
         if not context.clean_mode or context.revision != self.revision or context.runtime_id != id(self):
             raise RuntimeError("not a current clean transaction")
+        if context.psi_snapshot is not None:
+            context.psi_snapshot.validate(id(self), self.revision, self.predict_count)
         if set(context.candidates) != set(range(5)):
             raise RuntimeError("all five anchors must finish before committing")
         states = []

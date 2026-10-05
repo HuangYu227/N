@@ -6,6 +6,9 @@ import sys
 
 
 def stage_evaluate_command(args):
+    from .performance import ExecutionOptions, validate_execution
+    validate_execution(ExecutionOptions(getattr(args, "ttn_core_backend", "reference"),
+                       getattr(args, "ttn_psi_backend", "reference")), "C", diagnostics=True)
     from .provenance import implementation_identity
     output = Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=False)
@@ -14,6 +17,10 @@ def stage_evaluate_command(args):
     common = ["--parallel", "single", "--training-run", args.training_run, "--seed", str(args.seed),
               "--eval-cases", str(args.eval_cases), "--fixed-cases", args.fixed_cases, "--noise-frames", "61",
               "--cross-attn-backend", args.cross_attn_backend, "--device", args.device]
+    common += ["--ttn-core-backend", getattr(args, "ttn_core_backend", "reference"),
+               "--ttn-psi-backend", getattr(args, "ttn_psi_backend", "reference")]
+    for flag in ("ttn_profile", "ttn_layout_audit"):
+        if getattr(args, flag, False): common += ["--" + flag.replace("_", "-")]
     for name in ("base_weights", "sana_config", "dataset_root", "config"):
         if getattr(args, name, None): common += ["--" + name.replace("_", "-"), str(getattr(args, name))]
     commands = {
@@ -33,6 +40,7 @@ def stage_evaluate_command(args):
     publish()
     try:
         for name, command in commands.items():
+            if name != "align" and getattr(args, "ttn_compare_reference", False): command += ["--ttn-compare-reference"]
             subprocess.run([sys.executable, "-u", "-m", "worldttn.cli", *command, *common,
                             "--output", str(output / name)], check=True)
             summary = json.loads((output / name / "summary.json").read_text(encoding="utf-8"))
@@ -44,6 +52,7 @@ def stage_evaluate_command(args):
             result["identity"] = identities
             result["results"][name] = {"path": str(output / name / "summary.json"),
                 "metrics": summary.get("metrics"), "ttn_minus_sana": summary.get("ttn_minus_sana"),
+                "backend_comparison": summary.get("backend_comparison"),
                 "teacher_diagnoses": [{"original": r["diagnostic_summary"],
                     "matched": r["matched_backbone_softmax"]["diagnostic_summary"]} for r in summary["episodes"]] if name == "align" else None}
             publish()

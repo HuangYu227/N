@@ -31,6 +31,8 @@ def fixture_run(tmp_path):
         for step in (99, 100, 160, 170, 171)])
     # No stability.jsonl: exporter must recover it from the gathered train record.
     write(joint / "run_config.json", {"history_protocol": {"camera_cache": "full clip"}})
+    write(joint / "failure-job42-rank0-pid123.json", {"step": 170, "phase": "shard-write", "traceback": "OSError: quota"})
+    write(joint / "chain-status-42.json", {"job": "42", "phase": "failed", "step": 170})
     lines(joint / "jobs.jsonl", [dict(job="42", start_step=160, stop_step=170)])
     lines(joint / "eval_jobs.jsonl", [dict(job="43", step=125)])
     write(joint / "evaluations/step-000125/summary.json", {
@@ -86,6 +88,8 @@ def test_exports_recorded_metrics_without_cross_history_baseline_or_checkpoint_c
         assert any(n.endswith("slurm-42.out") for n in names)
         assert not any(n.endswith(".pt") for n in names)
         assert any(n.endswith("method_comparison.csv") for n in names)
+        assert any(n.endswith("failure-job42-rank0-pid123.json") for n in names)
+        assert any(n.endswith("chain-status-42.json") for n in names)
     assert (run / "joint/train.jsonl").read_bytes() == original
 
 
@@ -116,8 +120,8 @@ def test_export_retains_both_teachers_and_collects_external_stderr(tmp_path, mon
     error = tmp_path / "external-42.err"
     error.write_text("Disk quota exceeded during checkpoint save\n")
     def accounting(command, **kwargs):
-        if "--noheader" in command:
-            stdout = f"42|ttn-formal||{tmp_path}/external-%j.err|{tmp_path}|\n"
+        if command[0] == "scontrol":
+            stdout = f"JobId=42 JobName=ttn-formal StdOut= StdErr={tmp_path}/external-%j.err WorkDir={tmp_path}\n"
         else:
             stdout = "JobID|State|ExitCode\n42|FAILED|1:0\n"
         return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
@@ -129,3 +133,19 @@ def test_export_retains_both_teachers_and_collects_external_stderr(tmp_path, mon
     drift = list(csv.DictReader((out / "representation_drift.csv").open(encoding="utf-8-sig")))
     assert {r["point"] for r in drift} == {"after"}
     assert any("Disk quota exceeded" in p.read_text() for p in (out / "raw/slurm").glob("*.err"))
+
+
+def test_registered_logs_work_after_job_purged_and_no_invalid_sacct_fields(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from tools import ttn_export_analysis as module
+    error = tmp_path / "training.err"; error.write_text("quota error")
+    commands = []
+    def run(command, **kwargs):
+        commands.append(command)
+        assert "StdOut" not in " ".join(command) and "WorkDir" not in " ".join(command)
+        return SimpleNamespace(returncode=0, stdout="42|FAILED|1:0", stderr="")
+    monkeypatch.setattr(module.subprocess, "run", run)
+    warnings = []; out = tmp_path / "logs"
+    module.slurm_evidence(["42"], out, warnings, [{"job": "42", "stderr": str(error)}])
+    assert len(commands) == 1 and commands[0][0] == "sacct"
+    assert any(p.read_text() == "quota error" for p in out.glob("*.err"))

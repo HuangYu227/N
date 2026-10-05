@@ -334,7 +334,11 @@ def evaluate_command(args):
     methods = getattr(args, "eval_methods", ("sana", "ttn"))
     diagnostics = getattr(args, "state_diagnostics", False)
     if ablation != "full" and ttn.stage != "C": raise ValueError("mechanism ablations require a Stage C checkpoint")
-    if not methods or len(set(methods)) != len(methods) or any(m not in ("sana", "ttn") for m in methods):
+    if getattr(args, "ttn_compare_reference", False):
+        if tuple(methods) != ("sana", "ttn") or ablation != "full" or diagnostics:
+            raise ValueError("backend comparison requires paired Full evaluation without mechanism diagnostics")
+        methods = ("sana", "ttn", "ttn_reference")
+    if not methods or len(set(methods)) != len(methods) or any(m not in ("sana", "ttn", "ttn_reference") for m in methods):
         raise ValueError("evaluate requires distinct sana/ttn methods")
     from .provenance import camera_contract, implementation_identity
     camera_policy = camera_contract(ttn.camera_attention, getattr(args, "camera_attention", None),
@@ -395,14 +399,17 @@ def evaluate_command(args):
     records = []
     for method in methods:
         seed_everything(args.seed)
-        kwargs = {"install_adapter": method == "ttn"}
-        if method == "ttn" and (last_train.get("weight_scope") == "dit" or
+        kwargs = {"install_adapter": method != "sana"}
+        if method != "sana" and (last_train.get("weight_scope") == "dit" or
                 run["arguments"].get("train_scope") in ("dit", "ttn-visual")):
             kwargs["dtype"] = torch.float32  # retain trained masters; BF16 CUDA compute still uses autocast
         model = build_sana(config, ttn, args.base_weights or run["base"]["source"], args.device, **kwargs)
         if model.base_load_report["sha256"] != run["base"]["sha256"]:
             raise ValueError("paired evaluation base weights differ from training")
-        if method == "ttn":
+        if method != "sana":
+            from .performance import configure_from_args, configure_execution, ExecutionOptions, precision_audit
+            execution = configure_execution(model, ExecutionOptions()) if method == "ttn_reference" else configure_from_args(model, args)
+            if method == "ttn": protocol.update(execution=execution, precision=precision_audit())
             load_checkpoint(adapter, model)
             if file_sha256(adapter) != adapter_digest: raise ValueError("checkpoint changed during evaluation")
             if getattr(args, "camera_attention", None) is not None:
@@ -428,7 +435,12 @@ def evaluate_command(args):
                           "ablation": ablation, "history": history, **display}), flush=True)
                 else:
                     print("[TTN eval chunk] " + json.dumps({"method": method, "case": index, **chunk}), flush=True)
-            runtime_options = {}
+            def save_state(chunk, state):
+                torch.save({"world_state": state.world_state.detach().cpu(),
+                            "transition_fast": state.transition_fast.detach().cpu(),
+                            "commits": state.commit_count, "predictions": state.predict_count},
+                           output / f"case-{index:03d}-{method}-state-{chunk:03d}.pt")
+            runtime_options = {"on_state": save_state} if getattr(args, "ttn_compare_reference", False) else {}
             if method == "ttn" and (ablation != "full" or diagnostics):
                 runtime_options.update(ttn_ablation=ablation, state_diagnostics=diagnostics)
             if history == "gt": runtime_options["history_reference"] = gt
@@ -450,7 +462,8 @@ def evaluate_command(args):
                 row["prefix_13_metrics"] = latent_metrics(generated[:, :, :13], gt[:, :, :13],
                     [p for p in case["revisit_pairs"] if p["frame_b"] < 13], **metric_options)
                 row["prefix_protocol"] = "causal first 13 frames of this rollout, same full-horizon noise; not a separate run"
-            torch.save({"latents": generated, "method": method, "case_id": case["case_id"], "seed": case["seed"]},
+            torch.save({"latents": generated, "method": method, "case_id": case["case_id"], "seed": case["seed"],
+                        "chunks": [{k: chunk[k] for k in ("chunk", "start", "end")} for chunk in chunks]},
                        output / f"case-{index:03d}-{method}.pt")
             json_record(output / "episodes.jsonl", row)
             records.append(row)
@@ -460,7 +473,7 @@ def evaluate_command(args):
         del model
         gc.collect()
         torch.cuda.empty_cache()
-    if len(methods) == 2:
+    if "sana" in methods and "ttn" in methods:
         for index in range(len(cases)):
             a, b = records[index], records[index + len(cases)]
             if any(a[name] != b[name] for name in ("case_id", "seed", "input_sha256", "initial_noise_sha256", "base_sha256")):
@@ -468,6 +481,10 @@ def evaluate_command(args):
     if file_sha256(adapter) != adapter_digest: raise ValueError("checkpoint changed during evaluation")
     if fixed_digest is not None and file_sha256(args.fixed_cases) != fixed_digest:
         raise ValueError("fixed cases changed during evaluation")
-    result = {"protocol": protocol, **evaluation_summary(records), "episodes": records}
+    paired_records = [r for r in records if r["method"] != "ttn_reference"]
+    result = {"protocol": protocol, **evaluation_summary(paired_records), "episodes": records}
+    if getattr(args, "ttn_compare_reference", False):
+        from .benchmark import compare_saved_rollouts
+        result["backend_comparison"] = compare_saved_rollouts(output, len(cases))
     (output / "summary.json").write_text(json.dumps(result, indent=2))
-    print("[TTN eval summary] " + json.dumps({"output": str(output), **evaluation_summary(records)}), flush=True)
+    print("[TTN eval summary] " + json.dumps({"output": str(output), **evaluation_summary(paired_records)}), flush=True)

@@ -75,7 +75,10 @@ def atomic_save(payload, path):
     handle, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
     os.close(handle)
     try:
-        torch.save(payload, temporary)
+        with open(temporary, "wb") as stream:
+            torch.save(payload, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
         os.replace(temporary, path)
     finally:
         if os.path.exists(temporary): os.unlink(temporary)

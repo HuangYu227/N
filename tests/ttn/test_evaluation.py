@@ -137,7 +137,8 @@ def test_selector_rejects_camera_fallback_and_short_horizons():
 
 
 @pytest.mark.parametrize("camera_mode", [None, "sana"])
-def test_evaluate_runs_a_complete_identical_pair_and_never_passes_future_gt(tmp_path, monkeypatch, camera_mode):
+@pytest.mark.parametrize("compare_reference", [False, True])
+def test_evaluate_runs_a_complete_identical_pair_and_never_passes_future_gt(tmp_path, monkeypatch, camera_mode, compare_reference):
     from argparse import Namespace
     from dataclasses import dataclass
     from worldttn import evaluation as ev, cli, sana, checkpoint
@@ -178,15 +179,20 @@ def test_evaluate_runs_a_complete_identical_pair_and_never_passes_future_gt(tmp_
     run.mkdir()
     (run / "run_config.json").write_text(json.dumps({"arguments": {}, "training": {"data": {"num_frames": 25}},
                                                      "base": {"sha256": "base-sha", "source": "weights"}}))
-    (run / "train.jsonl").write_text(json.dumps({"step": 40, "stage": "A"}))
+    stage = "C" if compare_reference else "A"
+    (run / "train.jsonl").write_text(json.dumps({"step": 40, "stage": stage}))
     torch.save({"format": "TTN-SANA-WM-v0.1", "base_revision": BASE_REVISION,
-                "base_sha256": "base-sha", "stage": "A", "step": 40, "config": TTNConfig().to_dict()}, run / "last.pt")
+                "base_sha256": "base-sha", "stage": stage, "step": 40, "config": TTNConfig(stage=stage).to_dict()}, run / "last.pt")
     builds, captures = [], []
     class Model(torch.nn.Module):
         def __init__(self, adapted):
             super().__init__()
             self.adapted = adapted
             self.base_load_report = {"sha256": "base-sha"}
+            if adapted:
+                self.ttn_system = torch.nn.Module()
+                self.ttn_system.config = TTNConfig(stage=stage)
+                self.blocks = []
     def build(*args, install_adapter):
         builds.append(install_adapter)
         return Model(install_adapter)
@@ -201,14 +207,21 @@ def test_evaluate_runs_a_complete_identical_pair_and_never_passes_future_gt(tmp_
     monkeypatch.setattr(anchor, "configure_camera_attention", configure_camera)
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
     monkeypatch.setattr(cli, "timed_cuda", lambda call: (call(), {"seconds": 1., "peak_allocated_bytes": 10}))
-    def rollout(model, config, batch, steps, cfg, cache, *, initial_noise, on_chunk):
+    def rollout(model, config, batch, steps, cfg, cache, *, initial_noise, on_chunk, **kwargs):
         assert "clean_latents" not in batch and batch["initial_latent"].shape[2] == 1
         assert torch.equal(batch["initial_latent"], gt[:, :, :1])
         assert (batch["uncondition"] == 2).all(), "CFG needs encoded empty text, not smoke's zero placeholder"
         captures.append(initial_noise.clone())
         initial_noise += 5  # cannot contaminate the other method's noise
-        on_chunk({"chunk": 0, "start": 0, "end": 4})
-        return gt + 1, SimpleNamespace(commit_count=3, predict_count=3) if model.adapted else None, []
+        chunks = [{"chunk": 0, "start": 0, "end": 4}, {"chunk": 1, "start": 4, "end": 7}]
+        state = SimpleNamespace(commit_count=3, predict_count=3, world_state=torch.ones(1, 5, 2, 8, 8),
+                                transition_fast=torch.zeros(1, 5, 2, 3)) if model.adapted else None
+        for index, chunk in enumerate(chunks):
+            on_chunk(chunk)
+            if model.adapted and "on_state" in kwargs:
+                state.commit_count = state.predict_count = index + 2
+                kwargs["on_state"](index, state)
+        return gt + 1, state, chunks
     monkeypatch.setattr(cli, "rollout", rollout)
     args = Namespace(output=str(tmp_path / "eval"), training_run=str(run), adapter=None, stage=None,
                      config=str(cli.ROOT / "configs/worldttn/reference.json"), sana_config=None,
@@ -216,15 +229,20 @@ def test_evaluate_runs_a_complete_identical_pair_and_never_passes_future_gt(tmp_
                      revisit_min_gap=3, revisit_distance_fraction=.02, revisit_angle_deg=5., revisit_max_pairs=5,
                      seed=3407, device="cpu", base_weights=None, cross_attn_backend="math", launch={},
                      steps=20, cfg_scale=4.5, cached_blocks=2, camera_attention=camera_mode,
-                     camera_ablation=camera_mode is not None)
+                     camera_ablation=camera_mode is not None, ttn_compare_reference=compare_reference,
+                     ttn_core_backend="reuse" if compare_reference else "reference", ttn_psi_backend="projected" if compare_reference else "reference")
     ev.evaluate_command(args)
     summary = json.loads((tmp_path / "eval/summary.json").read_text())
-    assert builds == [False, True]
+    assert builds == ([False, True, True] if compare_reference else [False, True])
     torch.testing.assert_close(captures[0], captures[1])
+    if compare_reference:
+        torch.testing.assert_close(captures[1], captures[2])
+        assert summary["backend_comparison"][0]["generated_latents"]["exactly_equal"]
+        assert summary["backend_comparison"][0]["first_nonzero_state_difference"] is None
     assert summary["common_case_seed_count"] == 1 and summary["ttn_minus_sana"]["final_chunk_latent_mse"] == 0
     assert summary["protocol"]["training_latent_frames"] == 4
-    assert summary["protocol"]["stage"] == "A" and summary["protocol"]["step"] == 40
-    assert camera_overrides == ([] if camera_mode is None else [camera_mode])
+    assert summary["protocol"]["stage"] == stage and summary["protocol"]["step"] == 40
+    assert camera_overrides == ([] if camera_mode is None else [camera_mode] * (2 if compare_reference else 1))
     assert summary["protocol"]["checkpoint_camera_attention"] == "linear"
     assert summary["protocol"]["ttn_camera_attention"] == (camera_mode or "linear")
     assert summary["episodes"][0]["input_sha256"] == summary["episodes"][1]["input_sha256"]

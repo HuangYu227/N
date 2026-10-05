@@ -241,6 +241,9 @@ def alignment_command(args):
     kwargs = {"dtype": torch.float32} if (last_train.get("weight_scope") == "dit" or
                 run["arguments"].get("train_scope") in ("dit", "ttn-visual")) else {}
     student = build_sana(config, ttn, args.base_weights or run["base"]["source"], args.device, **kwargs)
+    from .performance import configure_from_args, precision_audit
+    protocol["execution"] = configure_from_args(student, args)
+    protocol["precision"] = precision_audit()
     for label, model in (("sana", teacher), ("ttn", student)):
         if model.base_load_report["sha256"] != run["base"]["sha256"]: raise ValueError("base weights differ from training")
         if label == "ttn": load_checkpoint(adapter, model)

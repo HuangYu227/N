@@ -1,11 +1,17 @@
 """Plain offline weight exports plus rank-local optimizer shards and RNG for exact resume."""
 from pathlib import Path
+import json
+import time
 import uuid
 import torch
 from torch import distributed as dist
 from .anchor import offline_state_dict
 from .checkpoint import atomic_save, checkpoint_payload, read_checkpoint, rng_state, restore_rng
 from .training_health import optimizer_parameter_names
+from .checkpoint_integrity import (FORMAT, acquire_checkpoint_lock, release_checkpoint_lock, atomic_json,
+                                   audit_checkpoint, bundle_directory, bundle_owner, file_receipt,
+                                   publish_model, prune_bundles, storage_budget, tensor_bytes)
+from .failure import record_failure
 
 
 def _pack(value):
@@ -33,6 +39,35 @@ def _unpack(value, parameter):
     return value
 
 
+def _phase(parallel, path, label, action, step=None):
+    """Propagate local filesystem errors BEFORE any subsequent collective."""
+    try:
+        result = {"rank": parallel.rank, "value": action(), "error": None}
+    except Exception as error:
+        record_failure(Path(path).parent, label, error, rank=parallel.rank, step=step)
+        result = {"rank": parallel.rank, "error": f"{type(error).__name__}: {error}"}
+    results = [None] * parallel.world
+    if parallel.world > 1: dist.all_gather_object(results, result)
+    else: results[0] = result
+    errors = [f"rank {r['rank']}: {r['error']}" for r in results if r["error"]]
+    if errors: raise RuntimeError(f"checkpoint {label} failed; " + "; ".join(errors))
+    return [r["value"] for r in results]
+
+
+def preflight_checkpoint(path, parallel, optimizer):
+    def estimates():
+        values = offline_state_dict(parallel.model).values()
+        model = sum(v.numel() * v.element_size() for v in values)
+        # Before the first update Adam moments do not exist yet.
+        moments = 2 * sum(tensor_bytes(p) for group in optimizer.param_groups for p in group["params"])
+        shard = max(moments, tensor_bytes(optimizer.state_dict())) if parallel.mode == "fsdp2" or parallel.rank == 0 else 0
+        return {"model": model, "shard": shard}
+    estimates = _phase(parallel, path, "storage-estimate", estimates)
+    budgets = _phase(parallel, path, "disk-budget", lambda: storage_budget(
+        path, estimates[0]["model"], [e["shard"] for e in estimates]) if parallel.rank == 0 else None)
+    return budgets[0]
+
+
 def save_training_checkpoint(path, parallel, optimizer, step, data_state=None, training_config=None):
     """All ranks participate; publish last.pt only after all shards are complete.
 
@@ -40,34 +75,70 @@ def save_training_checkpoint(path, parallel, optimizer, step, data_state=None, t
     an ordinary single-card inference/initialization checkpoint (full DiT for joint training).
     """
     path = Path(path)
+    budget = preflight_checkpoint(path, parallel, optimizer)
     identifier = [uuid.uuid4().hex if parallel.rank == 0 else None]
     if parallel.world > 1: dist.broadcast_object_list(identifier, src=0)
     checkpoint_id = identifier[0]
     folder = path.parent / f"{path.stem}-resume-{step:08d}-{checkpoint_id[:8]}"
-    folder.mkdir(parents=True, exist_ok=True)
-    parallel.reshard()
-    adapter = {}
-    for name, value in offline_state_dict(parallel.model).items():
-        value = value.detach()
-        if hasattr(value, "full_tensor"): value = value.full_tensor()  # collective on EVERY rank
-        if parallel.rank == 0: adapter[name] = value.cpu()
-    shard = {
-        "format": "TTN-parallel-resume-v1", "rank": parallel.rank, "world_size": parallel.world,
-        "mode": parallel.mode, "step": step, "rng": rng_state(), "data": data_state or {},
-        "checkpoint_id": checkpoint_id,
-        "optimizer": _pack(optimizer.state_dict()) if parallel.mode == "fsdp2" or parallel.rank == 0 else None,
-        "optimizer_parameter_names": optimizer_parameter_names(parallel.model, optimizer)
-    }
-    atomic_save(shard, folder / f"rank-{parallel.rank:05d}.pt")
-    if parallel.world > 1: dist.barrier()
-    if parallel.rank == 0:
-        payload = checkpoint_payload(parallel.model, adapter, None, step)
-        payload["distributed"] = {"format": shard["format"], "mode": parallel.mode,
-                                  "world_size": parallel.world, "resume_dir": folder.name,
-                                  "checkpoint_id": checkpoint_id,
-                                  "training_config": training_config or {}}
-        atomic_save(payload, path)
-    if parallel.world > 1: dist.barrier()
+    lock = path.parent / ".checkpoint-save.lock"
+    locked = False
+    def acquire():
+        nonlocal locked
+        if parallel.rank != 0: return None
+        acquire_checkpoint_lock(lock, checkpoint_id)
+        locked = True
+        return bundle_owner(path)
+    try:
+        owner = _phase(parallel, path, "save-lock", acquire, step)[0]
+        # A snapshot may have held the lock long enough for free space to change.
+        budget = preflight_checkpoint(path, parallel, optimizer)
+        _phase(parallel, path, "bundle-create", lambda: folder.mkdir(exist_ok=False) if parallel.rank == 0 else None, step)
+        parallel.reshard()
+        adapter = {}
+        for name, value in offline_state_dict(parallel.model).items():
+            value = value.detach()
+            if hasattr(value, "full_tensor"): value = value.full_tensor()  # collective on EVERY rank
+            if parallel.rank == 0: adapter[name] = value.cpu()
+        def write_shard():
+            shard = {
+                "format": "TTN-parallel-resume-v1", "rank": parallel.rank, "world_size": parallel.world,
+                "mode": parallel.mode, "step": step, "rng": rng_state(), "data": data_state or {},
+                "checkpoint_id": checkpoint_id,
+                "optimizer": _pack(optimizer.state_dict()) if parallel.mode == "fsdp2" or parallel.rank == 0 else None,
+                "optimizer_parameter_names": optimizer_parameter_names(parallel.model, optimizer)
+            }
+            target = folder / f"rank-{parallel.rank:05d}.pt"
+            atomic_save(shard, target)
+            return file_receipt(target, rank=parallel.rank)
+        receipts = _phase(parallel, path, "shard-write", write_shard, step)
+        def publish():
+            if parallel.rank != 0: return None
+            payload = checkpoint_payload(parallel.model, adapter, None, step)
+            payload["distributed"] = {"format": "TTN-parallel-resume-v1", "mode": parallel.mode,
+                                      "world_size": parallel.world, "resume_dir": folder.name,
+                                      "checkpoint_id": checkpoint_id, "manifest": "manifest.json", "bundle_owner": owner,
+                                      "training_config": training_config or {}}
+            model_path = folder / "model.pt"
+            atomic_save(payload, model_path)
+            manifest = {"format": FORMAT, "owner": owner, "target": path.name, "created_ns": time.time_ns(),
+                        "step": step, "checkpoint_id": checkpoint_id, "mode": parallel.mode, "world_size": parallel.world,
+                        "stage": payload["stage"], "train_scope": payload["train_scope"], "weight_scope": payload["weight_scope"],
+                        "files": [file_receipt(model_path, rank=None), *receipts]}
+            atomic_json(manifest, folder / "manifest.json")
+            report = audit_checkpoint(model_path, step)
+            publish_model(model_path, path)
+            print("[TTN checkpoint] " + json.dumps({**report, "path": str(path), "budget": budget}), flush=True)
+            # Publication is already successful: a cleanup failure must not invalidate it.
+            try:
+                print("[TTN retention] " + json.dumps(prune_bundles(path, apply=True)), flush=True)
+            except Exception as error:
+                print(f"[TTN retention] skipped after successful save: {error}", flush=True)
+            return report
+        return _phase(parallel, path, "model-publish", publish, step)[0]
+    finally:
+        if locked:
+            try: release_checkpoint_lock(lock, checkpoint_id)
+            except OSError as error: print(f"[TTN checkpoint] could not release save lock: {error}", flush=True)
 
 
 def validate_training_checkpoint(payload, mode, world, training_config):
@@ -104,7 +175,7 @@ def _validate_shard(shard, payload, parallel, rank):
 
 
 def _rank_shard(path, payload, parallel):
-    folder = Path(path).parent / payload["distributed"]["resume_dir"]
+    folder = bundle_directory(path, payload["distributed"])
     shard = torch.load(folder / f"rank-{parallel.rank:05d}.pt", map_location="cpu", weights_only=False)
     _validate_shard(shard, payload, parallel, parallel.rank)
     return shard
@@ -112,6 +183,7 @@ def _rank_shard(path, payload, parallel):
 
 def restore_training_progress(path, parallel, training_config):
     """Deliberate scope transition: keep RNG/cursor/step, never load old Adam state."""
+    _phase(parallel, path, "resume-integrity", lambda: audit_checkpoint(path) if parallel.rank == 0 else None)
     payload = read_checkpoint(path, parallel.model)
     validate_unfreeze_checkpoint(payload, parallel.mode, parallel.world, training_config)
     shard = _rank_shard(path, payload, parallel)
@@ -126,9 +198,11 @@ def restore_training_checkpoint(path, parallel, optimizer, training_config=None)
     tensors directly into FSDP2 parameters would bypass its sharding contract.
     """
     path = Path(path)
+    reports = _phase(parallel, path, "resume-integrity", lambda: audit_checkpoint(path) if parallel.rank == 0 else None)
+    if parallel.rank == 0: print("[TTN resume integrity] " + json.dumps(reports[0]), flush=True)
     payload = read_checkpoint(path, parallel.model, resume=True)
     validate_training_checkpoint(payload, parallel.mode, parallel.world, training_config)
-    folder = path.parent / payload["distributed"]["resume_dir"]
+    folder = bundle_directory(path, payload["distributed"])
     shard = _rank_shard(path, payload, parallel)
     state = shard["optimizer"]
     if state is None:

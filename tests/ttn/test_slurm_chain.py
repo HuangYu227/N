@@ -6,6 +6,7 @@ import subprocess
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 
 @pytest.fixture
@@ -34,7 +35,13 @@ def plan(tmp_path):
 def complete(run, step):
     run = Path(run)
     (run / "train.jsonl").write_text(json.dumps({"step": step}) + "\n", encoding="utf-8")
-    (run / "last.pt").touch()
+    folder = run / f"last-resume-{step}"; folder.mkdir(exist_ok=True)
+    meta = {"format": "TTN-parallel-resume-v1", "mode": "fsdp2", "world_size": 4,
+            "resume_dir": folder.name, "checkpoint_id": str(step)}
+    torch.save({"format": "TTN-SANA-WM-v0.1", "step": step, "distributed": meta}, run / "last.pt")
+    for rank in range(4):
+        torch.save({**meta, "step": step, "rank": rank, "rng": {}, "data": {}, "optimizer": {}},
+                   folder / f"rank-{rank:05d}.pt")
 
 
 def test_submission_preserves_training_and_does_not_inherit_old_allocation(chain, plan, monkeypatch):
@@ -125,7 +132,7 @@ def test_read_partial_json_line_and_require_completed_checkpoint(chain, tmp_path
     (tmp_path / "train.jsonl").write_text('{"step": 6}\n{"step":', encoding="utf-8")
     assert chain.last_step(tmp_path) == 6
     with pytest.raises(ValueError): chain.require_checkpoint(tmp_path, 6)
-    (tmp_path / "last.pt").touch()
+    complete(tmp_path, 6)
     chain.require_checkpoint(tmp_path, 6)
     with pytest.raises(ValueError): chain.require_checkpoint(tmp_path, 7)
 
@@ -291,3 +298,39 @@ def test_evaluation_submission_pins_snapshot_and_uses_separate_single_gpu(chain,
     assert not any(k in env for k in ("SLURM_JOB_ID", "ADAPTER", "CUDA_VISIBLE_DEVICES", "CAMERA_ATTENTION", "CAMERA_ABLATION"))
     row = json.loads((Path(plan["output"]) / "eval_jobs.jsonl").read_text())
     assert row["step"] == 25 and row["job"] == "123456"
+
+
+def test_checkpoint_exists_but_saved_step_is_stale_stops_chain(chain, tmp_path):
+    complete(tmp_path, 160)
+    (tmp_path / "train.jsonl").write_text('{"step":170}\n')
+    with pytest.raises(ValueError, match="checkpoint step 160"):
+        chain.require_checkpoint(tmp_path, 170)
+
+
+def test_start_recovers_from_saved_step_without_overwriting_original_logs(chain, tmp_path, monkeypatch):
+    project = tmp_path / "WorldTTN"; (project / "tools").mkdir(parents=True)
+    monkeypatch.setattr(chain, "__file__", str(project / "tools/ttn_slurm_chain.py"))
+    python = tmp_path / "envs/worldttn/bin/python"; python.parent.mkdir(parents=True); python.touch()
+    monkeypatch.setenv("ROOT", str(tmp_path))
+    source = tmp_path / "old"; source.mkdir(); complete(source, 160)
+    with (source / "train.jsonl").open("a") as stream: stream.write('{"step":170}\n')
+    (source / "run_config.json").write_text(json.dumps({"parallel": "fsdp2", "world_size": 4,
+        "arguments": {"max_steps": 170, "stage": "C", "train_scope": "dit"}}))
+    calls = []; monkeypatch.setattr(chain, "submit", lambda *a: calls.append(a))
+    chain.start_chain(SimpleNamespace(from_run=str(source), after_job=None, target_step=500,
+                    segment_steps=10, partition="short"))
+    plan = calls[0][0]
+    assert plan["initial_step"] == 160 and plan["source_checkpoint"]["unsaved_steps"] == [161, 170]
+    assert Path(plan["output"]) != source and chain.last_step(source) == 170
+
+
+@pytest.mark.parametrize("damage", ["missing", "stage", "train_scope"])
+def test_saved_training_record_must_exist_and_match_model_metadata(chain, tmp_path, damage):
+    complete(tmp_path, 160)
+    report = {"step": 160, "stage": "C", "train_scope": "dit"}
+    row = {"step": 160, "stage": "C", "train_scope": "dit"}
+    if damage == "missing": row["step"] = 170
+    else: row[damage] = "wrong"
+    (tmp_path / "train.jsonl").write_text(json.dumps(row) + "\n")
+    with pytest.raises(ValueError, match="training record"):
+        chain.verify_training_record(tmp_path, report)

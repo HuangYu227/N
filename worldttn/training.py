@@ -139,15 +139,18 @@ class TTNTrainingWindow(torch.nn.Module):
             _memory_phase(episode.memory_callback, "prefill_end")
             return episode.clean.new_zeros(())
         losses_in_window = []
+        from .performance import DEFAULT_EXECUTION, annotation
+        execution = getattr(self.model.ttn_system, "ttn_execution", DEFAULT_EXECUTION)
         for index in range(first, last):
             start, end = episode.ranges[index]
             context = session.begin_chunk(start, end)
             lm = episode.loss_valid[:, None, start:end, None, None].to(torch.float32)
             callback = (lambda output, i=index: on_prediction(i, output)) if on_prediction else None
             _memory_phase(episode.memory_callback, "noisy_begin", chunk=index, start=start, end=end)
-            losses = self.loss_fn(session, episode.clean[:, :, start:end], episode.timesteps[:, :, start:end],
-                                  episode.noise[:, :, start:end], episode.y, context, episode.cache, start, end,
-                                  episode.mask, episode.data_info, lm, callback)
+            with annotation(execution, "NoisyForward"):
+                losses = self.loss_fn(session, episode.clean[:, :, start:end], episode.timesteps[:, :, start:end],
+                                      episode.noise[:, :, start:end], episode.y, context, episode.cache, start, end,
+                                      episode.mask, episode.data_info, lm, callback)
             loss = (losses * (episode.loss_valid[:, start:end].sum(-1) / episode.total)).mean()
             if not torch.isfinite(loss): raise FloatingPointError("nonfinite flow loss")
             losses_in_window.append(loss)
@@ -155,8 +158,9 @@ class TTNTrainingWindow(torch.nn.Module):
             _memory_phase(episode.memory_callback, "noisy_end", chunk=index, start=start, end=end)
             # The current GT clean chunk becomes history only AFTER its noisy prediction.
             _memory_phase(episode.memory_callback, "clean_begin", chunk=index, start=start, end=end)
-            _, episode.cache = session.clean_forward(episode.clean[:, :, start:end], episode.y, context,
-                                                      episode.cache, start, end, episode.mask, episode.data_info)
+            with annotation(execution, "CleanForward"):
+                _, episode.cache = session.clean_forward(episode.clean[:, :, start:end], episode.y, context,
+                                                          episode.cache, start, end, episode.mask, episode.data_info)
             episode.records.append(dict(session.runtime.last_stats, chunk=index, start=start, end=end))
             _memory_phase(episode.memory_callback, "clean_end", chunk=index, start=start, end=end)
         return torch.stack(losses_in_window).sum()
@@ -233,7 +237,9 @@ def train_clip(model,
         with sync, amp, activation_storage(activation_offload):
             loss = runner(episode, first, last, on_prediction=on_prediction)
             _memory_phase(memory_callback, "backward_begin", first=first, last=last)
-            with trace_backward(loss):
+            from .performance import DEFAULT_EXECUTION, annotation
+            execution = getattr(model.ttn_system, "ttn_execution", DEFAULT_EXECUTION)
+            with annotation(execution, "Backward"), trace_backward(loss):
                 loss.backward()
             _memory_phase(memory_callback, "backward_end", first=first, last=last)
         runtime.detach()
@@ -242,7 +248,8 @@ def train_clip(model,
     grad_norm = parallel.clip_grad_norm(outer_clip) if parallel else torch.nn.utils.clip_grad_norm_(
         params, outer_clip, error_if_nonfinite=True)
     _memory_phase(memory_callback, "optimizer_begin")
-    optimizer.step()  # slow parameters stay fixed throughout every clip's windows
+    with annotation(execution, "Optimizer"):
+        optimizer.step()  # slow parameters stay fixed throughout every clip's windows
     _memory_phase(memory_callback, "optimizer_end")
     return {"loss": episode.total_loss, "outer_grad_norm": float(grad_norm), "runtime": runtime,
             "chunks": episode.records, "prefill": episode.prefill_stats}

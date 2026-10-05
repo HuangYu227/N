@@ -12,6 +12,7 @@ from .core import TTNConfig, BASE_ID, ANCHORS
 from .checkpoint import make_optimizer, save_checkpoint, load_checkpoint, read_checkpoint, apply_checkpoint_weights
 from .training import train_clip, SANAFlowLoss, chunk_ranges
 from .session import TTNSession
+from .performance import ExecutionOptions, configure_from_args, execution_report, precision_audit
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_REFERENCE = ROOT / "configs/worldttn/reference_sana_camera.json"
@@ -96,6 +97,7 @@ def build(args, stage=None, sana_path=None):
     # Do not quantize inherited master weights to BF16 before joint fine-tuning.
     options = {"dtype": torch.float32} if getattr(args, "train_scope", "ttn") in ("ttn-visual", "dit") else {}
     model = build_sana(config, ttn, args.base_weights, device=args.device, **options)
+    configure_from_args(model, args)
     policy = configure_cross_attention(model, getattr(args, "cross_attn_backend", "auto"),
                                        diagnostic_unmask_all_valid=getattr(args, "diagnostic_unmask_all_valid", False))
     from .distributed import rank_world
@@ -152,7 +154,7 @@ def train_update(model, config, batch, optimizer, k, parallel=None, *, activatio
 
 @torch.no_grad()
 def rollout(model, config, batch, steps=4, cfg_scale=4.5, cached_blocks=-1, *, initial_noise=None, on_chunk=None,
-            ttn_ablation="full", state_diagnostics=False, history_reference=None):
+            ttn_ablation="full", state_diagnostics=False, history_reference=None, on_state=None):
     from diffusion.scheduler.self_forcing_flow_euler_sampler import SelfForcingFlowEulerCamCtrl
     initial = batch.get("initial_latent")
     if initial is None: initial = batch["clean_latents"][:, :, :1]
@@ -228,6 +230,7 @@ def rollout(model, config, batch, steps=4, cfg_scale=4.5, cached_blocks=-1, *, i
                 })
                 if history_reference is not None: records[-1]["clean_history_source"] = "GT after current prediction; all caches"
                 if on_chunk is not None: on_chunk(records[-1])
+                if on_state is not None and session is not None: on_state(index, session.runtime)
                 last = now
     finally:
         model.forward_long = original
@@ -312,7 +315,27 @@ def _training_record(model, result, timing, parallel):
             "train_scope": getattr(model, "ttn_train_scope", "ttn"),
             "weight_scope": getattr(model, "ttn_weight_scope", "ttn"),
             "config": model.ttn_system.config.to_dict(), "base": model.base_load_report,
-            "cross_attention": getattr(model, "cross_attention_report", None)}
+            "cross_attention": getattr(model, "cross_attention_report", None), "execution": execution_report(model)}
+
+
+def benchmark_run(args):
+    return bool(getattr(args, "ttn_benchmark_stable_steps", 0) or getattr(args, "ttn_profiler_trace", None)
+                or getattr(args, "ttn_layout_audit", False))
+
+
+def checkpoint_due(args, step):
+    enabled = not benchmark_run(args) or getattr(args, "benchmark_save_checkpoint", False)
+    return enabled and (step % args.save_every == 0 or step == args.max_steps)
+
+
+def resolve_train_scope(args):
+    if benchmark_run(args) and args.adapter:
+        stored = torch.load(args.adapter, map_location="cpu", weights_only=False, mmap=True).get("train_scope", "ttn")
+        if getattr(args, "train_scope", None) is not None and args.train_scope != stored:
+            raise ValueError("benchmark train-scope differs from checkpoint; exact resume is required")
+        args.train_scope = stored
+    elif getattr(args, "train_scope", None) is None:
+        args.train_scope = "ttn"
 
 
 def train_command(args):
@@ -325,6 +348,8 @@ def train_command(args):
     from .sana import build_sana
     import hashlib
     import inspect
+    resolve_train_scope(args)
+    args._failure_phase = "model-build"
     model, config, settings = build(args)
     from .anchor import configure_train_scope, is_ttn_parameter
     if getattr(args, "train_scope", "ttn") != "ttn":
@@ -352,6 +377,11 @@ def train_command(args):
     # FSDP2 optimizer must be constructed AFTER parameters become DTensors.
     optimizer = make_optimizer(model, settings.get("learning_rate", 1e-5),
                                backbone_lr=getattr(args, "backbone_lr", 1e-6))
+    if not benchmark_run(args) or getattr(args, "benchmark_save_checkpoint", False):
+        from .parallel_checkpoint import preflight_checkpoint
+        args._failure_phase = "startup-disk-budget"
+        budget = preflight_checkpoint(Path(args.output) / "last.pt", parallel, optimizer)
+        if rank == 0: print("[TTN checkpoint budget] " + json.dumps(budget), flush=True)
     step, cursor = 0, None
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
@@ -378,6 +408,7 @@ def train_command(args):
             encoder.eval().requires_grad_(False)
     seed_everything(args.seed + rank)
     if args.resume:
+        args._failure_phase = "checkpoint-restore"
         if payload.get("distributed"):
             step, cursor = restore_training_checkpoint(args.adapter, parallel, optimizer, identity)
         else:
@@ -387,6 +418,18 @@ def train_command(args):
     if not args.batch_file:
         stream = ResumableBatchStream(loader, seed=args.seed, rank=rank, world=world, state=cursor)
     parameter_report = audit_training_parameters(model, optimizer)
+    benchmark_steps = getattr(args, "ttn_benchmark_stable_steps", 0)
+    benchmark_records = []
+    if benchmark_steps:
+        if args.ttn_profile or args.ttn_layout_audit or os.getenv("CUDA_LAUNCH_BLOCKING") == "1" or os.getenv("TORCH_LOGS"):
+            raise ValueError("throughput benchmark requires separate profiler/layout/recompile/synchronous diagnosis runs")
+        args.max_steps = step + benchmark_steps + 1
+        args.save_every = args.max_steps + 1  # Benchmark checkpoint IO only after the measurement window.
+        if args.ttn_core_backend == "compiled":
+            from .compiled import benchmark_warmup
+            benchmark_warmup(True)
+    elif getattr(args, "ttn_profiler_trace", None):
+        args.max_steps = step + 1
     if rank == 0:
         sources = {"cli": Path(__file__), "anchor": Path(inspect.getfile(type(model.blocks[3].attn))),
                    "sana": Path(inspect.getfile(build_sana)), "optimizer": Path(inspect.getfile(make_optimizer)),
@@ -396,6 +439,7 @@ def train_command(args):
                "launch": getattr(args, "launch", None), "parameters": parameter_report,
                "storage": parallel.storage_record(optimizer),
                "provenance": implementation_identity(),
+               "execution": execution_report(model), "precision": precision_audit(),
                "camera_attention": model.ttn_system.config.camera_attention,
                "history_protocol": {"clean_commits": "GT after current noisy loss", "camera_cache": "all previous chunks within clip",
                                     "prefill": "initial frame once; independent GDN/FFN scratch caches", "telemetry": "detached clean commits; rank/head separated"},
@@ -412,9 +456,14 @@ def train_command(args):
               ("stage", "train_scope", "weight_scope", "trainable_numel", "frozen_numel", "optimizer_groups")}), flush=True)
     first_update = True
     while step < args.max_steps:
+        args._failure_step = step + 1
+        args._failure_phase = "training-update"
+        iteration_started = time.perf_counter()
         if stream is not None: batch = _dataset_batch(next(stream), config, args, tokenizer, encoder, encoder_device)
         update_probe = FirstUpdateProbe(model) if first_update else None
-        result, timing = timed_cuda(lambda: train_update(model, config, batch, optimizer, k, parallel))
+        from .benchmark import profiler_update
+        with profiler_update(getattr(args, "ttn_profiler_trace", None) if first_update else None, rank):
+            result, timing = timed_cuda(lambda: train_update(model, config, batch, optimizer, k, parallel))
         result["anchor_gradients"] = anchor_gradient_scales(model)
         result["storage"] = parallel.storage_record(optimizer)
         if update_probe is not None:
@@ -442,9 +491,39 @@ def train_command(args):
             json_record(output / "train.jsonl", record)
             for row in stability_rows(record): json_record(output / "stability.jsonl", row)
             print(progress_line(record, args.max_steps), flush=True)
-        if step % args.save_every == 0 or step == args.max_steps:
+        if benchmark_steps:
+            record["local_iteration_seconds"] = time.perf_counter() - iteration_started
+            benchmark_records.append(record)
+            if len(benchmark_records) == 1:
+                # Cold update validates real backward after independent helper warmup.
+                if torch.cuda.is_available(): torch.cuda.synchronize()
+                if torch.distributed.is_initialized(): torch.distributed.barrier()
+                if args.ttn_core_backend == "compiled": benchmark_warmup(True, stable=True)
+        if benchmark_steps and step == args.max_steps:
+            from .distributed import gather_records
+            # One gather after the whole window, never an added per-step synchronization.
+            iteration_times = gather_records({"rank": rank, "seconds": [r["local_iteration_seconds"] for r in benchmark_records]})
+            for i, sample in enumerate(benchmark_records):
+                sample["iteration_seconds"] = max(r["seconds"][i] for r in iteration_times)
+                for r in sample["ranks"]:
+                    r["iteration_seconds"] = next(t["seconds"][i] for t in iteration_times if t["rank"] == r["rank"])
+        if benchmark_steps and step == args.max_steps and rank == 0:
+            from .benchmark import stable_summary
+            from .evaluation import file_sha256
+            performance = {**stable_summary(benchmark_records, benchmark_steps), "execution": execution_report(model),
+                           "precision": precision_audit(), "provenance": run["provenance"],
+                           "checkpoint_input": args.adapter,
+                           "checkpoint_sha256": file_sha256(args.adapter) if args.adapter else None, "training_identity": identity,
+                           "scope": args.train_scope, "world_size": world}
+            if args.ttn_core_backend == "compiled":
+                from .compiled import warmup_report
+                performance["compile_warmup"] = warmup_report()
+            (output / "performance.json").write_text(json.dumps(performance, indent=2), encoding="utf-8")
+        if checkpoint_due(args, step):
+            args._failure_phase = "checkpoint-save"
             save_training_checkpoint(output / "last.pt", parallel, optimizer, step,
                                      stream.state_dict() if stream is not None else {}, identity)
+    if benchmark_steps and args.ttn_core_backend == "compiled": benchmark_warmup(False)
 
 
 def infer_command(args):
@@ -460,6 +539,7 @@ def infer_command(args):
     torch.save({"latents": latents.cpu()}, output / "rollout.pt")
     report = {
         "mode": "inference",
+        "execution": execution_report(model), "precision": precision_audit(),
         "stage": model.ttn_system.config.stage,
         "config": model.ttn_system.config.to_dict(),
         "base": model.base_load_report,
@@ -678,6 +758,18 @@ def main():
                         help="auto: single with one process, DDP under Slurm, otherwise native FSDP2")
     parser.add_argument("--distributed-timeout", type=int, default=600,
                         help="process group timeout in seconds (default: 600)")
+    parser.add_argument("--ttn-core-backend", choices=("reference", "reuse", "compiled"), default="reference")
+    parser.add_argument("--ttn-psi-backend", choices=("reference", "projected"), default="reference",
+                        help="Triton is conditional on target-GPU profile; not implemented yet")
+    parser.add_argument("--ttn-profile", action="store_true", help="annotate profiler ranges; separate from throughput runs")
+    parser.add_argument("--ttn-layout-audit", action="store_true", help="record unique production tensor layouts per rank")
+    parser.add_argument("--ttn-benchmark-stable-steps", type=int, default=0,
+                        help="train only: one cold update plus N stable updates in a private output directory")
+    parser.add_argument("--ttn-profiler-trace", help="train only: export first-update CUDA traces, separate from throughput")
+    parser.add_argument("--benchmark-save-checkpoint", action="store_true",
+                        help="explicitly save resume bundles in benchmark/profiler/layout runs (default: no checkpoint IO)")
+    parser.add_argument("--ttn-compare-reference", action="store_true",
+                        help="evaluate: add same-weight TTN reference rollout and direct latent/S/psi differences")
     parser.add_argument("--activation-offload", choices=("none", "cpu"), default="none",
                         help="store backward saved tensors in pinned host RAM; single/DDP/FSDP2, no forward replay")
     parser.add_argument("--memory-trace", action="store_true",
@@ -701,7 +793,7 @@ def main():
     parser.add_argument("--camera-attention", choices=("linear", "sana"),
                         help="evaluate only: explicitly override the loaded TTN camera mixer/cache semantics")
     parser.add_argument("--camera-ablation", action="store_true", help="evaluate only: allow/label a camera operator different from training")
-    parser.add_argument("--train-scope", choices=("ttn", "ttn-visual", "dit"), default="ttn",
+    parser.add_argument("--train-scope", choices=("ttn", "ttn-visual", "dit"), default=None,
                         help="train: ttn-visual also freezes the original camera parameters; dit trains the complete DiT")
     parser.add_argument("--backbone-lr", type=float, default=1e-6,
                         help="learning rate for pretrained DiT outside five TTN anchors; --train-scope dit only")
@@ -726,6 +818,12 @@ def main():
     parser.add_argument("--latent-height", type=int, default=22)
     parser.add_argument("--latent-width", type=int, default=40)
     args = parser.parse_args()
+    try:
+        resolve_train_scope(args)
+    except (ValueError, OSError) as error:
+        parser.error(str(error))
+    if args.benchmark_save_checkpoint and (args.command != "train" or not benchmark_run(args)):
+        parser.error("--benchmark-save-checkpoint requires a train benchmark/profiler/layout run")
     if args.command != "evaluate" and (args.ttn_ablation != "full" or args.history_source != "generated"
             or args.state_diagnostics or args.eval_methods != ["sana", "ttn"]):
         parser.error("mechanism interventions are evaluate-only; training semantics are unchanged")
@@ -758,6 +856,19 @@ def main():
             parser.error("align-chunk uses real GT data without a sampler, --batch-file, --steps or --resume")
         if min(*args.alignment_timesteps, args.alignment_grad_timestep) < 0 or len(set(args.alignment_timesteps)) != len(args.alignment_timesteps):
             parser.error("align-chunk requires distinct nonnegative timesteps")
+    try:
+        ExecutionOptions(args.ttn_core_backend, args.ttn_psi_backend)
+    except ValueError as error:
+        parser.error(str(error))
+    if args.ttn_core_backend != "reference" and (args.ttn_ablation != "full" or args.state_diagnostics or
+            args.history_source != "generated" or args.command in ("align-chunk", "stage-evaluate")):
+        parser.error("mechanism and alignment diagnostics require reference/reference")
+    if args.ttn_benchmark_stable_steps < 0 or (args.ttn_benchmark_stable_steps or args.ttn_profiler_trace) and args.command != "train":
+        parser.error("benchmark/profiler update flags require train and nonnegative stable steps")
+    if args.ttn_benchmark_stable_steps and args.ttn_profiler_trace:
+        parser.error("profiler and stable throughput runs must be separate")
+    if args.ttn_compare_reference and args.command not in ("evaluate", "stage-evaluate"):
+        parser.error("--ttn-compare-reference requires evaluate or stage-evaluate")
     if args.steps is None: args.steps = 4
     if args.diagnostic_unmask_all_valid and (args.command != "diagnose-update" or args.batch_file):
         parser.error("--diagnostic-unmask-all-valid requires synthetic diagnose-update without --batch-file")
@@ -802,6 +913,11 @@ def main():
          "align-chunk": alignment_command, "stage-evaluate": stage_evaluate_command,
          "distributed-smoke": distributed_smoke_command, "distributed-check": distributed_check_command,
          "diagnose-update": diagnose_update_command}[args.command](args)
+    except Exception as error:
+        from .failure import record_failure
+        record_failure(args.output, getattr(args, "_failure_phase", args.command), error,
+                       step=getattr(args, "_failure_step", None))
+        raise
     finally:
         if torch.distributed.is_initialized(): torch.distributed.destroy_process_group()
 

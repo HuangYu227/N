@@ -145,4 +145,6 @@ class TTNSession:
                                       save=True)
         validate_clean_output(out, clean)
         self.runtime.commit_chunk(c)
+        # Detached factors are clean-only; outer predicted/state graphs remain live.
+        context.psi_snapshot = c.psi_snapshot = None
         return out, carry_cache(new_cache, self.model.ttn_system.config.camera_attention, previous=cache)
