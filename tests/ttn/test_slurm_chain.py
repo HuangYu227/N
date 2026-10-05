@@ -1,12 +1,51 @@
 """Test exact-resume launch wiring and failure boundaries without Slurm/GPU."""
 import importlib.util
 import json
+import os
 from pathlib import Path
+import shutil
 import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
 import torch
+
+
+def test_batch_entry_uses_project_package_even_with_an_old_checkout_on_pythonpath(tmp_path):
+    bash = Path("D:/Git/bin/bash.exe")
+    if not bash.exists():
+        candidate = shutil.which("bash")
+        if not candidate: pytest.skip("Bash not installed")
+        bash = Path(candidate)
+    project = Path(__file__).resolve().parents[2]
+    old = tmp_path / "old checkout"
+    for name in ("worldttn", "tools"):
+        package = old / name
+        package.mkdir(parents=True, exist_ok=True)
+        (package / "__init__.py").write_text("# stale package without new checkpoint helpers\n")
+    root = tmp_path / "shared root"
+    python = root / "envs/worldttn/bin/python"
+    python.parent.mkdir(parents=True)
+    python.write_text('#!/usr/bin/env bash\nexec "$REAL_PYTHON" "$@"\n', encoding="utf-8", newline="\n")
+    python.chmod(0o755)
+    output = tmp_path / "output"
+    output.mkdir()
+    manifest = output / "chain.json"
+    manifest.write_text(json.dumps({"output": str(output), "initial_step": 5, "target_step": 500}))
+    env = {k: v for k, v in os.environ.items() if not k.startswith("SLURM_")}
+    env.update(ROOT=root.as_posix(), PROJECT_ROOT=project.as_posix(), PYTHON=python.as_posix(),
+               REAL_PYTHON=Path(sys.executable).as_posix(), PYTHONPATH=old.as_posix())
+    for name in ("PYTHONSAFEPATH", "MSYS2_ENV_CONV_EXCL", "MSYS_NO_PATHCONV"):
+        env.pop(name, None)
+    result = subprocess.run([str(bash), str(project / "tools/ttn_slurm_chain.sbatch"), str(manifest), "4"],
+                            cwd=old, env=env, capture_output=True, text=True,
+                            encoding="utf-8", errors="replace", timeout=60)
+    # Stop before any training/submission; reaching this guard proves local imports work.
+    assert result.returncode != 0 and "Invalid segment start" in result.stderr, result.stderr
+    status = json.loads((output / "chain-status-local.json").read_text())
+    assert status["status"] == "failed" and status["phase"] == "source-validation"
+    assert len(list(output.glob("failure-*.json"))) == 1
 
 
 @pytest.fixture

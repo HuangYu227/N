@@ -6,4 +6,6 @@ set -euo pipefail
 [[ "$PYTHON" == "$ROOT/envs/worldttn/bin/python" && -x "$PYTHON" ]] || {
   echo "Expected the existing prefix Python: $ROOT/envs/worldttn/bin/python" >&2; exit 2;
 }
-exec "$PYTHON" -u "${PROJECT_ROOT:?}/tools/ttn_slurm_chain.py" worker "$1" "$2"
+# Module execution puts this checkout before stale installed/PYTHONPATH packages.
+cd "${PROJECT_ROOT:?}"
+exec "$PYTHON" -u -m tools.ttn_slurm_chain worker "$1" "$2"
