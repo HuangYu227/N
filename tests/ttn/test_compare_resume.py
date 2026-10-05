@@ -8,7 +8,7 @@ from worldttn.parallel_checkpoint import save_training_checkpoint
 
 @pytest.mark.parametrize("change", [None, "model", "rng", "data", "optimizer"])
 def test_compare_complete_bundles_checks_tensor_contents_rng_cursor_and_adam(tmp_path, change):
-    from tools.ttn_compare_resume import compare
+    from tools.ttn_compare_resume import compare, diagnose
     m = model()
     optimizer = make_optimizer(m)
     update(m, optimizer)
@@ -24,3 +24,14 @@ def test_compare_complete_bundles_checks_tensor_contents_rng_cursor_and_adam(tmp
         with pytest.raises(AssertionError): compare(a, b)
     else:
         assert compare(a, b)["status"] == "exact_match"
+    report = diagnose(a, b)
+    assert report["status"] == "diagnostic_only"
+    assert all(value["equal"] for value in report["metadata"].values())
+    rank = report["ranks"][0]
+    assert report["model"]["equal"] == (change != "model")
+    assert rank["data"]["equal"] == (change != "data")
+    assert rank["optimizer"]["equal"] == (change != "optimizer")
+    assert all(value["equal"] for value in rank["rng"].values()) == (change != "rng")
+    assert rank["optimizer_param_groups"]["equal"] and rank["optimizer_parameter_names"]["equal"]
+    if change == "model":
+        assert report["model_scale_example"]["max_abs_difference"] > 0
