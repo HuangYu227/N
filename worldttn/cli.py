@@ -497,8 +497,7 @@ def train_command(args):
         args._failure_phase = "training-update"
         iteration_started = time.perf_counter()
         if stream is not None: batch = _dataset_batch(next(stream), config, args, tokenizer, encoder, encoder_device)
-        meta = model.ttn_system.config.local_update or model.ttn_system.config.persistent_meta
-        update_probe = FirstUpdateProbe(model) if first_update and not meta else None
+        update_probe = FirstUpdateProbe(model) if first_update else None
         from .benchmark import profiler_update
         with profiler_update(getattr(args, "ttn_profiler_trace", None) if first_update else None, rank):
             result, timing = timed_cuda(lambda: train_update(model, config, batch, optimizer, k, parallel))

@@ -121,8 +121,8 @@ def probe_chunk(teacher, student, batch, flow_loss, timesteps, noise, *, gradien
     camera, y, mask, info = batch["camera_conditions"], batch["y"], batch.get("mask"), batch.get("data_info")
     if mask is not None: mask = mask.reshape(mask.shape[0], -1)  # preserve true padding
     width, height = clean.shape[-1], clean.shape[-2]
-    native = TTNSession(student, camera, width, height, extras=extras)
-    local = TTNSession(student, camera, width, height, extras=extras)
+    native = TTNSession(student, camera, width, height, extras=extras, collect_local_stats=True)
+    local = TTNSession(student, camera, width, height, extras=extras, collect_local_stats=True)
     teacher_session = TTNSession(teacher, camera, width, height, extras=extras)
     native.reset(1)
     local.reset(1)

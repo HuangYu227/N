@@ -15,11 +15,11 @@ def model(local=True, persistent=True):
     return configure_train_scope(m, "dit")
 
 
-def update(m, optimizer, offload="none"):
+def update(m, optimizer, offload="none", *, audit=False):
     clean, noise, t, camera = inputs()
     return train_clip(m, clean, torch.zeros(1, 1, 2, 8), camera, optimizer,
                       linear_flow_loss, t, noise, width=100, height=100,
-                      tbptt=2, activation_offload=offload)
+                      tbptt=2, activation_offload=offload, audit_update=audit)
 
 
 @pytest.mark.parametrize("offload", ["none", "cpu"])
@@ -28,7 +28,7 @@ def test_meta_train_clip_updates_eta_and_records_detached_local_persistent_metri
     optimizer = make_optimizer(m)
     eta = m.ttn_system.local_eta_logits
     initial = eta.detach().clone()
-    result = update(m, optimizer, offload)
+    result = update(m, optimizer, offload, audit=True)
     assert eta.grad is not None and torch.isfinite(eta.grad).all() and eta.grad.norm() > 0
     assert not torch.equal(initial, eta)
     origins = result["optimizer_updates"]["by_origin"]
@@ -138,7 +138,7 @@ def test_production_flow_records_exact_scheduler_sigma_separately_from_mapped_ti
             return args[0], None
     clean = torch.ones(1, 16, 2, 1, 1)
     t = torch.full((1, 1, 2), 500)
-    ctx = SimpleNamespace(system=Session.model.ttn_system)
+    ctx = SimpleNamespace(system=Session.model.ttn_system, collect_local_stats=True)
     flow(Session(), clean, t, clean, None, ctx, None, 0, 2, None, None, clean)
     torch.testing.assert_close(captures["noise_sigma"], torch.full_like(t, .73137, dtype=torch.float32), rtol=0, atol=0)
     assert torch.equal(captures["sampled_timestep"], t)

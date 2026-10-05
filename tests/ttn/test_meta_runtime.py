@@ -141,6 +141,7 @@ def test_eta_initialization_keeps_rng_and_parameter_origin():
                                                     ("no-ttt", False, False)])
 def test_contribution_controls_disable_only_selected_psi(mode, local, persistent):
     system, runtime, anchors = episode()
+    runtime.collect_local_stats = True
     runtime.ablation = mode
     ctx = begin(system, runtime)
     coeff = ctx.cbase + (ctx.psi.tanh() if persistent else 0)
@@ -165,6 +166,7 @@ def test_legacy_runtime_rejects_new_contribution_modes():
 @pytest.mark.parametrize("frame", [10, 11])
 def test_empty_support_or_query_and_zero_state_are_explicit_finite_results(frame):
     system, runtime, anchors = episode()
+    runtime.collect_local_stats = True
     runtime.world_state.zero_()
     ctx = begin(system, runtime, (frame,))
     before = runtime.transition_fast.clone()

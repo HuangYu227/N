@@ -11,7 +11,8 @@ from worldttn.session import TTNSession
 
 @pytest.mark.parametrize("meta", [False, True])
 @pytest.mark.parametrize("cfg_scale", [1., 4.5])
-def test_rollout_records_exact_per_call_sigma_and_commits_once_per_clean_chunk(monkeypatch, meta, cfg_scale):
+@pytest.mark.parametrize("telemetry", [False, True])
+def test_rollout_records_exact_per_call_sigma_and_commits_once_per_clean_chunk(monkeypatch, meta, cfg_scale, telemetry):
     path = Path(__file__).resolve().parents[2]/"diffusion/scheduler/self_forcing_flow_euler_sampler.py"
     cls = next(n for n in ast.parse(path.read_text(encoding="utf-8")).body
                if isinstance(n, ast.ClassDef) and n.name == "SelfForcingFlowEulerCamCtrl")
@@ -32,7 +33,7 @@ def test_rollout_records_exact_per_call_sigma_and_commits_once_per_clean_chunk(m
     monkeypatch.setenv("SANA_WM_STAGE1_KV_SAVE_STRIDE", "1")
     model = TinyWorldModel(local_update=meta, persistent_meta=meta).eval()
     _, latents, _, camera = inputs()
-    session = TTNSession(model, camera[:, :7], 100, 100)
+    session = TTNSession(model, camera[:, :7], 100, 100, collect_local_stats=telemetry)
     calls = []
     def call(x, t, y, **kw):
         ctx = kw["ttn_chunk_context"]
@@ -53,7 +54,7 @@ def test_rollout_records_exact_per_call_sigma_and_commits_once_per_clean_chunk(m
     chunks = list(ns["sample_chunks"](sampler, latents[:, :, :7].clone(), steps=2))
     assert len(chunks) == 2 and len(calls) == 4 and session.runtime.commit_count == 3
     for index, (t, info, local) in enumerate(calls):
-        if not meta:
+        if not meta or not telemetry:
             assert info == {} and local == {}
             continue
         expected = torch.full_like(t, float(sampler.scheduler.sigmas[index%2]))
@@ -62,3 +63,6 @@ def test_rollout_records_exact_per_call_sigma_and_commits_once_per_clean_chunk(m
         assert info["noise_timestep"] == t.tolist()
         assert set(local) == set(range(5))
         assert all(row["noise_sigma"] == info["noise_sigma"] for row in local.values())
+    if meta and telemetry:
+        for anchor in session.runtime.last_stats["anchors"]:
+            assert len(anchor["local_trajectory"]) == 2

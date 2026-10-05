@@ -132,7 +132,8 @@ class TTNAnchor(nn.Module):
                     aux = correct_with_aux(predicted, k, v, beta, write, cfg.alpha_s, cfg.eps)
                     state, w = aux.candidate, aux.w
                     raw = q @ state
-            if (cfg.local_update or cfg.persistent_meta) and not ctx.clean_mode and not ctx.prefill_mode:
+            if ((ctx.collect_local_stats or diagnostic is not None) and (cfg.local_update or cfg.persistent_meta)
+                    and not ctx.clean_mode and not ctx.prefill_mode):
                 if not local_enabled:
                     support, query = ctx.support_query_masks(n, HW)
                     gradient = clipped = local = torch.zeros_like(ctx.psi[:, self.index])
@@ -141,8 +142,15 @@ class TTNAnchor(nn.Module):
                 with annotation(execution, "LocalStats"):
                     stats = local_anchor_stats(ctx.previous[:, self.index], ctx.predicted[:, self.index], predicted,
                                                state, k, v, w, support, query, gradient, clipped, scale, local, eta, cfg.eps)
-                    stats.update(ctx.noise_info, enabled=local_enabled)
+                    stats.update(ctx.noise_info, enabled=local_enabled, recorded=True)
                     ctx.local_stats[self.index] = stats
+                    if ctx.local_trajectory:
+                        ctx.local_trajectory[-1]["anchors"][self.index] = {
+                            "enabled": local_enabled, "eta": stats["eta"],
+                            "per_head": {key: stats["per_head"][key] for key in
+                                         ("raw_grad_norm", "clipped_grad_norm", "psi_norm", "transport_change_norm")},
+                            **{part: {key: stats[part][key] for key in ("loss_before", "loss_after_transport")}
+                               for part in ("support", "query")}}
                 if diagnostic is not None: diagnostic("local_update", stats)
             if diagnostic is not None:
                 diagnostic("memory", (predicted, state, k, v, beta, w, write))

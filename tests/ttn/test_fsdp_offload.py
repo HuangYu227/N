@@ -62,7 +62,7 @@ def _offload_worker(rank, size, uri, output, k, amp, meta=False, device="cpu"):
             assert len(live) == 4
             assert live[0].grad is not None and live[0].grad.norm() > 0
             assert live[1].grad is None and live[2].grad is not None and live[2].grad.norm() > 0 and live[3].grad is None
-            assert result["optimizer_updates"]["groups"]["ttn_system.local_eta_logits"]["delta_norm"] > 0
+            assert health["groups"]["ttn_system.local_eta_logits"]["delta_norm"] > 0
         assert copies and all(copied for copied, _ in copies), "CPU tests must really copy saved tensors"
         assert not health["missing_core_gradients"]
         assert health["backbone"]["by_component"]["ffn"]["updated_parameters"] > 0

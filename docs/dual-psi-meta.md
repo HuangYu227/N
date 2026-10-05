@@ -6,7 +6,7 @@
 
 ## 本地验证结果
 
-2026-10-05，Windows / Python3.10.16 / PyTorch2.11.0+cpu：
+提交 1f1eaa3 的本地验证（2026-10-05），Windows / Python3.10.16 / PyTorch2.11.0+cpu：
 `OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python -m pytest tests/ttn -q --tb=short`
 完成 **583 passed、12 skipped**。跳过项不能作为 CUDA/A100 验收结果。
 覆盖 FP64 gradient/meta oracle、gradcheck/gradgradcheck、原 SANA teacher replay、
@@ -28,7 +28,8 @@ U/V 各为 5×20×16×112 的随机单位向量。新增五个 Local η logits�
 softplus 后初值 .01，常数初始化不消耗 RNG。
 
 ψ 不是 MLP 或 optimizer parameter。Persistent ψ 是 episode 内的 fast state；
-Local ψ 是一次 noisy call 内的临时张量。没有前 50 step 冻结适配。
+Local ζ 是一次 noisy call 内的临时系数状态。本文沿用“双时间尺度 ψ”作为机制名称，
+公式明确为两个独立 tanh 的系数增量，并非 tanh(ψP+ζ)。没有前 50 step 冻结适配。
 
 ## 单 head 的数学
 
@@ -138,12 +139,24 @@ train.jsonl 的 ranks/chunks/anchors 与 stability.jsonl 记录：
   S old/predicted/committed norm/RMS，Correct ratio，K/V/prediction/residual RMS，β/W 分布。
 - noisy model timestep 与实际 σ；训练与真实 rollout 均直接读取 scheduler.sigmas，
   原始 sampled timestep 单独记录，不能把 controller τ 当作噪声或累计视频时间。
-- 每步实际 optimizer_updates.by_origin、模块级 delta/gradient，FSDP 明确为 local shards；
+- 首次更新审计的 parameter_update.by_origin、模块级 delta/gradient，FSDP 明确为 local shards；
+  后续每步保留 anchor_gradients、Local/Persistent 与状态稳定性记录；
   exposure 包含 clips/有效 latent frames/预测 latent frames/预测 chunks；耗时和显存沿用原记录。
 
 实际更新审计暂存 CPU 参数副本，真实 DiT 约 2.5 GiB/rank，逐参数差值还需要临时空间。
-它包含在记录的 step 时间内，不能将其描述成无审计开销的吞吐。
+CLI 仅审计本次进程的首个更新（续训首步也检查）；train_clip 默认不复制参数，
+显式 audit_update=True 才额外生成 optimizer_updates。不能把首步当作稳定吞吐。
+Benchmark 的 iteration_seconds 包含 CLI 审计；train_update 的 seconds 不包含外层审计。
 global norm 用各 shard norm 的平方和开方，不能直接平均 shard norms。
+
+普通推理不采集 noisy Local 统计或序列化噪声信息；明确开启 state_diagnostics 的
+评估、teacher 对齐以及训练会采集。TTNSession/Runtime 也可显式 collect_local_stats=True。
+这些开关仅控制观测，不进入模型数学配置或 exact-resume identity。
+训练仍保留每 step/chunk 的原有完整 Local/Persistent 指标。
+显式观测时，各 anchor 的 local 保存最后一次完整统计，local_trajectory 另外保存每次
+noisy call 的 call index、真实 σ/timestep、raw/clipped gradient norm、ζ norm、
+Transport change、support/query 的 pre-Correct loss。Clean 不增加轨迹条目。
+诊断采集仍有 GPU→CPU 同步开销，耗时报告必须标明是否开启；此改动没有新的 A100 性能结果。
 
 query 仅从 inner loss 排除；Correct 后仍使用它自己的 V，因此 after_correct 的
 query 降低不是独立泛化证据。不能保证每次 learned Local step 都降低 support loss。

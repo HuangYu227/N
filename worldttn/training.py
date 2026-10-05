@@ -86,7 +86,7 @@ class SANAFlowLoss:
                  on_prediction=None):
         config = context.system.config  # Teacher replay intentionally has no TTN module.
         noise_info = {}
-        if config.local_update or config.persistent_meta:
+        if context.collect_local_stats and (config.local_update or config.persistent_meta):
             noise_info = {"noise_sigma": torch.as_tensor(self.scheduler.sigmas, device=clean.device,
                                                         dtype=torch.float32)[t.long()], "sampled_timestep": t}
         def model_call(x, timestep, **unused):
@@ -192,7 +192,8 @@ def train_clip(model,
                window_model=None,
                parallel=None,
                activation_offload="none",
-               memory_callback=None):
+               memory_callback=None,
+               audit_update=False):
     if tbptt not in (1, 2, 4): raise ValueError("reference TBPTT supports K=1,2,4")
     if activation_offload not in ("none", "cpu"): raise ValueError("activation_offload must be none or cpu")
     b, _, frames, _, _ = clean.shape
@@ -206,7 +207,7 @@ def train_clip(model,
     loss_valid = valid.clone()
     loss_valid[:, 0] = False
     total = loss_valid.sum(-1).clamp_min(1)
-    session = TTNSession(model, camera_conditions, width, height, valid, extras)
+    session = TTNSession(model, camera_conditions, width, height, valid, extras, collect_local_stats=True)
     runtime = session.reset(b)
     optimizer.zero_grad(set_to_none=True)
     model.eval()  # disables stochastic conditioning; does NOT disable differentiation
@@ -252,9 +253,8 @@ def train_clip(model,
     grad_norm = parallel.clip_grad_norm(outer_clip) if parallel else torch.nn.utils.clip_grad_norm_(
         params, outer_clip, error_if_nonfinite=True)
     _memory_phase(memory_callback, "optimizer_begin")
-    meta = model.ttn_system.config.local_update or model.ttn_system.config.persistent_meta
     probe = None
-    if meta:
+    if audit_update:
         from .training_health import FirstUpdateProbe
         probe = FirstUpdateProbe(model)
     with annotation(execution, "Optimizer"):

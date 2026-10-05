@@ -45,13 +45,16 @@ class TTNChunkContext:
     local_stats: dict = field(default_factory=dict)
     ablation: str = "full"
     noise_info: dict = field(default_factory=dict)
+    collect_local_stats: bool = False
+    local_trajectory: list = field(default_factory=list)
 
     def for_clean(self):
         return TTNChunkContext(self.predicted, self.previous, self.psi, self.cbase, self.system, self.frame_ids,
                                self.poses, self.read_mask, self.write_mask, self.revision, self.runtime_id, True,
                                self.prefill_mode, begin_id=self.begin_id, psi_snapshot=self.psi_snapshot,
                                write_history=self.write_history, live_factors=self.live_factors,
-                               local_stats=self.local_stats, ablation=self.ablation)
+                               local_stats=self.local_stats, ablation=self.ablation,
+                               collect_local_stats=self.collect_local_stats, local_trajectory=self.local_trajectory)
 
     def token_masks(self, n):
         f = self.frame_ids.shape[-1]
@@ -100,11 +103,12 @@ class TTNRuntimeState:
     # Runtime-only interventions: never saved as offline model configuration.
     ablation: str = "full"
     diagnostics: bool = False
+    collect_local_stats: bool = False
     # Diagnostic-only detached writes, never persistent learned state or checkpoint content.
     write_history: tuple = ()
 
     @classmethod
-    def create(cls, config, batch_size, device, *, ablation="full", diagnostics=False):
+    def create(cls, config, batch_size, device, *, ablation="full", diagnostics=False, collect_local_stats=False):
         if ablation not in ("full", "no-ttt", "identity", "no-local", "no-persistent"):
             raise ValueError("unknown TTN runtime ablation")
         if ablation in ("no-local", "no-persistent") and not (config.local_update or config.persistent_meta):
@@ -121,7 +125,7 @@ class TTNRuntimeState:
         psi = torch.zeros(batch_size, 5, config.heads, config.generators, device=device, dtype=torch.float32)
         pose = torch.eye(4, device=device).expand(batch_size, 4, 4).clone()
         return cls(config, s, psi, pose, [set() for _ in range(batch_size)],
-                   ablation=ablation, diagnostics=diagnostics)
+                   ablation=ablation, diagnostics=diagnostics, collect_local_stats=collect_local_stats)
 
     def reset(self):
         self.world_state = torch.zeros_like(self.world_state)
@@ -185,7 +189,7 @@ class TTNRuntimeState:
                                id(self),
                                prefill_mode=prefill, begin_id=self.predict_count, psi_snapshot=snapshot,
                                write_history=history, live_factors=live_factors if meta else None,
-                               ablation=self.ablation)
+                               ablation=self.ablation, collect_local_stats=self.collect_local_stats or self.diagnostics)
 
     def prefill(self, context):
         if self.prefilled or self.commit_count: raise RuntimeError("initial image can only be prefilled once")
@@ -231,7 +235,12 @@ class TTNRuntimeState:
                                  "clip_scale": heads["inner_clip_scale"], "psi_norm": heads["psi_norm"],
                                  "update_norm": heads["psi_update_norm"],
                                  "tanh_saturation_fraction": (psi[:, i].detach().tanh().abs() > .99).float().mean(-1).cpu().tolist()}}
-                stats["local"] = context.local_stats.get(i, {"enabled": False, "reason": "prefill/clean-only"})
+                stats["local"] = context.local_stats.get(i, {
+                    "enabled": self.config.local_update and not context.prefill_mode and self.ablation in ("full", "no-persistent"),
+                    "recorded": False, "reason": "prefill/clean-only" if context.prefill_mode else "telemetry disabled"})
+                if context.local_trajectory:
+                    stats["local_trajectory"] = [{key: value for key, value in call.items() if key != "anchors"} |
+                        call["anchors"][i] for call in context.local_trajectory if i in call["anchors"]]
         history = context.write_history
         if not context.prefill_mode:
             correction = (new_state.detach() - context.predicted.detach()).clone()
