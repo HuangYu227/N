@@ -5,29 +5,39 @@ import random
 import tempfile
 from pathlib import Path
 import torch
-from .anchor import is_ttn_parameter, offline_state_dict
+from .anchor import is_ttn_parameter, is_ttn_new_parameter, offline_state_dict
 from .core import BASE_REVISION
 from .training_health import optimizer_parameter_names, audit_training_parameters
 
 
-def make_optimizer(model, lr=1e-5, *, backbone_lr=1e-6):
+def make_optimizer(model, lr=1e-5, *, backbone_lr=1e-6, policy=None):
     if not math.isfinite(lr) or lr <= 0: raise ValueError("learning rate must be finite and positive")
+    scope = getattr(model, "ttn_train_scope", "ttn")
+    policy = policy or getattr(model, "ttn_optimizer_policy", "origin" if scope in ("dit", "ttn-new") else "legacy")
+    if policy not in ("origin", "legacy"): raise ValueError("invalid optimizer parameter policy")
+    model.ttn_optimizer_policy = policy
     parameters = [p for p in model.parameters() if p.requires_grad]
     options = {}
     if getattr(model, "ttn_train_scope", "ttn") == "ttn-visual":
         parameters = [{"name": "ttn_visual", "params": parameters}]
         options["foreach"] = False
-    if getattr(model, "ttn_train_scope", "ttn") == "dit":
+    if scope == "dit":
         if not math.isfinite(backbone_lr) or backbone_lr <= 0:
             raise ValueError("backbone learning rate must be finite and positive")
+        classifier = is_ttn_new_parameter if policy == "origin" else is_ttn_parameter
+        labels = ("ttn_new", "sana_inherited") if policy == "origin" else ("ttn", "backbone")
         parameters = [{"name": name, "lr": rate,
-                       "params": [p for n, p in model.named_parameters() if p.requires_grad and is_ttn_parameter(n) == ttn]}
-                      for name, rate, ttn in (("ttn", lr, True), ("backbone", backbone_lr, False))]
+                       "params": [p for n, p in model.named_parameters() if p.requires_grad and classifier(n) == ttn]}
+                      for name, rate, ttn in ((labels[0], lr, True), (labels[1], backbone_lr, False))]
         options["foreach"] = False  # Avoid a full-parameter-sized CUDA AdamW temporary.
+    elif scope == "ttn-new":
+        parameters = [{"name": "ttn_new", "params": parameters}]
+        options["foreach"] = False
     optimizer = torch.optim.AdamW(parameters, lr=lr,
                                  betas=(.9, .999),
                                  eps=1e-10,
                                  weight_decay=0., **options)
+    optimizer.ttn_optimizer_policy = policy
     audit_training_parameters(model, optimizer)
     return optimizer
 
@@ -60,6 +70,7 @@ def checkpoint_payload(model, adapter, optimizer, step):
         "config": model.ttn_system.config.to_dict(),
         "stage": model.ttn_system.config.stage,
         "train_scope": getattr(model, "ttn_train_scope", "ttn"),
+        "optimizer_policy": getattr(model, "ttn_optimizer_policy", "legacy"),
         "weight_scope": getattr(model, "ttn_weight_scope", "ttn"),
         "adapter": adapter,
         "optimizer": optimizer.state_dict() if optimizer else None,
@@ -105,7 +116,7 @@ def read_checkpoint(path, model, resume=False):
     if stage != current_stage and (stage, current_stage) not in (("A", "B"), ("B", "C")):
         raise ValueError("stage initialization must advance A->B or B->C")
     train_scope, weight_scope = payload.get("train_scope", "ttn"), payload.get("weight_scope", "ttn")
-    if train_scope not in ("ttn", "ttn-visual", "dit") or weight_scope not in ("ttn", "dit"):
+    if train_scope not in ("ttn", "ttn-visual", "ttn-new", "dit") or weight_scope not in ("ttn", "dit"):
         raise ValueError("invalid checkpoint train-scope/weight scope")
     if train_scope == "dit" and weight_scope != "dit":
         raise ValueError("joint DiT checkpoint must include full weights")
@@ -131,10 +142,12 @@ def load_checkpoint(path, model, optimizer=None, resume=False):
     # All validation happens before loading any parameter.
     if resume and (optimizer is None or payload.get("optimizer") is None):
         raise ValueError("resume requires optimizer state")
+    if resume and payload.get("optimizer_policy", "legacy") != getattr(model, "ttn_optimizer_policy", "legacy"):
+        raise ValueError("resume optimizer parameter policy mismatch")
     if resume and payload.get("optimizer_parameter_names") is not None and (
             payload["optimizer_parameter_names"] != optimizer_parameter_names(model, optimizer)):
         raise ValueError("resume optimizer parameter names/order mismatch")
-    if resume and getattr(model, "ttn_train_scope", "ttn") in ("ttn-visual", "dit"):
+    if resume and getattr(model, "ttn_train_scope", "ttn") in ("ttn-visual", "ttn-new", "dit"):
         stored_groups = payload["optimizer"]["param_groups"]
         if [g["lr"] for g in stored_groups] != [g["lr"] for g in optimizer.param_groups]:
             raise ValueError("resume learning rate mismatch")

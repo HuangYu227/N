@@ -84,6 +84,7 @@ case "$command" in
     args+=(--stage "${STAGE:-A}" --tbptt "${TBPTT:-2}" --max-steps "${MAX_STEPS:-100}"
            --save-every "${SAVE_EVERY:-50}" --text-encoder-device "${TEXT_ENCODER_DEVICE:-cpu}"
            --train-scope "${TRAIN_SCOPE:-ttn}" --backbone-lr "${BACKBONE_LR:-1e-6}")
+    [[ -z "${OPTIMIZER_POLICY:-}" ]] || args+=(--optimizer-policy "$OPTIMIZER_POLICY")
     if [[ -n "${BATCH_FILE:-}" ]]; then
       args+=(--batch-file "$BATCH_FILE")
     else

@@ -95,7 +95,7 @@ def build(args, stage=None, sana_path=None):
         config.data.data_dir = {names[0]: str(Path(args.data_dir).resolve())}
     if getattr(args, "vae_cache_dir", None): config.data.vae_cache_dir = str(Path(args.vae_cache_dir).resolve())
     # Do not quantize inherited master weights to BF16 before joint fine-tuning.
-    options = {"dtype": torch.float32} if getattr(args, "train_scope", "ttn") in ("ttn-visual", "dit") else {}
+    options = {"dtype": torch.float32} if getattr(args, "train_scope", "ttn") in ("ttn-visual", "ttn-new", "dit") else {}
     model = build_sana(config, ttn, args.base_weights, device=args.device, **options)
     configure_from_args(model, args)
     policy = configure_cross_attention(model, getattr(args, "cross_attn_backend", "auto"),
@@ -294,8 +294,9 @@ def _training_identity(args, config, settings, k):
     # Preserve existing frozen-backbone resume identities exactly.
     if getattr(args, "train_scope", "ttn") == "dit":
         identity.update(train_scope="dit", backbone_lr=getattr(args, "backbone_lr", 1e-6), optimizer_foreach=False)
-    elif getattr(args, "train_scope", "ttn") == "ttn-visual":
-        identity.update(train_scope="ttn-visual", optimizer_foreach=False)
+    elif getattr(args, "train_scope", "ttn") in ("ttn-visual", "ttn-new"):
+        identity.update(train_scope=args.train_scope, optimizer_foreach=False)
+    if getattr(args, "optimizer_policy", None) == "origin": identity["optimizer_policy"] = "origin"
     return identity
 
 
@@ -340,6 +341,18 @@ def resolve_train_scope(args):
         args.train_scope = "ttn"
 
 
+def resolve_optimizer_policy(args, payload):
+    """New joint runs use origins; exact resumes never reassign old Adam states."""
+    stored = payload.get("optimizer_policy", "legacy") if payload else None
+    requested = getattr(args, "optimizer_policy", None)
+    if payload and (args.resume or getattr(args, "unfreeze", False)):
+        if requested is not None and requested != stored:
+            raise ValueError("resume/unfreeze optimizer parameter policy mismatch")
+        args.optimizer_policy = stored
+    else:
+        args.optimizer_policy = requested or ("origin" if args.train_scope in ("dit", "ttn-new") else "legacy")
+
+
 def train_command(args):
     from .distributed import ParallelTraining, save_training_checkpoint, restore_training_checkpoint, rank_world
     from .parallel_checkpoint import validate_training_checkpoint, validate_unfreeze_checkpoint, restore_training_progress
@@ -359,8 +372,9 @@ def train_command(args):
     mode = getattr(args, "parallel", "single")
     rank, world = rank_world()
     k = args.tbptt or settings.get("tbptt", 2)
-    identity = _training_identity(args, config, settings, k)
     payload = read_checkpoint(args.adapter, model, resume=args.resume) if args.adapter else None
+    resolve_optimizer_policy(args, payload)
+    identity = _training_identity(args, config, settings, k)
     unfreeze = getattr(args, "unfreeze", False)
     resume_execution = None
     if unfreeze:
@@ -379,7 +393,7 @@ def train_command(args):
                                 memory_trace=getattr(args, "memory_trace", False))
     # FSDP2 optimizer must be constructed AFTER parameters become DTensors.
     optimizer = make_optimizer(model, settings.get("learning_rate", 1e-5),
-                               backbone_lr=getattr(args, "backbone_lr", 1e-6))
+                               backbone_lr=getattr(args, "backbone_lr", 1e-6), policy=args.optimizer_policy)
     if not benchmark_run(args) or getattr(args, "benchmark_save_checkpoint", False):
         from .parallel_checkpoint import preflight_checkpoint
         args._failure_phase = "startup-disk-budget"
@@ -453,6 +467,14 @@ def train_command(args):
             run["initialization"] = {"checkpoint": str(Path(args.adapter).resolve()), "step": step,
                                      "optimizer_reset": True, "rng_and_data_cursor_restored": True}
             print(f"[TTN unfreeze] source_step={step} next_step={step + 1} optimizer=reset rng/data=restored", flush=True)
+        elif payload:
+            run["initialization"] = {"source": "checkpoint", "step": payload["step"],
+                                     "checkpoint": str(Path(args.adapter).resolve()), "resume": args.resume}
+        else:
+            run["initialization"] = {"source": "pretrained SANA + fresh TTN", "step": 0,
+                "sana_inherited": "original base SHA256; visual/camera mappings preserved",
+                "ttn_new": "beta/controller heads zero; controller body random; normalized random generators",
+                "episode_state": "S/psi zero; never optimizer parameters", "seed": args.seed}
         (output / "run_config.json").write_text(json.dumps(run, indent=2), encoding="utf-8")
         json_record(output / "implementations.jsonl", {"next_step": step + 1, "train_scope": args.train_scope if hasattr(args, "train_scope") else "ttn",
                                                      **run["provenance"]})
@@ -797,10 +819,12 @@ def main():
     parser.add_argument("--camera-attention", choices=("linear", "sana"),
                         help="evaluate only: explicitly override the loaded TTN camera mixer/cache semantics")
     parser.add_argument("--camera-ablation", action="store_true", help="evaluate only: allow/label a camera operator different from training")
-    parser.add_argument("--train-scope", choices=("ttn", "ttn-visual", "dit"), default=None,
-                        help="train: ttn-visual also freezes the original camera parameters; dit trains the complete DiT")
+    parser.add_argument("--train-scope", choices=("ttn", "ttn-visual", "ttn-new", "dit"), default=None,
+                        help="train: ttn-new trains only added parameters; dit trains the complete DiT")
+    parser.add_argument("--optimizer-policy", choices=("origin", "legacy"),
+                        help="train: joint defaults to origin (new TTN vs inherited SANA); resumes inherit saved policy")
     parser.add_argument("--backbone-lr", type=float, default=1e-6,
-                        help="learning rate for pretrained DiT outside five TTN anchors; --train-scope dit only")
+                        help="joint origin policy: LR for all inherited SANA visual/camera/DiT parameters")
     parser.add_argument("--stage", choices=("A", "B", "C"),
                         help="A: identity Predict + Correct/Read; B: camera-conditioned Predict + Correct/Read; "
                              "C: B plus per-clean-chunk psi adaptation")
@@ -810,7 +834,7 @@ def main():
     parser.add_argument("--batch-file", help="precomputed tensor bundle; optional {rank} expands per process")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--unfreeze", action="store_true",
-                        help="train: initialize DiT from C/sana-camera visual warmup, reset optimizer, restore step/RNG/cursor")
+                        help="train: initialize DiT from C/sana-camera ttn-new or legacy visual warmup; reset optimizer, restore progress")
     parser.add_argument("--max-steps", type=int, default=1)
     parser.add_argument("--save-every", type=int, default=50)
     parser.add_argument("--tbptt", type=int, choices=(1, 2, 4))
@@ -840,6 +864,7 @@ def main():
     if args.fixed_cases and args.command not in ("evaluate", "align-chunk", "stage-evaluate"): parser.error("--fixed-cases is diagnostic-only")
     if args.train_scope != "ttn" and args.command != "train":
         parser.error("--train-scope is only supported for train; inference reads weight scope from checkpoint")
+    if args.optimizer_policy is not None and args.command != "train": parser.error("--optimizer-policy is train-only")
     if args.unfreeze and (args.command != "train" or args.train_scope != "dit" or not args.adapter or args.resume):
         parser.error("--unfreeze requires train --train-scope dit --adapter and no --resume")
     if not math.isfinite(args.backbone_lr) or args.backbone_lr <= 0:

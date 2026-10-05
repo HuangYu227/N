@@ -2,7 +2,7 @@
 import math
 import torch
 from .core import ANCHORS
-from .anchor import trainable_parameter_names, is_ttn_parameter
+from .anchor import trainable_parameter_names, is_ttn_parameter, is_ttn_new_parameter, is_ttn_camera_parameter
 
 
 def optimizer_parameter_names(model, optimizer):
@@ -29,7 +29,14 @@ def audit_training_parameters(model, optimizer):
         raise ValueError("optimizer must contain every TTN trainable parameter exactly once and no frozen parameter")
     wrong_dtype = [name for name in expected if named[name].dtype != torch.float32]
     if wrong_dtype: raise ValueError(f"TTN optimizer parameters must be FP32: {wrong_dtype}")
+    policy = getattr(model, "ttn_optimizer_policy", "legacy")
+    if policy == "origin" and getattr(model, "ttn_train_scope", "ttn") == "dit":
+        for group, names in zip(optimizer.param_groups, optimizer_parameter_names(model, optimizer)):
+            expected_origin = {"ttn_new": True, "sana_inherited": False}.get(group.get("name"))
+            if expected_origin is None or any(is_ttn_new_parameter(n) != expected_origin for n in names):
+                raise ValueError("optimizer parameter origin mismatch")
     return {"stage": stage, "train_scope": getattr(model, "ttn_train_scope", "ttn"),
+            "optimizer_policy": policy,
             "weight_scope": getattr(model, "ttn_weight_scope", "ttn"),
             "trainable_numel": sum(named[n].numel() for n in expected),
             "frozen_numel": sum(p.numel() for name, p in named.items() if name not in expected),
@@ -67,9 +74,12 @@ class FirstUpdateProbe:
             row["delta_squared"] += delta.square().sum().item()
             row["changed_elements"] += changed
             row["optimizer_state_parameters"] += bool(optimizer.state.get(p))
-            if not is_ttn_parameter(name):
+            if not (is_ttn_new_parameter(name) if getattr(optimizer, "ttn_optimizer_policy", "legacy") == "origin"
+                    else is_ttn_parameter(name)):
                 part = name.split(".")[2] if name.startswith("blocks.") else ""
                 kind = {"attn": "gdn", "mlp": "ffn", "ffn": "ffn", "cross_attn": "text_cross_attention"}.get(part, "other_dit")
+                if is_ttn_parameter(name):
+                    kind = "anchor_camera" if is_ttn_camera_parameter(name) else "anchor_visual"
                 component = components.setdefault(kind, {key: 0 for key in backbone})
                 for counts in (backbone, component):
                     counts["parameters"] += 1

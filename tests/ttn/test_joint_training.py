@@ -34,11 +34,52 @@ def test_joint_scope_and_optimizer_partition(stage):
     assert all(p.requires_grad and p.dtype == torch.float32 for b in model.blocks for p in b.parameters())
     assert all(p.requires_grad == (stage != "A") for p in model.ttn_system.parameters())
     assert [(g["name"], g["lr"], g["foreach"]) for g in optimizer.param_groups] == [
-        ("ttn", 1e-5, False), ("backbone", 1e-6, False)]
+        ("ttn_new", 1e-5, False), ("sana_inherited", 1e-6, False)]
     names = audit["optimizer_parameter_names"]
-    assert "blocks.3.attn.qkv.weight" in names[0]
+    assert "blocks.3.attn.beta_proj.weight" in names[0]
+    assert "blocks.3.attn.qkv.weight" in names[1]
     assert "blocks.3.ffn.weight" in names[1]
     assert not set(names[0]) & set(names[1])
+
+
+def test_origin_policy_keeps_all_visual_and_camera_mappings_at_backbone_lr():
+    from worldttn.anchor import is_ttn_new_parameter
+    model = joint_model()
+    optimizer = make_optimizer(model)
+    audit = audit_training_parameters(model, optimizer)
+    new, inherited = audit["optimizer_parameter_names"]
+    assert all(is_ttn_new_parameter(n) for n in new)
+    assert all(not is_ttn_new_parameter(n) for n in inherited)
+    for i in (3, 7, 11, 15, 19):
+        for group in ("qkv", "q_norm", "k_norm", "proj", "output_gate", "q_proj_cam", "k_proj_cam", "v_proj_cam", "out_proj_cam"):
+            assert f"blocks.{i}.attn.{group}.weight" in inherited
+    optimizer.param_groups[0]["params"], optimizer.param_groups[1]["params"] = (
+        optimizer.param_groups[1]["params"], optimizer.param_groups[0]["params"])
+    with pytest.raises(ValueError, match="origin"):
+        audit_training_parameters(model, optimizer)
+
+
+def test_legacy_joint_resume_policy_is_explicit_and_never_silently_regrouped(tmp_path):
+    from worldttn.cli import resolve_optimizer_policy
+    model = joint_model()
+    optimizer = make_optimizer(model, policy="legacy")
+    update(model, optimizer)
+    path = tmp_path / "last.pt"
+    save_checkpoint(path, model, optimizer, 1)
+    payload = torch.load(path, weights_only=False)
+    payload.pop("optimizer_policy")  # A genuine old checkpoint has no policy marker.
+    torch.save(payload, path)
+    args = Namespace(resume=True, train_scope="dit", optimizer_policy=None)
+    resolve_optimizer_policy(args, payload)
+    assert args.optimizer_policy == "legacy"
+    restored = joint_model()
+    assert load_checkpoint(path, restored, make_optimizer(restored, policy=args.optimizer_policy), resume=True) == 1
+    wrong = joint_model()
+    with pytest.raises(ValueError, match="policy"):
+        load_checkpoint(path, wrong, make_optimizer(wrong), resume=True)
+    args.optimizer_policy = "origin"
+    with pytest.raises(ValueError, match="policy"):
+        resolve_optimizer_policy(args, payload)
 
 
 @pytest.mark.parametrize("amp", [False, True])

@@ -4,7 +4,7 @@ import torch
 from torch import nn
 from .core import ANCHORS, TTNConfig, Rank2Generators, CayleyFactors, DetachedCayleySnapshot
 from .performance import DEFAULT_EXECUTION, annotation, validate_execution
-from .stability import committed_anchor_stats, matrix_scale
+from .stability import committed_anchor_stats, matrix_scale, write_direction_stats
 from .controller import TransitionController
 
 
@@ -36,11 +36,13 @@ class TTNChunkContext:
     candidates: dict = field(default_factory=dict)
     begin_id: int = 0
     psi_snapshot: DetachedCayleySnapshot | None = None
+    write_history: tuple = ()
 
     def for_clean(self):
         return TTNChunkContext(self.predicted, self.previous, self.psi, self.cbase, self.system, self.frame_ids,
                                self.poses, self.read_mask, self.write_mask, self.revision, self.runtime_id, True,
-                               self.prefill_mode, begin_id=self.begin_id, psi_snapshot=self.psi_snapshot)
+                               self.prefill_mode, begin_id=self.begin_id, psi_snapshot=self.psi_snapshot,
+                               write_history=self.write_history)
 
     def token_masks(self, n):
         f = self.frame_ids.shape[-1]
@@ -77,6 +79,8 @@ class TTNRuntimeState:
     # Runtime-only interventions: never saved as offline model configuration.
     ablation: str = "full"
     diagnostics: bool = False
+    # Diagnostic-only detached writes, never persistent learned state or checkpoint content.
+    write_history: tuple = ()
 
     @classmethod
     def create(cls, config, batch_size, device, *, ablation="full", diagnostics=False):
@@ -107,6 +111,7 @@ class TTNRuntimeState:
         self.revision += 1
         self.prefilled = False
         self.last_stats = {}
+        self.write_history = ()
 
     def begin_chunk(self, system, poses, intrinsics, frame_ids, valid_mask, width, height, prefill=False):
         if system.config != self.config: raise ValueError("runtime/system configurations differ")
@@ -125,6 +130,7 @@ class TTNRuntimeState:
         options = getattr(system, "ttn_execution", DEFAULT_EXECUTION)
         validate_execution(options, self.config.stage, self.ablation, self.diagnostics)
         snapshot = None
+        history = self.write_history
         with annotation(options, "Predict"), torch.autocast(device_type=self.world_state.device.type, enabled=False):
             if self.config.stage == "A" or prefill or self.ablation == "identity":
                 cbase = torch.zeros_like(self.transition_fast)
@@ -135,6 +141,8 @@ class TTNRuntimeState:
                                  if self.config.stage == "C" and self.ablation == "full" else 0)
                 live_factors = CayleyFactors(system.generators.u.float(), system.generators.v.float(), coeff)
                 predicted = live_factors.right(self.world_state)
+                with torch.no_grad():
+                    history = tuple((raw, live_factors.right(aligned).detach()) for raw, aligned in history)
                 if options.core_backend != "reference" and self.config.stage == "C":
                     snapshot = DetachedCayleySnapshot.from_live(live_factors, self.transition_fast, cbase,
                                                                (id(self), self.revision, self.predict_count + 1))
@@ -150,7 +158,8 @@ class TTNRuntimeState:
                                write,
                                self.revision,
                                id(self),
-                               prefill_mode=prefill, begin_id=self.predict_count, psi_snapshot=snapshot)
+                               prefill_mode=prefill, begin_id=self.predict_count, psi_snapshot=snapshot,
+                               write_history=history)
 
     def prefill(self, context):
         if self.prefilled or self.commit_count: raise RuntimeError("initial image can only be prefilled once")
@@ -182,6 +191,13 @@ class TTNRuntimeState:
                    self.transition_fast)
         anchor_stats = [committed_anchor_stats(context.candidates[i][2], self.transition_fast[:, i], psi[:, i],
                         grad[:, i], scale[:, i], context.cbase[:, i], ANCHORS[i], context.prefill_mode) for i in range(5)]
+        history = context.write_history
+        if not context.prefill_mode:
+            correction = (new_state.detach() - context.predicted.detach()).clone()
+            for i, stats in enumerate(anchor_stats):
+                stats.update(write_direction_stats(correction[:, i],
+                    tuple((raw[:, i], aligned[:, i]) for raw, aligned in history), self.config.eps))
+            history = ((correction, correction), *history[:3])
         if self.diagnostics:
             from .stability import state_dynamics
             for i, stats in enumerate(anchor_stats):
@@ -198,6 +214,7 @@ class TTNRuntimeState:
         # Assign only after every validation/computation succeeds. The context
         # keeps its old prediction/psi; the new psi is consumed next chunk.
         self.world_state = new_state
+        self.write_history = history
         self.transition_fast = psi
         self.previous_committed_pose = previous_pose
         self.committed_frame_ids = committed

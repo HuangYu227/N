@@ -223,6 +223,12 @@ def is_ttn_parameter(name):
     return name.startswith("ttn_system.") or any(name.startswith(f"blocks.{i}.attn.") for i in ANCHORS)
 
 
+def is_ttn_new_parameter(name):
+    """Parameter origin, independent of the replacement module's ownership."""
+    return name.startswith(("ttn_system.controller.", "ttn_system.generators.")) or any(
+        name.startswith(f"blocks.{i}.attn.beta_proj.") for i in ANCHORS)
+
+
 def is_ttn_camera_parameter(name):
     return any(name.startswith(f"blocks.{i}.attn.{group}.") for i in ANCHORS
                for group in ("q_proj_cam", "k_proj_cam", "v_proj_cam", "out_proj_cam",
@@ -231,9 +237,10 @@ def is_ttn_camera_parameter(name):
 
 def trainable_parameter_names(model, scope=None):
     scope = scope or getattr(model, "ttn_train_scope", "ttn")
-    if scope not in ("ttn", "ttn-visual", "dit"): raise ValueError("train-scope must be ttn, ttn-visual or dit")
+    if scope not in ("ttn", "ttn-visual", "ttn-new", "dit"): raise ValueError("invalid train-scope")
     return {name for name, _ in model.named_parameters()
             if (scope == "dit" or is_ttn_parameter(name))
+            and not (scope == "ttn-new" and not is_ttn_new_parameter(name))
             and not (scope == "ttn-visual" and is_ttn_camera_parameter(name))
             and not (model.ttn_system.config.stage == "A" and name.startswith("ttn_system."))}
 
@@ -241,7 +248,7 @@ def trainable_parameter_names(model, scope=None):
 def configure_train_scope(model, scope="ttn"):
     """Configure optimizer ownership before DDP/FSDP wrapping; compute still uses autocast."""
     expected = trainable_parameter_names(model, scope)
-    if scope in ("ttn-visual", "dit"): model.float()  # Preserve masters across the later unfreeze.
+    if scope in ("ttn-visual", "ttn-new", "dit"): model.float()  # Preserve inherited FP32 masters.
     for name, p in model.named_parameters(): p.requires_grad_(name in expected)
     model.ttn_train_scope = scope
     # A previously fine-tuned, now frozen backbone must still be exported in full.

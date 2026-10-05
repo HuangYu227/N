@@ -218,7 +218,8 @@ def test_fresh_original_ucpe_plan_starts_without_old_weights_and_clamps_warmup_b
                     tbptt=2, backbone_lr=1e-6, base_weights=None, warmup_only=hold))
     assert len(calls) == 1
     plan, manifest, start = calls[0]
-    assert start == 0 and plan["target_step"] == 25 and plan["environment"]["TRAIN_SCOPE"] == "ttn-visual"
+    assert start == 0 and plan["target_step"] == 25 and plan["environment"]["TRAIN_SCOPE"] == "ttn-new"
+    assert plan["environment"]["OPTIMIZER_POLICY"] == "origin"
     assert bool(plan.get("joint_target_step")) == (not hold)
     env = chain.environment(plan, 0)
     assert "ADAPTER" not in env and "UNFREEZE" not in env and env["RESUME"] == "0"
@@ -236,6 +237,44 @@ def test_joint_transition_resets_optimizer_only_in_first_segment(chain, plan):
     env = chain.environment(plan, 60)
     assert env["RESUME"] == "1" and "UNFREEZE" not in env and env["MAX_STEPS"] == "70"
     assert env["ADAPTER"] == str(Path(plan["output"])/"last.pt")
+
+
+def test_zero_warmup_starts_joint_at_step_one_without_checkpoint_or_unfreeze(chain, tmp_path, monkeypatch):
+    project = tmp_path / "WorldTTN"
+    (project / "tools").mkdir(parents=True)
+    config = project / "configs/worldttn/reference_sana_camera.json"
+    config.parent.mkdir(parents=True)
+    config.write_text(json.dumps({"ttn": {"stage": "C", "camera_attention": "sana"}}))
+    python = tmp_path / "envs/worldttn/bin/python"
+    python.parent.mkdir(parents=True); python.touch()
+    (tmp_path / "datasets/sana-wm-example").mkdir(parents=True)
+    monkeypatch.setattr(chain, "__file__", str(project / "tools/ttn_slurm_chain.py"))
+    monkeypatch.setenv("ROOT", str(tmp_path))
+    calls = []; monkeypatch.setattr(chain, "submit", lambda *args: calls.append(args))
+    args = SimpleNamespace(output=str(tmp_path / "new"), dataset_root=None, config=None,
+        warmup_steps=0, target_step=500, segment_steps=10, partition="short", seed=3407,
+        tbptt=2, backbone_lr=1e-6, base_weights=None, warmup_only=False, eval_every=25)
+    chain.fresh_chain(args)
+    plan = calls[0][0]
+    assert plan["target_step"] == 500 and plan["environment"]["TRAIN_SCOPE"] == "dit"
+    assert "joint_target_step" not in plan
+    assert plan["evaluation"]["keep_model_steps"] == [25, 50, 100, 250, 500]
+    env = chain.environment(plan, 0)
+    assert env["OPTIMIZER_POLICY"] == "origin" and env["RESUME"] == "0"
+    assert "UNFREEZE" not in env and "ADAPTER" not in env
+    assert chain.environment(plan, 10)["RESUME"] == "1"
+
+
+def test_evaluation_snapshot_retention_preserves_key_points_and_releases_other_models(chain, plan, monkeypatch):
+    import tools.ttn_eval_snapshot as snapshots
+    calls = []
+    monkeypatch.setattr(snapshots, "snapshot_training_run", lambda source, **kw: calls.append(kw) or Path(source) / "snapshot")
+    plan["evaluation"] = {"every": 25, "seed": 3407, "steps": 20, "cases": 1,
+        "fixed_cases": "fixed.pt", "output": str(Path(plan["output"]) / "eval"), "keep_model_steps": [25, 50, 100, 250, 500]}
+    monkeypatch.setattr(chain.subprocess, "run", lambda *a, **kw: SimpleNamespace(stdout="123456\n"))
+    chain.submit_evaluation(plan, 75, "123455")
+    chain.submit_evaluation(plan, 100, "123455")
+    assert calls == [{"retain_model": False}, {"retain_model": True}]
 
 
 @pytest.mark.parametrize("fail", [False, True])
@@ -277,7 +316,7 @@ def test_periodic_boundaries_and_first_unfrozen_step_are_exact(chain, plan):
 def test_evaluation_submission_pins_snapshot_and_uses_separate_single_gpu(chain, plan, monkeypatch):
     import tools.ttn_eval_snapshot as snapshots
     snapshot = Path(plan["output"]) / "immutable-snapshot"
-    monkeypatch.setattr(snapshots, "snapshot_training_run", lambda source: snapshot)
+    monkeypatch.setattr(snapshots, "snapshot_training_run", lambda source, **kw: snapshot)
     plan["evaluation"] = {"every": 25, "seed": 3407, "steps": 20, "cases": 1,
                           "fixed_cases": "shared/fixed-cases.pt", "output": str(Path(plan["output"]) / "eval")}
     monkeypatch.setenv("SLURM_JOB_ID", "old")

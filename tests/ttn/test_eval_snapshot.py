@@ -70,3 +70,50 @@ def test_snapshot_rejects_inconsistent_metadata_without_modifying_source(snapsho
     before = {p.name: p.read_bytes() for p in source.iterdir()}
     with pytest.raises(ValueError): snapshot.snapshot_training_run(source)
     assert before == {p.name: p.read_bytes() for p in source.iterdir()}
+    assert not list(tmp_path.glob("eval-snapshot-*"))
+
+
+@pytest.mark.parametrize("retain", [True, False])
+def test_completed_evaluation_releases_only_opted_in_model_alias(snapshot, tmp_path, retain):
+    source = make_run(tmp_path)
+    frozen = snapshot.snapshot_training_run(source, retain_model=retain)
+    result = {"status": "completed", "training_run": str(frozen), "identity": {"step": 156},
+              "results": {"long": {}, "short": {}, "align": {}}}
+    report = snapshot.release_evaluation_model(frozen, result)
+    assert report["status"] == ("retained" if retain else "released")
+    assert (frozen / "last.pt").exists() == retain
+    assert (source / "last.pt").is_file()
+    assert (frozen / "train.jsonl").is_file() and (frozen / "run_config.json").is_file()
+    if not retain: assert snapshot.release_evaluation_model(frozen, result)["status"] == "released"
+
+
+def test_manual_keep_protects_non_key_model(snapshot, tmp_path):
+    source = make_run(tmp_path)
+    frozen = snapshot.snapshot_training_run(source, retain_model=False)
+    (frozen / ".keep").touch()
+    result = {"status": "completed", "training_run": str(frozen), "identity": {"step": 156},
+              "results": {"long": {}, "short": {}, "align": {}}}
+    assert snapshot.release_evaluation_model(frozen, result)["status"] == "retained"
+    assert (frozen / "last.pt").is_file()
+
+
+@pytest.mark.parametrize("damage", ["running", "failed", "step", "source", "missing-child", "replacement", "symlink"])
+def test_model_release_protects_pending_failed_different_or_replaced_snapshots(snapshot, tmp_path, damage):
+    source = make_run(tmp_path)
+    frozen = snapshot.snapshot_training_run(source, retain_model=False)
+    result = {"status": "completed", "training_run": str(frozen), "identity": {"step": 156},
+              "results": {"long": {}, "short": {}, "align": {}}}
+    if damage in ("running", "failed"): result["status"] = damage
+    elif damage == "step": result["identity"]["step"] = 157
+    elif damage == "source": result["training_run"] = str(source)
+    elif damage == "missing-child": result["results"].pop("align")
+    elif damage == "replacement":
+        replacement = frozen / "replacement.pt"
+        torch.save({"step": 156}, replacement)
+        os.replace(replacement, frozen / "last.pt")
+    else:
+        (frozen / "last.pt").unlink()
+        try: (frozen / "last.pt").symlink_to(source / "last.pt")
+        except OSError: pytest.skip("symlinks unavailable")
+    with pytest.raises(ValueError): snapshot.release_evaluation_model(frozen, result)
+    assert (frozen / "last.pt").exists() and (source / "last.pt").exists()

@@ -63,14 +63,33 @@ def test_visual_adaptation_updates_mappings_but_preserves_original_camera_and_ba
     assert torch.autograd.grad(raw.square().sum(), x)[0].norm() > 0
 
 
-def test_unfreeze_restores_progress_only_and_refuses_exact_resume_with_changed_scope(tmp_path, cached_sana):
+def test_corrected_warmup_trains_only_new_parameters_and_joint_preserves_lr_origins(cached_sana):
+    from worldttn.anchor import is_ttn_new_parameter
     model = camera_model(cached_sana)
-    configure_train_scope(model, "ttn-visual")
+    before = {n: p.detach().clone() for n, p in model.named_parameters()}
+    configure_train_scope(model, "ttn-new")
+    optimizer = make_optimizer(model)
+    update(model, optimizer)
+    assert all(p.requires_grad == is_ttn_new_parameter(n) for n, p in model.named_parameters())
+    assert any(not torch.equal(before[n], p) for n, p in model.named_parameters() if is_ttn_new_parameter(n))
+    for n, p in model.named_parameters():
+        if not is_ttn_new_parameter(n): assert torch.equal(before[n], p) and p.grad is None
+    configure_train_scope(model, "dit")
+    optimizer = make_optimizer(model)
+    assert optimizer.param_groups[1]["lr"] == 1e-6
+    report = audit_training_parameters(model, optimizer)
+    assert "blocks.3.attn.q_proj_cam.weight" in report["optimizer_parameter_names"][1]
+
+
+@pytest.mark.parametrize("warmup_scope", ["ttn-visual", "ttn-new"])
+def test_unfreeze_restores_progress_only_and_refuses_exact_resume_with_changed_scope(tmp_path, cached_sana, warmup_scope):
+    model = camera_model(cached_sana)
+    configure_train_scope(model, warmup_scope)
     engine = ParallelTraining(model, linear_flow_loss)
     optimizer = make_optimizer(model)
     update(model, optimizer, engine)
     path = tmp_path / "last.pt"
-    old_identity = {"train_scope": "ttn-visual", "optimizer_foreach": False, "seed": 3407, "tbptt": 2}
+    old_identity = {"train_scope": warmup_scope, "optimizer_foreach": False, "seed": 3407, "tbptt": 2}
     cursor = {"epoch": 9, "batch_in_epoch": 3}
     save_training_checkpoint(path, engine, optimizer, 50, cursor, old_identity)
     expected_rng = torch.get_rng_state().clone()

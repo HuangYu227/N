@@ -189,9 +189,9 @@ def validate_unfreeze_checkpoint(payload, mode, world, training_config):
     old_config = _resume_identity(meta.get("training_config"))
     training_config = _resume_identity(training_config)
     validate_training_checkpoint(payload, mode, world, old_config)
-    if (payload.get("train_scope") != "ttn-visual" or payload.get("stage") != "C"
+    if (payload.get("train_scope") not in ("ttn-visual", "ttn-new") or payload.get("stage") != "C"
             or payload["config"].get("camera_attention") != "sana"
-            or old_config.get("train_scope") != "ttn-visual" or training_config.get("train_scope") != "dit"):
+            or old_config.get("train_scope") != payload.get("train_scope") or training_config.get("train_scope") != "dit"):
         raise ValueError("unfreeze requires Stage C/sana-camera visual warmup -> joint DiT")
     changed = {"train_scope", "backbone_lr", "optimizer_foreach"}
     if ({k: v for k, v in old_config.items() if k not in changed}

@@ -26,8 +26,10 @@ def stage_evaluate_command(args):
     commands = {
         # Long first creates the full immutable case bundle, then every diagnostic uses prefixes.
         "long": ["evaluate", "--frames", "61", "--steps", str(args.steps),
+                 "--state-diagnostics",
                  "--cfg-scale", str(args.cfg_scale), "--cached-blocks", str(args.cached_blocks)],
         "short": ["evaluate", "--frames", "13", "--steps", str(args.steps),
+                  "--state-diagnostics",
                   "--cfg-scale", str(args.cfg_scale), "--cached-blocks", str(args.cached_blocks)],
         "align": ["align-chunk", "--frames", "4", "--alignment-timesteps", "500", "--alignment-grad-timestep", "500"],
     }
@@ -61,5 +63,11 @@ def stage_evaluate_command(args):
         result.update(status="failed", error=str(error))
         publish()
         raise
+    publish()
+    from tools.ttn_eval_snapshot import release_evaluation_model
+    try:
+        result["model_retention"] = release_evaluation_model(args.training_run, result)
+    except (OSError, ValueError) as error:
+        result["model_retention"] = {"status": "retained", "error": str(error)}
     publish()
     print("[TTN stage evaluation] " + json.dumps(result), flush=True)

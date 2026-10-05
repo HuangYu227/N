@@ -15,10 +15,12 @@ def state_dynamics(previous, predicted, candidate, eps):
     def cosine(a, b):
         return ratio((a * b).sum((-1, -2)), norm(a) * norm(b))
     spectra = {}
-    for name, state in (("previous", previous), ("predicted", predicted), ("committed", candidate)):
+    for name, state in (("previous", previous), ("predicted", predicted), ("committed", candidate),
+                        ("correction", candidate - predicted)):
         singular = torch.linalg.svdvals(state)
         spectra[name] = {"sigma_max": singular[..., 0].cpu().tolist(),
                          "top4": singular[..., :4].cpu().tolist(),
+                         "top1_energy_fraction": ratio(singular[..., 0].square(), state.square().sum((-1, -2))),
                          "stable_rank": ratio(state.square().sum((-1, -2)), singular[..., 0].square())}
     correction = candidate - predicted
     return {"state_spectrum": spectra, "state_dynamics": {
@@ -28,6 +30,23 @@ def state_dynamics(previous, predicted, candidate, eps):
         "correction_prediction_cosine": cosine(correction, predicted),
         "correction_relative": ratio(norm(correction), norm(predicted)),
         "measurement": "detached FP32; [CFG branch, head]; zero-reference ratios are null"}}
+
+
+@torch.no_grad()
+def write_direction_stats(correction, history, eps):
+    """History pairs are (original write, write transported into current basis)."""
+    correction = correction.detach().float()
+    norm = correction.flatten(-2).norm(dim=-1)
+    def cosine(old):
+        old = old.detach().float()
+        old_norm = old.flatten(-2).norm(dim=-1)
+        values = ((correction * old).sum((-1, -2)) / (norm * old_norm).clamp_min(eps**2)).clamp(-1, 1).cpu().tolist()
+        valid = ((norm > eps) & (old_norm > eps)).cpu().tolist()
+        return [[x if valid[i][j] else None for j, x in enumerate(row)] for i, row in enumerate(values)]
+    return {"write_direction": {"lag_" + str(lag): {
+        "cosine_raw": cosine(history[lag - 1][0]),
+        "cosine_transport_aligned": cosine(history[lag - 1][1])} for lag in (1, 2, 4) if lag <= len(history)},
+        "write_direction_measurement": "detached FP32; [branch, head]; clean predicted chunks only; zero writes null; diagnostic only"}
 
 
 def matrix_scale(value):
@@ -127,13 +146,14 @@ def stability_rows(record):
 
 
 def progress_line(record, target):
-    rows = list(stability_rows(record))
+    # Prefill starts from S=0, so innovation/V=1 by construction; do not hide later chunks.
+    rows = [row for row in stability_rows(record) if not row.get("prefill", False)]
     values = [(max(x for branch in r.get("per_head", {}).get("innovation_relative", [])
                    for x in branch if x is not None), r["block"]) for r in rows
               if any(x is not None for b in r.get("per_head", {}).get("innovation_relative", []) for x in b)]
     largest = max(values) if values else None
     peak = max(r.get("peak_allocated_bytes", 0) for r in record["ranks"]) / 2**30
-    suffix = "" if largest is None else f" | max innovation/V={largest[0]:.3g}@{largest[1]}"
+    suffix = "" if largest is None else f" | max clean innovation/V={largest[0]:.3g}@{largest[1]}"
     return (f"[TTN progress] step {record['step']}/{target} | scope={record['train_scope']} | "
             f"loss={record['loss']:.6f} | grad={record['outer_grad_norm']:.4g} | "
             f"train={record['seconds']:.1f}s | peak={peak:.2f}GiB{suffix}")

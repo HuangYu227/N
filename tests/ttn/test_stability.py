@@ -43,6 +43,17 @@ def test_relative_innovation_separates_feature_scale_from_prediction_error():
                                torch.tensor(b["per_head"]["innovation_relative"]), rtol=2e-6, atol=1e-6)
 
 
+def test_progress_summary_excludes_prefill_baseline_but_preserves_full_log_rows():
+    def chunk(index, value, prefill):
+        return {"chunk": index, "start": 0, "end": 1, "anchors": [
+            {"block": 19, "prefill": prefill, "per_head": {"innovation_relative": [[value]]}}]}
+    record = {"step": 1, "stage": "C", "train_scope": "dit", "config": {"camera_attention": "sana"},
+              "loss": .4, "outer_grad_norm": .5, "seconds": 1., "ranks": [
+                  {"rank": 0, "prefill": chunk(-1, 1., True), "chunks": [chunk(0, .5, False)]}]}
+    assert len(list(stability_rows(record))) == 2
+    assert "max clean innovation/V=0.5@19" in progress_line(record, 500)
+
+
 def test_empty_writes_have_zero_active_eta_and_undefined_relative_error():
     _, old, new, *_, stats = features(empty=True)
     torch.testing.assert_close(old, new, rtol=0, atol=0)
@@ -96,3 +107,47 @@ def test_telemetry_preserves_full_stage_c_tbptt_gradients_updates_and_states(mon
     torch.testing.assert_close(a["runtime"].world_state, b["runtime"].world_state, rtol=0, atol=0)
     torch.testing.assert_close(a["runtime"].transition_fast, b["runtime"].transition_fast, rtol=0, atol=0)
     assert a["prefill"]["prefill"] and [c["chunk"] for c in a["chunks"]] == list(range(4))
+
+
+def test_write_direction_distinguishes_raw_from_transported_basis_and_zero_writes():
+    from worldttn.stability import write_direction_stats, state_dynamics
+    previous = torch.tensor([[[[1., 0.], [0., 0.]]]])
+    rotation = torch.tensor([[0., -1.], [1., 0.]])
+    current = (previous @ rotation).requires_grad_()
+    stats = write_direction_stats(current, ((previous, previous @ rotation),), 1e-6)
+    assert stats["write_direction"]["lag_1"] == {"cosine_raw": [[0.]], "cosine_transport_aligned": [[1.]]}
+    empty = write_direction_stats(current * 0, ((previous, previous),), 1e-6)
+    assert empty["write_direction"]["lag_1"]["cosine_raw"] == [[None]]
+    spectrum = state_dynamics(previous * 0, previous * 0, previous, 1e-6)
+    assert spectrum["state_spectrum"]["correction"]["stable_rank"] == [[1.]]
+    assert spectrum["state_spectrum"]["correction"]["top1_energy_fraction"] == [[1.]]
+    json.dumps(stats, allow_nan=False)
+
+
+def test_runtime_write_history_is_detached_bounded_transport_aligned_and_reset(monkeypatch):
+    from test_runtime import config, begin
+    from worldttn import runtime as module
+    cfg = config("B")
+    system = module.TTNSystem(cfg)
+    runtime = module.TTNRuntimeState.create(cfg, 1, "cpu")
+    rotation = torch.eye(8)
+    rotation[:2, :2] = torch.tensor([[0., -1.], [1., 0.]])
+    class Factors:
+        def __init__(self, *args): pass
+        def right(self, value): return value @ rotation
+    monkeypatch.setattr(module, "CayleyFactors", Factors)
+    write = torch.zeros_like(runtime.world_state)
+    write[..., 0, 0] = 1.
+    for step in range(6):
+        context = begin(runtime, system, [step], clean=True)
+        delta = write @ torch.linalg.matrix_power(rotation, step)
+        for i in range(5): context.stage(i, context.predicted[:, i] + delta[:, i], context.psi[:, i], {})
+        runtime.commit_chunk(context)
+        assert len(runtime.write_history) == min(step + 1, 4)
+        assert all(not value.requires_grad for pair in runtime.write_history for value in pair)
+        if step:
+            stats = runtime.last_stats["anchors"][0]["write_direction"]["lag_1"]
+            assert stats["cosine_transport_aligned"] == [[1., 1.]]
+            assert stats["cosine_raw"] == [[0., 0.]]
+    runtime.reset()
+    assert runtime.write_history == ()

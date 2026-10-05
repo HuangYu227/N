@@ -1,4 +1,4 @@
-"""Adapt visual TTN then unfreeze DiT, or resume a run in hour-limited Slurm jobs.
+"""Train joint DiT (optional TTN-new frozen control) in hour-limited Slurm jobs.
 
 Uses the existing training launcher and exact-resume protocol unchanged. Only
 one successor is submitted at a time, after a successful training segment.
@@ -22,6 +22,7 @@ PROFILE = {
     "backbone_lr": "BACKBONE_LR", "text_encoder_device": "TEXT_ENCODER_DEVICE",
     "activation_offload": "ACTIVATION_OFFLOAD", "cross_attn_backend": "CROSS_ATTN_BACKEND",
     "ttn_core_backend": "TTN_CORE_BACKEND", "ttn_psi_backend": "TTN_PSI_BACKEND",
+    "optimizer_policy": "OPTIMIZER_POLICY",
 }
 
 
@@ -124,7 +125,10 @@ def evaluation_settings(args, output):
     if not every: return None
     if getattr(args, "eval_steps", 20) < 1 or getattr(args, "eval_cases", 1) < 1:
         raise ValueError("positive eval-steps and eval-cases are required")
+    key_steps = sorted(set(getattr(args, "keep_model_steps", (25, 50, 100, 250))) | {args.target_step})
+    if any(step < 1 for step in key_steps): raise ValueError("key model steps must be positive")
     return {"every": every, "seed": getattr(args, "eval_seed", 3407), "steps": getattr(args, "eval_steps", 20),
+            "keep_model_steps": key_steps,
             "cases": getattr(args, "eval_cases", 1), "fixed_cases": str(Path(output) / "fixed-cases.pt"),
             "output": str(Path(output) / "evaluations")}
 
@@ -133,7 +137,9 @@ def submit_evaluation(plan, step, parent_job):
     from tools.ttn_eval_snapshot import snapshot_training_run
     evaluation = plan["evaluation"]
     if not parent_job.isdecimal(): raise ValueError("evaluation requires a numeric parent Slurm job")
-    snapshot = snapshot_training_run(plan["output"])
+    # Old chains without a retention policy preserve their previous behavior.
+    retain = "keep_model_steps" not in evaluation or step in evaluation["keep_model_steps"]
+    snapshot = snapshot_training_run(plan["output"], retain_model=retain)
     output = Path(evaluation["output"]) / f"step-{step:06d}"
     output.parent.mkdir(parents=True, exist_ok=True)
     env = environment(plan, step)
@@ -189,10 +195,11 @@ def start_chain(args):
     run = json.loads((source / "run_config.json").read_text(encoding="utf-8"))
     original = run["arguments"]
     unfreeze = getattr(args, "unfreeze", False)
-    expected_scope = "ttn-visual" if unfreeze else "dit"
-    if (run["parallel"], run["world_size"], original["stage"], original["train_scope"]) != ("fsdp2", 4, "C", expected_scope):
+    expected_scopes = ("ttn-visual", "ttn-new") if unfreeze else ("dit",)
+    if ((run["parallel"], run["world_size"], original["stage"]) != ("fsdp2", 4, "C")
+            or original["train_scope"] not in expected_scopes):
         raise ValueError("Expected an existing 4-rank FSDP2 full Stage C/DiT training run")
-    if unfreeze and run["training"].get("train_scope") != "ttn-visual":
+    if unfreeze and run["training"].get("train_scope") not in ("ttn-visual", "ttn-new"):
         raise ValueError("unfreeze source must be a visual warmup run")
     dependency = parent_dependency(args.after_job) if args.after_job else None
     if dependency:
@@ -252,34 +259,37 @@ def fresh_chain(args):
         raise ValueError("fresh adaptation requires the Stage C/original SANA camera config")
     if not python.is_file() or not dataset.is_dir():
         raise ValueError("Existing prefix Python and dataset are required; no environment/data will be created")
-    if args.warmup_steps < 1 or args.segment_steps < 1 or args.target_step <= args.warmup_steps:
-        raise ValueError("positive warmup/segment steps and target-step > warmup-steps are required")
+    if args.warmup_steps < 0 or args.segment_steps < 1 or args.target_step <= args.warmup_steps:
+        raise ValueError("nonnegative warmup, positive segment and target-step > warmup-steps are required")
+    if args.warmup_only and args.warmup_steps == 0:
+        raise ValueError("warmup-only requires positive warmup-steps")
     if not math.isfinite(args.backbone_lr) or args.backbone_lr <= 0:
         raise ValueError("backbone learning rate must be finite and positive")
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     output = (Path(args.output).resolve() if args.output else
               project / "output/worldttn" / f"ucpe-C-{stamp}-{uuid.uuid4().hex[:6]}")
     output.mkdir(parents=True, exist_ok=False)
-    warmup = output / "adapt"
+    warmup = output / ("adapt" if args.warmup_steps else "joint")
     warmup.mkdir()
     profile = {"ROOT": str(root), "PROJECT_ROOT": str(project), "PYTHON": str(python),
                "CONFIG": str(config), "DATASET_ROOT": str(dataset), "COMMAND": "train",
-               "PARALLEL": "fsdp2", "STAGE": "C", "TRAIN_SCOPE": "ttn-visual", "RESUME": "0",
+               "PARALLEL": "fsdp2", "STAGE": "C", "TRAIN_SCOPE": "ttn-new" if args.warmup_steps else "dit", "RESUME": "0",
+               "OPTIMIZER_POLICY": "origin",
                "SEED": str(args.seed), "TBPTT": str(args.tbptt), "BACKBONE_LR": str(args.backbone_lr),
                "ACTIVATION_OFFLOAD": "cpu", "TEXT_ENCODER_DEVICE": "cpu", "CROSS_ATTN_BACKEND": "math",
                "MEMORY_TRACE": "1", "CUDA_TRACE": "0", "CUDA_LAUNCH_BLOCKING": "0",
                "GDN_DISABLE_COMPILE": "1", "GDN_DISABLE_COMPLEX_COMPILE": "0", "DISTRIBUTED_TIMEOUT": "1800"}
     if args.base_weights: profile["BASE_WEIGHTS"] = args.base_weights
     plan = {"source": "", "fresh": True, "project": str(project), "output": str(warmup),
-            "environment": profile, "initial_step": 0, "target_step": args.warmup_steps,
+            "environment": profile, "initial_step": 0, "target_step": args.warmup_steps or args.target_step,
             "segment_steps": args.segment_steps, "partition": args.partition}
-    if not args.warmup_only:
+    if args.warmup_steps and not args.warmup_only:
         plan.update(joint_output=str(output / "joint"), joint_target_step=args.target_step)
     evaluation = evaluation_settings(args, output)
     if evaluation: plan["evaluation"] = evaluation
     manifest = warmup / "chain.json"
     manifest.write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
-    print(f"[TTN chain] output={output} warmup=1..{args.warmup_steps} "
+    print(f"[TTN chain] output={output} frozen_steps={args.warmup_steps} "
           f"joint={'held' if args.warmup_only else str(args.warmup_steps + 1) + '..' + str(args.target_step)}", flush=True)
     submit(plan, manifest, 0)
 
@@ -353,8 +363,8 @@ def main():
     start.add_argument("--partition", default="short")
     start.add_argument("--unfreeze", action="store_true", help="Source is C/sana-camera visual warmup; reset optimizer once")
     start.add_argument("--output", help="New joint output directory")
-    fresh = modes.add_parser("fresh", help="New original-UCPE C run: visual adaptation then joint DiT")
-    fresh.add_argument("--warmup-steps", type=int, default=50)
+    fresh = modes.add_parser("fresh", help="Fresh C/SANA-camera joint DiT; optional corrected TTN-new frozen control")
+    fresh.add_argument("--warmup-steps", type=int, default=0, help="frozen TTN-new control; zero starts joint DiT immediately")
     fresh.add_argument("--target-step", type=int, default=500, help="Total adaptation + joint steps")
     fresh.add_argument("--segment-steps", type=int, default=10)
     fresh.add_argument("--partition", default="short")
@@ -371,6 +381,8 @@ def main():
         command.add_argument("--eval-seed", type=int, default=3407)
         command.add_argument("--eval-steps", type=int, default=20)
         command.add_argument("--eval-cases", type=int, default=1)
+        command.add_argument("--keep-model-steps", type=int, nargs="*", default=[25, 50, 100, 250],
+                             help="pin evaluation models only at these steps and target; all metric logs remain")
     work = modes.add_parser("worker", help=argparse.SUPPRESS)
     work.add_argument("manifest", type=Path)
     work.add_argument("start_step", type=int)
