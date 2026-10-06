@@ -17,4 +17,4 @@ cd "$PROJECT_ROOT"
 source tools/ttn_cache_env.sh
 export DISABLE_XFORMERS=1 SANA_CP_SIZE=1 PYTHONUNBUFFERED=1
 srun "$ROOT/envs/worldttn/bin/python" -m tools.ttn_decode_comparison \
-    --evaluation "$VIDEO_EVALUATION" --output "$VIDEO_OUTPUT" --chunks 5
+    --evaluation "$VIDEO_EVALUATION" --output "$VIDEO_OUTPUT" --chunks "${VIDEO_CHUNKS:-5}"

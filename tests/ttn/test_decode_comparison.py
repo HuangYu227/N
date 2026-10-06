@@ -18,6 +18,9 @@ def test_saved_pair_prefix_and_video_conversion(tmp_path):
                    tmp_path / f"case-000-{method}.pt")
     _, _, latents = load_pair(tmp_path, 0, 5)
     assert [x.shape[2] for x in latents] == [16, 16]
+    _, _, long_latents = load_pair(tmp_path, 0, 20)
+    assert [x.shape[2] for x in long_latents] == [61, 61]
+    assert ((long_latents[0].shape[2] - 1) * 8 + 1) / 16 == 30.0625
     with pytest.raises(ValueError, match="T >="):
         load_pair(tmp_path, 0, 21)
     episodes[1]["initial_noise_sha256"] = "different"
