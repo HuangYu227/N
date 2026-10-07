@@ -132,14 +132,15 @@ def test_concurrent_workers_have_separate_local_scratch(worker_setup):
     assert len(scratch_dirs) == 3
 
 
-def test_worker_uses_allowlisted_pytest_entry_and_cleans_scratch(worker_setup):
+@pytest.mark.parametrize("module", ["pytest", "tools.ttn_custom_inference"])
+def test_worker_uses_allowlisted_entry_and_cleans_scratch(worker_setup, module):
     bash, script, capture, writer, personal, env = worker_setup
-    env["TTN_ENTRY_MODULE"] = "pytest"
+    env["TTN_ENTRY_MODULE"] = module
     result = subprocess.run([str(bash), str(script), "-q", "tests/ttn/test_meta_core.py"], env=env,
                             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
     assert result.returncode == 0, result.stderr
     record = json.loads(capture.read_text())
-    assert record["args"][:3] == ["-u", "-m", "pytest"]
+    assert record["args"][:3] == ["-u", "-m", module]
     assert not Path(record["env"]["TMPDIR"]).parent.exists()
 
 

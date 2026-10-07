@@ -1,0 +1,30 @@
+{
+  "format": "TTN-custom-image-case-v1",
+  "case_id": "custom/study-static-20261007",
+  "source": "user-provided AI-generated image; independent of this TTN fine-tuning dataset",
+  "image": "first_frame.png",
+  "image_sha256": "38b1b477098b18e00b409bcb0d3a893f449ce4a6df344c077cdc969b19abf482",
+  "prompt_file": "prompt.txt",
+  "target_size_hw": [
+    704,
+    1280
+  ],
+  "latent_frames": 61,
+  "raw_frames": 481,
+  "fps": 16,
+  "seed": 3407,
+  "camera": {
+    "trajectory": "static",
+    "intrinsics_px": [
+      900.0,
+      900.0,
+      640.0,
+      352.0
+    ],
+    "intrinsics_grid_hw": [
+      704,
+      1280
+    ],
+    "intrinsics_source": "assumed virtual pinhole camera; not estimated or measured"
+  }
+}

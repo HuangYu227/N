@@ -69,14 +69,14 @@ def comparison_frame(left, right, frame, stride, step, font):
     return np.asarray(canvas)
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--evaluation", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--chunks", type=int, default=5, help="predicted chunks, excluding observation")
     parser.add_argument("--case", type=int, default=0)
     parser.add_argument("--sana-config", type=Path, default=Path("configs/worldttn/sana_teacher_single_gpu.yaml"))
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     summary, episode, latents = load_pair(args.evaluation, args.case, args.chunks)
     from worldttn.sana import load_sana_config
     from diffusion.model.builder import get_vae, vae_decode
