@@ -215,6 +215,64 @@ def test_summary_does_not_override_worker_completion_or_failure(tmp_path, status
     assert result["variants"]["full"]["first_exception"] == "original trace"
 
 
+@pytest.mark.parametrize("name", ["full", "aligned-010"])
+@pytest.mark.parametrize("status", ["pending", "running", "failed"])
+def test_parallel_collector_ignores_other_workers_partial_output(tmp_path, name, status):
+    from tools.ttn_submit_sink import collect
+    root, _ = completed_suite(tmp_path)
+    (root / name / "summary.json").write_text('{"protocol":')
+    (root / f"{name}-status.json").write_text(json.dumps({"status": status}))
+    result = collect(root)
+    assert result["status"] == ("failed" if status == "failed" else "running")
+    assert name not in result["results"]
+
+
+def test_worker_validates_own_result_before_completion_and_releases_failed_lock(tmp_path):
+    from tools.ttn_submit_sink import _publish
+    root, _ = completed_suite(tmp_path)
+    (root / "aligned-010-status.json").write_text('{"status":"running"}')
+    (root / "zero-025-status.json").write_text('{"status":"running"}')
+    (root / "zero-025/summary.json").write_text('{"protocol":')
+    result = _publish(root, validating="aligned-010")
+    assert result["status"] == "running" and "aligned-010" in result["results"]
+    assert "zero-025" not in result["results"]
+    path = root / "aligned-010/summary.json"
+    invalid = json.loads(path.read_text())
+    invalid["episodes"][0]["sink_reference_verified"] = False
+    path.write_text(json.dumps(invalid))
+    with pytest.raises(ValueError, match="reference audit"):
+        _publish(root, validating="aligned-010")
+    assert not (root / ".sink-summary.lock").exists()
+    assert json.loads((root / "aligned-010-status.json").read_text())["status"] == "running"
+
+
+def test_five_parallel_sink_workers_publish_complete_aggregate(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    import subprocess
+    import sys
+    root, plan = completed_suite(tmp_path)
+    for name in plan["variants"][1:]:
+        (root / f"{name}-status.json").write_text('{"status":"running"}')
+    script = (
+        "import sys\nfrom pathlib import Path\n"
+        "from tools.ttn_submit_sink import atomic_json, _publish\n"
+        "root, name = Path(sys.argv[1]), sys.argv[2]\n"
+        "_publish(root, validating=name)\n"
+        "atomic_json(root / f'{name}-status.json', {'status': 'completed'})\n"
+        "_publish(root)\n"
+    )
+    def complete(name):
+        return subprocess.run([sys.executable, "-c", script, str(root), name],
+                              capture_output=True, text=True, timeout=60)
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        results = list(pool.map(complete, plan["variants"][1:]))
+    for result in results: assert result.returncode == 0, result.stderr
+    result = json.loads((root / "summary.json").read_text())
+    assert result["status"] == "completed" and len(result["results"]) == 6
+    assert all(item["status"] == "completed" for item in result["variants"].values())
+    assert not (root / ".sink-summary.lock").exists()
+
+
 @pytest.mark.parametrize("changed_prefix", [False, True])
 def test_worker_reuses_custom_baseline_and_requires_validated_videos(tmp_path, monkeypatch, changed_prefix):
     from tools import ttn_submit_sink as tool

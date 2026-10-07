@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import sys
 import traceback
+import uuid
 
 import torch
 
@@ -186,7 +187,7 @@ def _frame_comparison(reference, current, *, prefix=False):
     return checks
 
 
-def collect(root):
+def collect(root, *, validating=None):
     root = Path(root)
     plan = _plan(root)
     submission_path = root / "submission-status.json"
@@ -197,6 +198,8 @@ def collect(root):
         status = root / f"{name}-status.json"
         statuses[name] = json.loads(status.read_text(encoding="utf-8")) if status.is_file() else {"status": "pending"}
         path = root / name / "summary.json"
+        # Only this worker may inspect its finished output before marking completion.
+        if statuses[name]["status"] != "completed" and name != validating: continue
         if not path.is_file():
             if statuses[name]["status"] == "completed": raise ValueError(f"{name}: completed result is missing")
             continue
@@ -290,10 +293,17 @@ def collect(root):
     return result
 
 
-def _publish(root):
-    result = collect(root)
-    atomic_json(Path(root) / "summary.json", result)
-    return result
+def _publish(root, *, validating=None):
+    from worldttn.checkpoint_integrity import acquire_checkpoint_lock, release_checkpoint_lock
+    root = Path(root)
+    lock, token = root / ".sink-summary.lock", uuid.uuid4().hex
+    acquire_checkpoint_lock(lock, token)
+    try:
+        result = collect(root) if validating is None else collect(root, validating=validating)
+        atomic_json(root / "summary.json", result)
+        return result
+    finally:
+        release_checkpoint_lock(lock, token)
 
 
 def mark_failed(root, index, exit_code):
@@ -366,7 +376,7 @@ def run_variant(root, index):
                    "--eval-methods", *(("sana", "ttn") if index == 0 else ("ttn",))])
         record["phase"] = "validate_results"
         atomic_json(status_path, record)
-        _publish(root)
+        _publish(root, validating=name)
         record.update(status="completed", phase="completed")
         atomic_json(status_path, record)
         return _publish(root)
