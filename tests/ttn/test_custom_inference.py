@@ -172,3 +172,23 @@ def test_custom_pair_reuses_inputs_and_noise_without_future_gt(monkeypatch, tmp_
     assert hashes[0] == hashes[1] == hashes[2]
     assert len(decoded) == 3 and decoded[-1][-4:] == ["--left-evaluation", str(output), "--left-method", "ttn"]
     assert decoded[-1][decoded[-1].index("--output") + 1] == str(intervention / "videos-vs-ttn-baseline")
+    # Smoke validation runs after encoding and propagates failures to Slurm.
+    import tools.ttn_submit_sink as sink_suite
+    case_path = custom.REPO / "assets/worldttn/study_static" / case_name
+    smoke_case, _, _ = custom.load_case(case_path)
+    smoke_case.update(latent_frames=16, raw_frames=121)
+    for key in ("image", "prompt_file"):
+        smoke_case[key] = str(case_path.parent / smoke_case[key])
+    smoke_path = tmp_path / "smoke-case.json"
+    smoke_path.write_text(json.dumps(smoke_case))
+    smoke_output = tmp_path / "smoke"
+    monkeypatch.setattr(custom, "encode_first_frame", lambda *a: torch.zeros(1, 128, 1, 22, 40))
+    def reject_smoke(argv):
+        assert argv == ["--check-smoke", str(smoke_output)]
+        assert decoded[-1][decoded[-1].index("--evaluation")+1] == str(smoke_output)
+        raise ValueError("smoke rejected ineffective noisy branch")
+    monkeypatch.setattr(sink_suite, "main", reject_smoke)
+    with pytest.raises(ValueError, match="ineffective noisy branch"):
+        custom.main(["--training-run", str(tmp_path), "--output", str(smoke_output),
+                     "--case", str(smoke_path), "--steps", "4", "--state-diagnostics",
+                     "--tla-sink", "protected", "--check-sink-smoke"])

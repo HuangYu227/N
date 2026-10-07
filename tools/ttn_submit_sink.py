@@ -3,6 +3,7 @@ import argparse
 from dataclasses import asdict
 from datetime import datetime, timezone
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -13,7 +14,7 @@ import torch
 
 from tools.ttn_custom_inference import load_case
 from tools.ttn_submit_mechanism import prepare as prepare_mechanisms
-from worldttn.core import TTNConfig
+from worldttn.core import ANCHORS, TTNConfig
 from worldttn.evaluation import file_sha256, paired_summary
 from worldttn.mechanism_evaluation import atomic_json, IDENTITY, sink_identity
 from worldttn.sink import SinkOptions
@@ -21,6 +22,71 @@ from worldttn.sink import SinkOptions
 REPO = Path(__file__).resolve().parents[1]
 DEFAULT_CASE = REPO / "assets/worldttn/study_static/case.json"
 SIGNATURES = ("input_sha256", "initial_noise_sha256", "base_sha256")
+
+
+def check_smoke(root):
+    """Step100 / five-chunk acceptance: prove noisy output influence, not quality."""
+    root = Path(root)
+    summary = json.loads((root / "summary.json").read_text(encoding="utf-8"))
+    protocol = summary["protocol"]
+    expected = dict(status="completed", step=100, stage="C", frames=16, raw_frames=121, steps=4,
+                    camera_attention="sana", history_source="generated", ttn_ablation="full",
+                    execution="reference/reference", state_diagnostics=True,
+                    tla_sink=asdict(SinkOptions("protected")))
+    if any(protocol.get(key) != value for key, value in expected.items()):
+        raise ValueError("smoke requires step100, 16 latents, four solver steps and protected .1 temporal-realign from chunk5")
+    cfg = protocol.get("cfg_scale")
+    if isinstance(cfg, bool) or not isinstance(cfg, (int, float)) or not math.isfinite(cfg) or cfg < 1:
+        raise ValueError("invalid smoke CFG")
+    rows = [row for row in summary["episodes"] if row["method"] == "ttn"]
+    if len(rows) != 1: raise ValueError("smoke requires exactly one TTN episode")
+    row = rows[0]
+    digest = row.get("sink_reference_sha256", "")
+    if (row.get("commits") != 6 or row.get("sink_reference_verified") is not True
+            or not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest)):
+        raise ValueError("smoke commit count or protected reference SHA audit failed")
+    ranges = ((0, 4), (4, 7), (7, 10), (10, 13), (13, 16))
+    if len(row["chunks"]) != len(ranges): raise ValueError("smoke requires five predicted chunks")
+    shifts, checked, noisy_norms = [12]*(2 if cfg > 1 else 1), [], {}
+
+    def active_read(sink):
+        if (sink.get("active") is not True or sink.get("mode") != "protected" or sink.get("gain") != .1
+                or sink.get("position") != "temporal-realign" or sink.get("temporal_shift") != shifts
+                or sink.get("reference_source") != "observed-prefill" or sink.get("reference_sha256") != digest):
+            raise ValueError("fifth chunk sink activation/shift/settings/reference SHA differs")
+        value = sink.get("effective_delta_norm")
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            raise ValueError("sink effective_delta_norm must be finite and nonnegative")
+        return value
+
+    for index, (chunk, bounds) in enumerate(zip(row["chunks"], ranges)):
+        anchors = chunk["anchors"]
+        if (chunk.get("chunk") != index or (chunk.get("start"), chunk.get("end")) != bounds
+                or len(anchors) != len(ANCHORS) or {anchor["block"] for anchor in anchors} != set(ANCHORS)):
+            raise ValueError("smoke chunk bounds or five anchor identities differ")
+        for anchor in anchors:
+            if index < 4:
+                if anchor["sink"].get("active") is not False or anchor.get("sink_trajectory"):
+                    raise ValueError("sink activated before the fifth predicted chunk")
+            else:
+                active_read(anchor["sink"])
+                calls = anchor.get("sink_trajectory", [])
+                if [call.get("call") for call in calls] != [0, 2, 3]:
+                    raise ValueError("fifth chunk requires first/middle/last noisy sink measurements")
+                noisy_norms[str(anchor["block"])] = max(active_read(call) for call in calls)
+        checked.append(dict(predicted_chunk=index+1, latent_range=list(bounds), active=index == 4,
+                            anchors=list(ANCHORS), temporal_shift=shifts if index == 4 else None))
+    nonzero = [int(block) for block, value in noisy_norms.items() if value > 0]
+    if not nonzero: raise ValueError("sink has no nonzero gate/projection contribution in noisy generation calls")
+    video = json.loads((root / "videos/comparison.json").read_text(encoding="utf-8"))
+    encoded = video.get("encoded_video_validation", {})
+    if video.get("status") != "completed" or any(encoded.get(name, {}).get("frames") != 121
+            for name in ("sana.mp4", "ttn.mp4", "comparison.mp4")):
+        raise ValueError("smoke video encoding is incomplete or has incorrect frame counts")
+    return dict(status="passed", step=100, checkpoint_sha256=protocol["checkpoint_sha256"], commits=6,
+                sink=expected["tla_sink"], reference_sha256=digest, reference_verified=True, chunks=checked,
+                noisy_effective_delta_norm=noisy_norms, nonzero_noisy_anchors=nonzero,
+                measurement="FP32 gate/projection contribution before output quantization; no quality claim")
 
 
 def interventions(profile="static"):
@@ -363,10 +429,19 @@ def main(argv=None):
     parser.add_argument("--partition", default="day")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--collect", type=Path)
+    parser.add_argument("--check-smoke", type=Path, help="validate completed step100 five-chunk GPU smoke")
     parser.add_argument("--run-variant", type=int)
     parser.add_argument("--mark-failed", type=int)
     parser.add_argument("--failure-exit-code", type=int, default=1)
     args = parser.parse_args(argv)
+    if args.check_smoke:
+        report = args.check_smoke / "smoke-validation.json"
+        try: result = check_smoke(args.check_smoke)
+        except Exception as error:
+            atomic_json(report, dict(status="failed", error=str(error), first_exception=traceback.format_exc()))
+            raise
+        atomic_json(report, result)
+        print(json.dumps(result, indent=2, allow_nan=False)); return
     if args.collect:
         print(json.dumps(_publish(args.collect), indent=2, allow_nan=False)); return
     if args.mark_failed is not None:

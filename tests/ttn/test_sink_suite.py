@@ -22,6 +22,79 @@ def snapshot(tmp_path):
     return directory
 
 
+def smoke_result(tmp_path, cfg_scale=4.5):
+    from worldttn.sink import SinkOptions
+    digest = "a"*64
+    shifts = [12]*(2 if cfg_scale > 1 else 1)
+    chunks = []
+    for index, (start, end) in enumerate(((0, 4), (4, 7), (7, 10), (10, 13), (13, 16))):
+        anchors = []
+        for block in (3, 7, 11, 15, 19):
+            sink = dict(active=index == 4, mode="protected", gain=.1)
+            if index == 4:
+                sink.update(position="temporal-realign", temporal_shift=shifts,
+                            reference_source="observed-prefill", reference_sha256=digest,
+                            effective_delta_norm=.2 if block == 19 else 0.)
+            anchors.append(dict(block=block, sink=sink,
+                sink_trajectory=[dict(sink, call=call) for call in (0, 2, 3)] if index == 4 else []))
+        chunks.append(dict(chunk=index, start=start, end=end, anchors=anchors))
+    protocol = dict(status="completed", step=100, stage="C", frames=16, raw_frames=121,
+                    steps=4, cfg_scale=cfg_scale, camera_attention="sana", history_source="generated",
+                    ttn_ablation="full", execution="reference/reference", state_diagnostics=True,
+                    tla_sink=asdict(SinkOptions("protected")), checkpoint_sha256="b"*64)
+    row = dict(method="ttn", commits=6, chunks=chunks,
+               sink_reference_sha256=digest, sink_reference_verified=True)
+    result = dict(protocol=protocol, episodes=[dict(method="sana"), row])
+    (tmp_path / "summary.json").write_text(json.dumps(result))
+    video = tmp_path / "videos"
+    video.mkdir()
+    (video / "comparison.json").write_text(json.dumps(dict(status="completed",
+        encoded_video_validation={name: {"frames": 121} for name in ("sana.mp4", "ttn.mp4", "comparison.mp4")})))
+    return result
+
+
+@pytest.mark.parametrize("cfg_scale", [1., 4.5])
+def test_smoke_checks_actual_noisy_effect_and_cli_publishes_report(tmp_path, cfg_scale, capsys):
+    from tools.ttn_submit_sink import check_smoke, main
+    smoke_result(tmp_path, cfg_scale)
+    checked = check_smoke(tmp_path)
+    assert checked["status"] == "passed" and checked["nonzero_noisy_anchors"] == [19]
+    assert checked["chunks"][4]["temporal_shift"] == [12]*(2 if cfg_scale > 1 else 1)
+    main(["--check-smoke", str(tmp_path)])
+    assert json.loads((tmp_path / "smoke-validation.json").read_text()) == checked
+    assert '"status": "passed"' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("corrupt", ["early", "fifth", "missing-anchor", "shift", "mode", "gain", "position",
+    "hash", "unverified", "zero-noisy", "missing-noisy", "nan", "commit", "video"])
+def test_smoke_rejects_inactive_or_ineffective_sink_and_records_failure(tmp_path, corrupt):
+    from tools.ttn_submit_sink import main
+    result = smoke_result(tmp_path)
+    row = result["episodes"][1]
+    last = row["chunks"][-1]["anchors"]
+    if corrupt == "early": row["chunks"][0]["anchors"][0]["sink"]["active"] = True
+    elif corrupt == "fifth": last[0]["sink"]["active"] = False
+    elif corrupt == "missing-anchor": last.pop()
+    elif corrupt == "shift": last[0]["sink"]["temporal_shift"] = [11, 11]
+    elif corrupt == "mode": last[0]["sink"]["mode"] = "zero"
+    elif corrupt == "gain": last[0]["sink"]["gain"] = .25
+    elif corrupt == "position": last[0]["sink"]["position"] = "absolute"
+    elif corrupt == "hash": last[0]["sink"]["reference_sha256"] = "c"*64
+    elif corrupt == "unverified": row["sink_reference_verified"] = False
+    elif corrupt == "zero-noisy":
+        for anchor in last:
+            for call in anchor["sink_trajectory"]: call["effective_delta_norm"] = 0.
+    elif corrupt == "missing-noisy": last[0]["sink_trajectory"] = []
+    elif corrupt == "nan": last[0]["sink_trajectory"][0]["effective_delta_norm"] = float("nan")
+    elif corrupt == "commit": row["commits"] = 7
+    elif corrupt == "video":
+        (tmp_path / "videos/comparison.json").write_text('{"status":"running"}')
+    (tmp_path / "summary.json").write_text(json.dumps(result))
+    with pytest.raises(ValueError): main(["--check-smoke", str(tmp_path)])
+    failure = json.loads((tmp_path / "smoke-validation.json").read_text())
+    assert failure["status"] == "failed" and failure["first_exception"]
+
+
 def test_custom_suite_requires_pinned_snapshot_and_defines_scale_controls(tmp_path):
     from tools.ttn_submit_sink import prepare
     directory = snapshot(tmp_path)

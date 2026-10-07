@@ -195,11 +195,15 @@ def main(argv=None):
     parser.add_argument("--reuse-baseline", type=Path,
                         help="completed paired custom run; reuse its observation/text/geometry and SANA rollout")
     parser.add_argument("--state-diagnostics", action="store_true", help="detached state/sink telemetry")
+    parser.add_argument("--check-sink-smoke", action="store_true",
+                        help="after video encoding, require the step100 five-chunk sink acceptance checks")
     from worldttn.sink import add_sink_arguments
     add_sink_arguments(parser)
     parser.set_defaults(adapter=None, stage=None, dataset_root=None, data_dir=None, vae_cache_dir=None)
     args = parser.parse_args(argv)
     case, image_path, prompt = load_case(args.case)
+    if args.check_sink_smoke and (case["latent_frames"] != 16 or args.steps != 4 or not args.state_diagnostics):
+        parser.error("--check-sink-smoke requires 16 latents, --steps 4 and --state-diagnostics")
     if not torch.cuda.is_available():
         raise ValueError("submit this command with a single CUDA Slurm allocation")
     if args.steps < 1 or not np.isfinite(args.cfg_scale) or args.cfg_scale < 1:
@@ -336,6 +340,9 @@ def main(argv=None):
     if args.reuse_baseline:
         decode([*decode_args[:3], str(args.output / "videos-vs-ttn-baseline"), *decode_args[4:],
                 "--left-evaluation", str(args.reuse_baseline), "--left-method", "ttn"])
+    if args.check_sink_smoke:
+        from tools.ttn_submit_sink import main as validate_smoke
+        validate_smoke(["--check-smoke", str(args.output)])
     print(f"[TTN custom completed] {args.output / 'videos/comparison.mp4'}", flush=True)
 
 
