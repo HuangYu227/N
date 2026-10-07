@@ -2,6 +2,7 @@
 import argparse
 import json
 from pathlib import Path
+import uuid
 
 from .evaluation import paired_summary
 
@@ -49,7 +50,9 @@ def collect_mechanisms(output):
     summaries, statuses = {}, {}
     identity = None
     full = output / "full/summary.json"
-    meta = json.loads(full.read_text())["protocol"].get("meta_ttt", {}) if full.is_file() else {}
+    full_status = output / "full-status.json"
+    full_ready = not full_status.is_file() or json.loads(full_status.read_text())["status"] == "completed"
+    meta = json.loads(full.read_text())["protocol"].get("meta_ttt", {}) if full.is_file() and full_ready else {}
     plan_path = output / "plan.json"
     plan = json.loads(plan_path.read_text()) if plan_path.is_file() else {}
     suite = plan.get("suite", "mechanisms")
@@ -64,6 +67,8 @@ def collect_mechanisms(output):
         status = output / f"{name}-status.json"
         statuses[name] = json.loads(status.read_text()) if status.is_file() else {"status": "pending"}
         path = folder / "summary.json"
+        # A worker marks completed only after its result writer has returned.
+        if status.is_file() and statuses[name]["status"] != "completed": continue
         if not path.is_file(): continue
         summary = json.loads(path.read_text())
         protocol = summary["protocol"]
@@ -173,15 +178,21 @@ def main():
     output = Path(args.output).resolve()
     if bool(args.variant) != bool(args.status): parser.error("--variant and --status must be specified together")
     output.mkdir(parents=True, exist_ok=True)
-    if args.variant:
-        # Do not pre-create a variant's directory: evaluate requires a new path.
-        atomic_json(output / f"{args.variant}-status.json", {"status": args.status})
+    from .checkpoint_integrity import acquire_checkpoint_lock, release_checkpoint_lock
+    lock, token = output / ".mechanism-summary.lock", uuid.uuid4().hex
+    acquire_checkpoint_lock(lock, token)
     try:
-        result = collect_mechanisms(output)
-    except Exception as error:
-        atomic_json(output / "summary.json", {"status": "failed", "error": str(error)})
-        raise
-    atomic_json(output / "summary.json", result)
+        if args.variant:
+            # Do not pre-create a variant's directory: evaluate requires a new path.
+            atomic_json(output / f"{args.variant}-status.json", {"status": args.status})
+        try:
+            result = collect_mechanisms(output)
+        except Exception as error:
+            atomic_json(output / "summary.json", {"status": "failed", "error": str(error)})
+            raise
+        atomic_json(output / "summary.json", result)
+    finally:
+        release_checkpoint_lock(lock, token)
     print(f"[TTN mechanisms] status={result['status']} completed={len(result['results'])}/{len(result['variants'])} output={output}", flush=True)
     if result["status"] == "completed":
         if "full_c_reproduction" in result:

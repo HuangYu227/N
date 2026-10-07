@@ -263,6 +263,47 @@ def test_history_suite_accepts_explicit_off_sink_and_preserves_failed_partial_st
     assert collect_mechanisms(tmp_path)["status"] == "failed"
 
 
+@pytest.mark.parametrize("variant", ["full", "ttn-gt-history"])
+@pytest.mark.parametrize("status", ["running", "failed"])
+def test_history_collector_ignores_unpublished_worker_results(tmp_path, variant, status):
+    from worldttn.mechanism_evaluation import collect_mechanisms
+    mechanism_files(tmp_path, histories=True)
+    (tmp_path / variant / "summary.json").write_text('{"protocol":')
+    (tmp_path / f"{variant}-status.json").write_text(json.dumps({"status": status}))
+    result = collect_mechanisms(tmp_path)
+    assert result["status"] == status
+    assert result["variants"][variant]["status"] == status
+    assert variant not in result["results"]
+
+
+def test_history_failed_worker_is_not_overridden_by_complete_result(tmp_path):
+    from worldttn.mechanism_evaluation import collect_mechanisms
+    mechanism_files(tmp_path, histories=True)
+    (tmp_path / "ttn-gt-history-status.json").write_text('{"status":"failed"}')
+    result = collect_mechanisms(tmp_path)
+    assert result["status"] == "failed" and "ttn-gt-history" not in result["results"]
+
+
+def test_parallel_history_workers_publish_one_complete_aggregate(tmp_path):
+    import subprocess
+    from worldttn.mechanism_evaluation import HISTORY_VARIANTS
+    output = tmp_path / "experiment"
+    mechanism_files(output, histories=True)
+    for variant in HISTORY_VARIANTS:
+        (output / f"{variant}-status.json").write_text('{"status":"running"}')
+    def complete(variant):
+        return subprocess.run([sys.executable, "-m", "worldttn.mechanism_evaluation", str(output),
+                               "--variant", variant, "--status", "completed"],
+                              capture_output=True, text=True, timeout=60)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(complete, HISTORY_VARIANTS))
+    for result in results: assert result.returncode == 0, result.stderr
+    result = json.loads((output / "summary.json").read_text())
+    assert result["status"] == "completed" and len(result["results"]) == 4
+    assert all(value["status"] == "completed" for value in result["variants"].values())
+    assert not (output / ".mechanism-summary.lock").exists()
+
+
 def test_meta_collector_requires_both_contributions_and_reports_separate_contrasts(tmp_path):
     from worldttn.mechanism_evaluation import collect_mechanisms
     mechanism_files(tmp_path, meta=True)
