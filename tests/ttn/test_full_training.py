@@ -107,11 +107,25 @@ def test_generated_history_is_independent_of_future_gt_and_does_not_commit(monke
 
 
 def test_full_training_offload_and_checkpoint_retain_recipe(monkeypatch, tmp_path, cached_sana):
+    from tools.ttn_compare_resume import identical
+    from worldttn.checkpoint import rng_state
     monkeypatch.setattr(training, "_history_scheduler", EulerOracle)
     a, b = model(cached_sana), model(cached_sana)
-    left, right = update(a), update(b, offload="cpu")
+    aopt, bopt = make_optimizer(a), make_optimizer(b)
+    left = update(a, aopt)
+    expected_rng = rng_state()
+    right = update(b, bopt, offload="cpu")
     assert left["loss"] == right["loss"]
-    for p, q in zip(a.parameters(), b.parameters()): torch.testing.assert_close(p, q, rtol=0, atol=0)
+    assert left["outer_grad_norm"] == right["outer_grad_norm"]
+    for (name, p), (other, q) in zip(a.named_parameters(), b.named_parameters()):
+        assert name == other
+        torch.testing.assert_close(p, q, rtol=0, atol=0, msg=name)
+        if p.grad is None: assert q.grad is None
+        else: torch.testing.assert_close(p.grad, q.grad, rtol=0, atol=0, msg=name)
+    identical(aopt.state_dict(), bopt.state_dict(), "CPU offload optimizer")
+    identical(expected_rng, rng_state(), "CPU offload RNG")
+    for field in ("world_state", "transition_fast", "replay_values"):
+        torch.testing.assert_close(getattr(left["runtime"], field), getattr(right["runtime"], field), rtol=0, atol=0)
     a.base_load_report = {"sha256": "test"}
     path = tmp_path/"last.pt"
     save_checkpoint(path, a, None, 1)
@@ -120,6 +134,24 @@ def test_full_training_offload_and_checkpoint_retain_recipe(monkeypatch, tmp_pat
     for p, q in zip(a.parameters(), restored.parameters()): torch.testing.assert_close(p, q, rtol=0, atol=0)
     wrong = model(cached_sana, False); wrong.base_load_report = a.base_load_report
     with pytest.raises(ValueError, match="identity mismatch"): load_checkpoint(path, wrong)
+
+
+def test_cpu_activation_storage_skips_pinned_hooks_even_on_gpu_hosts(monkeypatch):
+    from contextlib import nullcontext
+    calls = []
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    def saved_tensors(**kwargs):
+        calls.append(kwargs)
+        return nullcontext()
+    monkeypatch.setattr(torch.autograd.graph, "save_on_cpu", saved_tensors)
+    x = torch.arange(6.).reshape(2, 3).transpose(0, 1).requires_grad_()
+    with training.activation_storage("cpu", device=x.device):
+        x.square().sum().backward()
+    assert calls == [] and torch.equal(x.grad, 2*x.detach())
+    with training.activation_storage("cpu", device="cuda:0"): pass
+    assert calls == [{"pin_memory": True}]
+    with pytest.raises(ValueError, match="none or cpu"):
+        training.activation_storage("disk", device="cpu")
 
 
 def test_full_training_recipe_validation():

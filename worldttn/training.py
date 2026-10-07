@@ -72,7 +72,7 @@ def generate_history_chunk(session, initial_noise, observed, y, context, cache, 
     return x
 
 
-def activation_storage(mode):
+def activation_storage(mode, *, device=None):
     """Copy saved tensors to host before FSDP resharding; never replay TTN forwards.
 
     Native save_on_cpu copies values (including weight views) during forward,
@@ -80,7 +80,11 @@ def activation_storage(mode):
     parameter hooks still unshard and reduce the actual parameter gradients.
     """
     if mode == "none": return nullcontext()
-    if mode == "cpu": return torch.autograd.graph.save_on_cpu(pin_memory=True)
+    if mode == "cpu":
+        # CPU tensors already live on the host. Pinned packing would only
+        # change their strides and can change backward rounding on GPU hosts.
+        if device is not None and torch.device(device).type == "cpu": return nullcontext()
+        return torch.autograd.graph.save_on_cpu(pin_memory=True)
     raise ValueError("activation_offload must be none or cpu")
 
 
@@ -330,7 +334,7 @@ def train_clip(model,
                              cache_enabled=False) if parallel is not None and parallel.mode == "fsdp2" else nullcontext()
         # DDP no_sync still encloses both forward and backward. CPU storage
         # preserves the full window's S/optional Persistent-meta graph.
-        with sync, amp, activation_storage(activation_offload):
+        with sync, amp, activation_storage(activation_offload, device=clean.device):
             loss = runner(episode, first, last, on_prediction=on_prediction)
             _memory_phase(memory_callback, "backward_begin", first=first, last=last)
             from .performance import DEFAULT_EXECUTION, annotation

@@ -174,7 +174,7 @@ def gradient_health(session, context, clean, y, mask, info, noise, flow_loss, lo
         t = torch.full((1, 1, 4), timestep, device=clean.device, dtype=torch.long)
         t[:, :, 0] = 0
         with torch.enable_grad(), torch.autocast(device_type=clean.device.type, dtype=torch.bfloat16,
-                                                enabled=clean.device.type == "cuda"), activation_storage("cpu"):
+                                                enabled=clean.device.type == "cuda"), activation_storage("cpu", device=clean.device):
             loss = flow_loss(session, clean, t, noise, y, context, [[None] * 10 for _ in model.blocks],
                              0, 4, mask, info, loss_mask).mean()
             if not torch.isfinite(loss): raise FloatingPointError("nonfinite gradient-probe loss")
