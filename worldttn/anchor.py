@@ -11,6 +11,7 @@ from .stability import clean_anchor_stats, local_anchor_stats, matrix_scale
 from .geometry import apply_complex_rope
 from .runtime import TTNSystem
 from .sink import sink_read_stats, sink_effective_stats, validate_sink
+from . import replay
 
 
 class TTNAnchor(nn.Module):
@@ -88,6 +89,7 @@ class TTNAnchor(nn.Module):
         cfg = self.config
         execution = getattr(self, "ttn_execution", DEFAULT_EXECUTION)
         validate_sink(ctx.sink_options, cfg, ctx.ablation, execution)
+        replay.validate_replay(ctx.replay_options, cfg, ctx.ablation, execution)
         b, n, c = x.shape
         if diagnostic is not None: diagnostic("input", x)
         read, write = ctx.token_masks(n)
@@ -98,6 +100,7 @@ class TTNAnchor(nn.Module):
         with torch.autocast(device_type=x.device.type, enabled=False):
             beta = self.beta_proj(x.float()).sigmoid().transpose(1, 2)
             predicted = ctx.predicted[:, self.index]
+            replay_target = ctx.replay_values[:, self.index] if ctx.replay_values is not None else None
             local_enabled = cfg.local_update and not ctx.clean_mode and not ctx.prefill_mode and ctx.ablation in ("full", "no-persistent")
             if local_enabled:
                 support, query = ctx.support_query_masks(n, HW)
@@ -113,14 +116,25 @@ class TTNAnchor(nn.Module):
                 if support.any():
                     persistent = cfg.delta_psi * ctx.psi[:, self.index].tanh() if ctx.ablation == "full" else 0
                     coeff = ctx.cbase[:, self.index] + persistent + local.tanh()
-                    adapted = CayleyFactors(ctx.system.generators.u[self.index].float(),
-                                           ctx.system.generators.v[self.index].float(), coeff).right(ctx.previous[:, self.index])
+                    adapted_factors = CayleyFactors(ctx.system.generators.u[self.index].float(),
+                                                    ctx.system.generators.v[self.index].float(), coeff)
+                    adapted = adapted_factors.right(ctx.previous[:, self.index])
                     predicted = torch.where(support.any(-1)[:, None, None, None], adapted, predicted)
+                    if replay_target is not None:
+                        replay_target = torch.where(support.any(-1)[:, None, None, None],
+                            adapted_factors.right(ctx.replay_previous_values[:, self.index]), replay_target)
             audit_layout(self, "clean" if ctx.clean_mode else "diagnostic" if diagnostic is not None else "noisy",
                          q=q, k=k, v=v, beta=beta, predicted=predicted, write=write)
             with annotation(execution, "CorrectRead"):
+                replay_result = None
                 if execution.core_backend == "reference":
-                    state, w = correct(predicted, k, v, beta, write, cfg.alpha_s, cfg.eps)
+                    if ctx.replay_active:
+                        observation = ctx.replay_observations[self.index] if ctx.replay_observations else None
+                        state, w, replay_result = replay.correct_with_replay(predicted, k, v, beta, write,
+                            ctx.replay_options, observation, replay_target, alpha_s=cfg.alpha_s, eps=cfg.eps,
+                            collect_stats=ctx.clean_mode or ctx.collect_replay_stats or diagnostic is not None)
+                    else:
+                        state, w = correct(predicted, k, v, beta, write, cfg.alpha_s, cfg.eps)
                     raw = q @ state if ctx.sink_reference is None else None
                 elif execution.core_backend == "compiled":
                     from . import compiled
@@ -134,6 +148,10 @@ class TTNAnchor(nn.Module):
                     aux = correct_with_aux(predicted, k, v, beta, write, cfg.alpha_s, cfg.eps)
                     state, w = aux.candidate, aux.w
                     raw = q @ state
+            if ctx.prefill_mode and ctx.clean_mode and ctx.replay_options.active and ctx.replay_options.mode == "observed":
+                if self.index in ctx.replay_captures: raise RuntimeError("observed anchor captured twice")
+                ctx.replay_captures[self.index] = replay.capture_observation(k, v, w, write, ctx.frame_ids,
+                                                                            ctx.replay_options.budget)
             sink_stats = sink_delta = None
             if ctx.sink_reference is not None:
                 reference = ctx.sink_reference[:, self.index]
@@ -231,6 +249,15 @@ class TTNAnchor(nn.Module):
             raw = raw + camera_contribution
         if diagnostic is not None: diagnostic("fused_raw", raw)
         gate = F.silu(self.output_gate(x).float())
+        if replay_result is not None:
+            replay_stats, replay_delta = replay_result
+            delta_raw = (q @ replay_delta).transpose(1, 2).reshape(b, n, c)
+            sink_effective_stats(replay_stats, delta_raw, gate, self.proj, read, self.heads)
+            if ctx.clean_mode:
+                ctx.replay_stats[self.index] = replay_stats
+            elif ctx.collect_replay_stats and ctx.replay_trajectory:
+                ctx.replay_trajectory[-1]["anchors"][self.index] = replay_stats
+            if diagnostic is not None: diagnostic("replay_update", replay_stats)
         if sink_stats is not None:
             sink_effective_stats(sink_stats, sink_delta.transpose(1, 2).reshape(b, n, c), gate,
                                  self.proj, read, self.heads)

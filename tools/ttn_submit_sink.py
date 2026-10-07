@@ -1,4 +1,4 @@
-"""Pinned, single-GPU sink interventions with a verified baseline dependency."""
+"""Pinned single-GPU sink/replay probes with a verified baseline dependency."""
 import argparse
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -19,6 +19,7 @@ from worldttn.core import ANCHORS, TTNConfig
 from worldttn.evaluation import file_sha256, paired_summary
 from worldttn.mechanism_evaluation import atomic_json, IDENTITY, sink_identity
 from worldttn.sink import SinkOptions
+from worldttn.replay import ReplayOptions
 
 REPO = Path(__file__).resolve().parents[1]
 DEFAULT_CASE = REPO / "assets/worldttn/study_static/case.json"
@@ -93,6 +94,10 @@ def check_smoke(root):
 
 
 def interventions(profile="static"):
+    if profile == "observed-replay":
+        return {name: asdict(value) for name, value in {
+            "full": ReplayOptions(), "shrink-025": ReplayOptions("shrink"),
+            "observed-025": ReplayOptions("observed")}.items()}
     if profile not in ("static", "orbit"): raise ValueError("unknown sink profile")
     specs = {"full": SinkOptions(), "zero-010": SinkOptions("zero"),
              "absolute-010": SinkOptions("protected", position="absolute"),
@@ -106,8 +111,10 @@ def prepare(*, training_run=None, evaluation=None, case=None, output=None, fixed
     if bool(training_run) == bool(evaluation):
         raise ValueError("provide exactly one immutable --training-run snapshot or completed --evaluation")
     specs = interventions(profile)
+    if profile == "observed-replay" and not evaluation:
+        raise ValueError("observed replay probe requires a completed dataset evaluation")
     if evaluation:
-        if case is not None or profile != "static": raise ValueError("dataset suite uses its pinned cases")
+        if case is not None or profile == "orbit": raise ValueError("dataset suite uses its pinned cases")
         plan = dict(prepare_mechanisms(evaluation, output, fixed_cases))
         if output is not None: plan["output"] = str(Path(output).resolve())
         plan.update(kind="dataset", source_evaluation=str(Path(evaluation).resolve()), frames=61)
@@ -146,7 +153,7 @@ def prepare(*, training_run=None, evaluation=None, case=None, output=None, fixed
                     cross_attn_backend="math", compile={})
     if Path(plan["output"]).exists(): raise ValueError("use a new sink output directory")
     plan.update(format="TTN-sink-suite-v1", profile=profile, variants=list(specs), interventions=specs,
-                array=f"1-{len(specs)-1}%1")
+                array=f"1-{len(specs)-1}%{2 if profile == 'observed-replay' else 1}")
     return plan
 
 
@@ -205,8 +212,13 @@ def collect(root, *, validating=None):
             continue
         summary = json.loads(path.read_text(encoding="utf-8"))
         protocol = summary["protocol"]
-        if protocol.get("tla_sink") != plan["interventions"][name]:
+        intervention_field = "tla_replay" if plan["profile"] == "observed-replay" else "tla_sink"
+        if protocol.get(intervention_field) != plan["interventions"][name]:
             raise ValueError(f"{name}: sink parameters differ from plan")
+        if plan["profile"] == "observed-replay" and sink_identity(protocol) != {"mode": "off"}:
+            raise ValueError("replay probe must keep the read-time sink disabled")
+        if plan["profile"] != "observed-replay" and ReplayOptions(**protocol.get("tla_replay", {})).active:
+            raise ValueError("sink comparisons require TLA replay off")
         for field in ("checkpoint_sha256", "step", "frames", "steps", "cfg_scale", "cached_blocks", "cross_attn_backend"):
             if protocol.get(field) != plan[field]: raise ValueError(f"{name}: sink protocol differs: {field}")
         if protocol.get("stage") != "C" or protocol.get("history_source") != "generated" or protocol.get("ttn_ablation") != "full":
@@ -235,7 +247,9 @@ def collect(root, *, validating=None):
                   submission=submission,
                   kind=plan["kind"], identity=identity, variants=statuses, results={}, contrasts={},
                   metric_space="none: no future GT" if plan["kind"] == "custom" else "cached LTX latents",
-                  interpretation="same-weight inference interventions; zero controls isolate output shrinkage; single-case results are diagnostic")
+                  interpretation=("same-weight inference; shrink controls current write dilution; no new training; single-case diagnostic"
+                    if plan["profile"] == "observed-replay" else
+                    "same-weight inference interventions; zero controls isolate output shrinkage; single-case results are diagnostic"))
     if "full" not in summaries: return result
     baseline = _rows(summaries["full"], "ttn")
     sana = _rows(summaries["full"], "sana")
@@ -254,10 +268,11 @@ def collect(root, *, validating=None):
         current = _rows(summary, "ttn")
         _paired_identity(baseline, current)
         reference_hashes = []
-        if plan["interventions"][name]["mode"] == "protected":
+        if plan["interventions"][name]["mode"] in ("protected", "observed"):
+            prefix = "replay" if plan["profile"] == "observed-replay" else "sink"
             for row in current.values():
-                digest = row.get("sink_reference_sha256", "")
-                if (row.get("sink_reference_verified") is not True or len(digest) != 64
+                digest = row.get(f"{prefix}_reference_sha256", "")
+                if (row.get(f"{prefix}_reference_verified") is not True or len(digest) != 64
                         or any(c not in "0123456789abcdef" for c in digest)):
                     raise ValueError(f"{name}: protected reference audit missing or failed")
                 reference_hashes.append(dict(case_id=row["case_id"], seed=row["seed"], sha256=digest, verified=True))
@@ -279,11 +294,16 @@ def collect(root, *, validating=None):
             item["prefix_13_matches_baseline"] = checks
             item["gt_metrics"] = {h: paired_summary([dict(r, metrics=r[field]) for table in (sana, current) for r in table.values()])
                                   for h, field in (("long", "metrics"), ("short", "prefix_13_metrics"))}
+        if plan["profile"] == "observed-replay" and name != "full":
+            audits = [check_replay_episode(row, plan["interventions"][name], steps=plan["steps"])
+                      for row in current.values()]
+            item["replay_audit"] = audits
         result["results"][name] = item
     if plan["kind"] == "dataset":
         pairs = [(name, "full") for name in summaries if name != "full"]
         pairs += [(name, zero) for name, zero in (("absolute-010", "zero-010"), ("aligned-010", "zero-010"),
-                                                ("aligned-025", "zero-025")) if name in summaries and zero in summaries]
+                                                ("aligned-025", "zero-025"), ("observed-025", "shrink-025"))
+                  if name in summaries and zero in summaries]
         for a, b in pairs:
             result["contrasts"][f"{a}_minus_{b}"] = {h: {metric: values["ttn"] - result["results"][b]["gt_metrics"][h]["metrics"][metric]["ttn"]
                 if values["ttn"] is not None and result["results"][b]["gt_metrics"][h]["metrics"][metric]["ttn"] is not None else None
@@ -291,6 +311,61 @@ def collect(root, *, validating=None):
     if not failed_submission and len(summaries) == len(plan["variants"]) and all(s["status"] == "completed" for s in statuses.values()):
         result["status"] = "completed"
     return result
+
+
+def check_replay_episode(row, spec, *, steps):
+    """GPU wiring gate: no early update, five active anchors, actual content gradient."""
+    chunks = row["chunks"]
+    from worldttn.training import chunk_ranges
+    if [(c["start"], c["end"]) for c in chunks] != chunk_ranges(61):
+        raise ValueError("replay diagnostic requires the planned 61-latent rollout")
+    if row.get("commits") != len(chunks)+1 or row.get("predictions") != len(chunks)+1:
+        raise ValueError("replay clean transaction counts differ")
+    nonzero_history, nonzero_output = set(), set()
+    for index, chunk in enumerate(chunks):
+        anchors = chunk["anchors"]
+        if len(anchors) != 5 or {a["block"] for a in anchors} != set(ANCHORS):
+            raise ValueError("replay requires all five anchor diagnostics")
+        active = index+1 >= spec["start_chunk"]
+        for anchor in anchors:
+            measured = anchor["replay"]
+            if measured.get("active") is not active:
+                raise ValueError("replay activated at the wrong predicted chunk")
+            if not active:
+                if anchor.get("replay_trajectory"): raise ValueError("replay ran before activation")
+                continue
+            calls = anchor.get("replay_trajectory", [])
+            if [c.get("call") for c in calls] != sorted({0, steps//2, steps-1}):
+                raise ValueError("missing first/middle/last noisy replay measurements")
+            for record in (measured, *calls):
+                if record.get("mode") != spec["mode"] or record.get("strength") != spec["strength"]:
+                    raise ValueError("replay settings differ from plan")
+                if record.get("key_position") != "original-absolute-rope":
+                    raise ValueError("replay key coordinates changed")
+                if record.get("value_transport") != "actual-current-cayley":
+                    raise ValueError("replay targets use a different transport")
+                if record.get("current_scale") != 1/(1+spec["strength"]):
+                    raise ValueError("current write dilution differs from the matched control")
+                if (spec["mode"] == "observed" and (record.get("source") != "observed-prefill-only"
+                        or not 0 < record.get("samples", 0) <= spec["budget"])):
+                    raise ValueError("observed replay source/budget differs")
+                effective = record.get("effective_delta_norm")
+                gradients = record.get("per_head", {}).get("history_gradient_norm", [])
+                if (not isinstance(effective, (int, float)) or not math.isfinite(effective)
+                        or effective < 0 or not gradients):
+                    raise ValueError("missing/nonfinite replay influence metrics")
+                if any(not math.isfinite(x) or x < 0 for branch in gradients for x in branch):
+                    raise ValueError("nonfinite history gradient")
+                if spec["mode"] == "shrink" and any(x != 0 for branch in gradients for x in branch):
+                    raise ValueError("shrink control contains a history gradient")
+            if any(c["effective_delta_norm"] > 0 for c in calls): nonzero_output.add(anchor["block"])
+            if any(x > 0 for c in calls for branch in c["per_head"]["history_gradient_norm"] for x in branch):
+                nonzero_history.add(anchor["block"])
+    if not nonzero_output or spec["mode"] == "observed" and not nonzero_history:
+        raise ValueError("replay has no nonzero noisy-call contribution")
+    return dict(case_id=row["case_id"], seed=row["seed"], status="passed",
+                nonzero_noisy_anchors=sorted(nonzero_output), history_gradient_anchors=sorted(nonzero_history),
+                reference_storage_bytes=row.get("replay_storage_bytes"), measurement="wiring evidence, no quality claim")
 
 
 def _publish(root, *, validating=None):
@@ -343,12 +418,17 @@ def run_variant(root, index):
         spec = plan["interventions"][name]
         args = ["--training-run", plan["snapshot"], "--output", str(root / name), "--steps", str(plan["steps"]),
                 "--cfg-scale", str(plan["cfg_scale"]), "--cached-blocks", str(plan["cached_blocks"]),
-                "--cross-attn-backend", plan["cross_attn_backend"], "--state-diagnostics",
-                "--tla-sink", spec["mode"], "--sink-gain", str(spec["gain"]),
-                "--sink-position", spec["position"], "--sink-start-chunk", str(spec["start_chunk"])]
+                "--cross-attn-backend", plan["cross_attn_backend"], "--state-diagnostics"]
+        if plan["profile"] == "observed-replay":
+            args += ["--tla-replay", spec["mode"], "--replay-strength", str(spec["strength"]),
+                     "--replay-budget", str(spec["budget"]), "--replay-start-chunk", str(spec["start_chunk"])]
+        else:
+            args += ["--tla-sink", spec["mode"], "--sink-gain", str(spec["gain"]),
+                     "--sink-position", spec["position"], "--sink-start-chunk", str(spec["start_chunk"])]
         record["phase"] = "inference"
         atomic_json(status_path, record)
-        print(f"[TTN sink task] variant={name} phase=inference output={root/name}", flush=True)
+        label = "replay" if plan["profile"] == "observed-replay" else "sink"
+        print(f"[TTN {label} task] variant={name} phase=inference output={root/name}", flush=True)
         if plan["kind"] == "custom":
             if file_sha256(plan["case"]) != plan["case_sha256"]: raise ValueError("sink custom case changed")
             if index: args += ["--reuse-baseline", str(root / "full")]
@@ -374,6 +454,18 @@ def run_variant(root, index):
                    "--history-source", "generated", "--ttn-ablation", "full",
                    "--ttn-core-backend", "reference", "--ttn-psi-backend", "reference",
                    "--eval-methods", *(("sana", "ttn") if index == 0 else ("ttn",))])
+            if index and plan["profile"] == "observed-replay":
+                from tools.ttn_decode_comparison import load_pair
+                prefix_checks = []
+                for case in range(plan["eval_cases"]):
+                    _, episode, (baseline, current) = load_pair(root / name, case, 4,
+                        left_evaluation=root / "full", left_method="ttn")
+                    torch.testing.assert_close(current, baseline, atol=1e-5, rtol=1e-4,
+                        msg=lambda message: f"replay changed the first four chunks: {message}")
+                    prefix_checks.append(dict(case_id=episode["case_id"], seed=episode["seed"],
+                        max_abs_difference=float((current-baseline).abs().max())))
+                record["prefix_13_validation"] = dict(status="passed", latent_frames=13,
+                    atol=1e-5, rtol=1e-4, cases=prefix_checks, reference="saved TTN baseline latents")
         record["phase"] = "validate_results"
         atomic_json(status_path, record)
         _publish(root, validating=name)
@@ -404,12 +496,15 @@ def submit(plan, *, partition="day", root=None):
            and key not in ("RANK", "LOCAL_RANK", "WORLD_SIZE", "NODE_RANK", "LOCAL_WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT",
                            "CUDA_VISIBLE_DEVICES", "TTN_ENTRY_MODULE", "COMMAND", "ADAPTER", "CONFIG", "SANA_CONFIG", "BASE_WEIGHTS",
                            "TTN_CORE_BACKEND", "TTN_PSI_BACKEND", "CAMERA_ATTENTION", "CAMERA_ABLATION", "NOISE_FRAMES",
-                           "TLA_SINK", "SINK_GAIN", "SINK_POSITION", "SINK_START_CHUNK", "HISTORY_SOURCE", "TTN_ABLATION")}
+                           "TLA_SINK", "SINK_GAIN", "SINK_POSITION", "SINK_START_CHUNK", "HISTORY_SOURCE", "TTN_ABLATION",
+                           "TLA_REPLAY", "REPLAY_STRENGTH", "REPLAY_BUDGET", "REPLAY_START_CHUNK")}
     env.update(ROOT=str(root), PROJECT_ROOT=str(REPO), PYTHON=str(root / "envs/worldttn/bin/python"), SINK_OUTPUT=str(output))
     for key in ("GDN_DISABLE_COMPILE", "GDN_DISABLE_COMPLEX_COMPILE"):
         if plan.get("compile", {}).get(key) is not None: env[key] = plan["compile"][key]
     command = ["sbatch", "--parsable", "--export=ALL", f"--partition={partition}", f"--chdir={REPO}",
                f"--output={output}/slurm-%A_%a.out"]
+    if plan["profile"] == "observed-replay":
+        command += ["--job-name=ttn-replay", "--time=01:00:00"]
     jobs = {}
     try:
         response = subprocess.run([*command, str(REPO / "tools/ttn_slurm_sink.sbatch")], env=env, capture_output=True, text=True, check=True)
@@ -437,7 +532,7 @@ def main(argv=None):
     parser.add_argument("--case")
     parser.add_argument("--fixed-cases")
     parser.add_argument("--output")
-    parser.add_argument("--profile", choices=("static", "orbit"), default="static")
+    parser.add_argument("--profile", choices=("static", "orbit", "observed-replay"), default="static")
     parser.add_argument("--partition", default="day")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--collect", type=Path)

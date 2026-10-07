@@ -7,7 +7,7 @@ from .core import ANCHORS, TTNConfig, Rank2Generators, CayleyFactors, DetachedCa
 from .performance import DEFAULT_EXECUTION, annotation, validate_execution
 from .stability import committed_anchor_stats, matrix_scale, write_direction_stats
 from .controller import TransitionController
-from . import sink
+from . import sink, replay
 
 
 class TTNSystem(nn.Module):
@@ -56,6 +56,16 @@ class TTNChunkContext:
     sink_trajectory: list = field(default_factory=list)
     noise_call_count: int = 0
     collect_sink_stats: bool = False
+    replay_options: replay.ReplayOptions = field(default_factory=replay.ReplayOptions)
+    replay_observations: tuple = ()
+    replay_previous_values: torch.Tensor | None = None
+    replay_values: torch.Tensor | None = None
+    replay_active: bool = False
+    replay_captures: dict = field(default_factory=dict)
+    replay_stats: dict = field(default_factory=dict)
+    replay_trajectory: list = field(default_factory=list)
+    replay_call_count: int = 0
+    collect_replay_stats: bool = False
 
     def for_clean(self):
         return TTNChunkContext(self.predicted, self.previous, self.psi, self.cbase, self.system, self.frame_ids,
@@ -66,7 +76,10 @@ class TTNChunkContext:
                                collect_local_stats=self.collect_local_stats, local_trajectory=self.local_trajectory,
                                sink_options=self.sink_options, sink_reference=self.sink_reference,
                                sink_shift=self.sink_shift, sink_trajectory=self.sink_trajectory,
-                               sink_reference_sha256=self.sink_reference_sha256)
+                               sink_reference_sha256=self.sink_reference_sha256,
+                               replay_options=self.replay_options, replay_observations=self.replay_observations,
+                               replay_previous_values=self.replay_previous_values, replay_values=self.replay_values,
+                               replay_active=self.replay_active, replay_trajectory=self.replay_trajectory)
 
     def token_masks(self, n):
         f = self.frame_ids.shape[-1]
@@ -122,12 +135,21 @@ class TTNRuntimeState:
     sink_reference: torch.Tensor | None = None
     sink_reference_sha256: str | None = None
     sink_reference_verified: bool | None = None
+    replay_options: replay.ReplayOptions = field(default_factory=replay.ReplayOptions)
+    replay_observations: tuple = ()
+    replay_values: torch.Tensor | None = None
+    replay_reference_sha256: str | None = None
+    replay_reference_verified: bool | None = None
 
     @classmethod
     def create(cls, config, batch_size, device, *, ablation="full", diagnostics=False, collect_local_stats=False,
-               sink_options=None):
+               sink_options=None, replay_options=None):
         sink_options = sink.SinkOptions() if sink_options is None else sink_options
         sink.validate_sink(sink_options, config, ablation)
+        replay_options = replay.ReplayOptions() if replay_options is None else replay_options
+        replay.validate_replay(replay_options, config, ablation)
+        if replay_options.active and sink_options.active:
+            raise ValueError("run observed replay and read-time sink in separate experiments")
         if ablation not in ("full", "no-ttt", "identity", "no-local", "no-persistent"):
             raise ValueError("unknown TTN runtime ablation")
         if ablation in ("no-local", "no-persistent") and not (config.local_update or config.persistent_meta):
@@ -145,7 +167,7 @@ class TTNRuntimeState:
         pose = torch.eye(4, device=device).expand(batch_size, 4, 4).clone()
         return cls(config, s, psi, pose, [set() for _ in range(batch_size)],
                    ablation=ablation, diagnostics=diagnostics, collect_local_stats=collect_local_stats,
-                   sink_options=sink_options)
+                   sink_options=sink_options, replay_options=replay_options)
 
     def reset(self):
         self.world_state = torch.zeros_like(self.world_state)
@@ -162,6 +184,9 @@ class TTNRuntimeState:
         self.sink_reference = None
         self.sink_reference_sha256 = None
         self.sink_reference_verified = None
+        self.replay_observations = ()
+        self.replay_values = None
+        self.replay_reference_sha256 = self.replay_reference_verified = None
 
     def begin_chunk(self, system, poses, intrinsics, frame_ids, valid_mask, width, height, prefill=False, *, rope=None):
         if system.config != self.config: raise ValueError("runtime/system configurations differ")
@@ -179,6 +204,7 @@ class TTNRuntimeState:
         previous_pose = poses[:, 0] if prefill else self.previous_committed_pose
         options = getattr(system, "ttn_execution", DEFAULT_EXECUTION)
         sink.validate_sink(self.sink_options, self.config, self.ablation, options)
+        replay.validate_replay(self.replay_options, self.config, self.ablation, options)
         meta = self.config.local_update or self.config.persistent_meta
         validate_execution(options, self.config.stage, self.ablation, self.diagnostics, meta=meta)
         reference = shift = None
@@ -195,6 +221,7 @@ class TTNRuntimeState:
                     reference = sink.realign_reference(reference, rope, shift)
         snapshot = None
         live_factors = None
+        replay_values = self.replay_values
         history = self.write_history
         with annotation(options, "Predict"), torch.autocast(device_type=self.world_state.device.type, enabled=False):
             if self.config.stage == "A" or prefill or self.ablation == "identity":
@@ -206,6 +233,8 @@ class TTNRuntimeState:
                                  if self.config.stage == "C" and self.ablation in ("full", "no-local") else 0)
                 live_factors = CayleyFactors(system.generators.u.float(), system.generators.v.float(), coeff)
                 predicted = live_factors.right(self.world_state)
+                if replay_values is not None:
+                    replay_values = live_factors.right(replay_values)
                 with torch.no_grad():
                     history = tuple((raw, live_factors.right(aligned).detach()) for raw, aligned in history)
                 if options.core_backend != "reference" and self.config.stage == "C":
@@ -224,21 +253,29 @@ class TTNRuntimeState:
                                self.revision,
                                id(self),
                                prefill_mode=prefill, begin_id=self.predict_count, psi_snapshot=snapshot,
-                               write_history=history, live_factors=live_factors if meta else None,
+                               write_history=history, live_factors=live_factors if meta or self.replay_options.active else None,
                                ablation=self.ablation, collect_local_stats=self.collect_local_stats or self.diagnostics,
                                sink_options=self.sink_options, sink_reference=reference, sink_shift=shift,
-                               sink_reference_sha256=self.sink_reference_sha256)
+                               sink_reference_sha256=self.sink_reference_sha256,
+                               replay_options=self.replay_options, replay_observations=self.replay_observations,
+                               replay_previous_values=self.replay_values, replay_values=replay_values,
+                               replay_active=self.replay_options.active and not prefill
+                                   and self.commit_count >= self.replay_options.start_chunk)
 
     def prefill(self, context):
         if self.prefilled or self.commit_count: raise RuntimeError("initial image can only be prefilled once")
         if self.sink_options.active and not context.prefill_mode:
             raise RuntimeError("sink reference requires an observed-frame prefill transaction")
+        if self.replay_options.active and not context.prefill_mode:
+            raise RuntimeError("replay requires an observed-frame prefill transaction")
         self.commit_chunk(context)
         self.prefilled = True
 
     def commit_chunk(self, context):
         sink.validate_sink(self.sink_options, self.config, self.ablation,
                            getattr(context.system, "ttn_execution", DEFAULT_EXECUTION))
+        replay.validate_replay(self.replay_options, self.config, self.ablation,
+                              getattr(context.system, "ttn_execution", DEFAULT_EXECUTION))
         if not context.clean_mode or context.revision != self.revision or context.runtime_id != id(self):
             raise RuntimeError("not a current clean transaction")
         if context.psi_snapshot is not None:
@@ -256,6 +293,18 @@ class TTNRuntimeState:
             states.append(s)
             gradients.append(g)
         new_state = torch.stack(states, 1)
+        observations, replay_values = self.replay_observations, context.replay_values
+        replay_hash = self.replay_reference_sha256
+        if self.replay_options.active and self.replay_options.mode == "observed":
+            if context.prefill_mode:
+                if self.prefilled or self.commit_count or set(context.replay_captures) != set(range(5)):
+                    raise RuntimeError("all five observed replay captures must finish exactly once")
+                observations = tuple(context.replay_captures[i] for i in range(5))
+                replay_values = torch.stack([item.value for item in observations], 1)
+                replay_hash = replay.observation_digest(observations)
+            if (not observations or replay_values is None or not torch.isfinite(replay_values).all()
+                    or replay_values.shape != (observations[0].value.shape[0], 5, *observations[0].value.shape[1:])):
+                raise ValueError("invalid observed replay targets; transaction not committed")
         reference = self.sink_reference
         reference_hash = self.sink_reference_sha256
         if self.sink_options.active and self.sink_options.mode == "protected" and context.prefill_mode:
@@ -271,6 +320,13 @@ class TTNRuntimeState:
             raise ValueError("nonfinite or non-FP32 Persistent psi; transaction not committed")
         anchor_stats = [committed_anchor_stats(context.candidates[i][2], self.transition_fast[:, i], psi[:, i],
                         grad[:, i], scale[:, i], context.cbase[:, i], ANCHORS[i], context.prefill_mode) for i in range(5)]
+        if self.replay_options.active:
+            for i, stats in enumerate(anchor_stats):
+                stats["replay"] = context.replay_stats.get(i, {"active": False, "mode": self.replay_options.mode,
+                    "reason": "prefill/before activation"})
+                if context.replay_trajectory:
+                    stats["replay_trajectory"] = [{key: value for key, value in call.items() if key != "anchors"} |
+                        call["anchors"][i] for call in context.replay_trajectory if i in call["anchors"]]
         if self.sink_options.active:
             for i, stats in enumerate(anchor_stats):
                 stats["sink"] = context.sink_stats.get(i, {"active": False, "mode": self.sink_options.mode,
@@ -321,6 +377,8 @@ class TTNRuntimeState:
         self.world_state = new_state
         self.sink_reference = reference
         self.sink_reference_sha256 = reference_hash
+        self.replay_observations, self.replay_values = observations, replay_values
+        self.replay_reference_sha256 = replay_hash
         self.write_history = history
         self.transition_fast = psi
         self.previous_committed_pose = previous_pose
@@ -339,6 +397,8 @@ class TTNRuntimeState:
             "anchors": anchor_stats
         }
         if self.diagnostics or self.ablation != "full": self.last_stats["ablation"] = self.ablation
+        if self.replay_options.active:
+            self.last_stats["replay_storage_bytes"] = replay.storage_bytes(observations, replay_values)
 
     def detach(self):
         self.world_state = self.world_state.detach()
@@ -350,3 +410,9 @@ class TTNRuntimeState:
         if sink.reference_sha256(self.sink_reference) != self.sink_reference_sha256:
             raise RuntimeError("protected sink reference changed during the episode")
         return self.sink_reference_sha256
+
+    def verify_replay_reference(self):
+        if not self.replay_observations: return None
+        if replay.observation_digest(self.replay_observations) != self.replay_reference_sha256:
+            raise RuntimeError("observed replay reference changed during the episode")
+        return self.replay_reference_sha256

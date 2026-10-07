@@ -155,7 +155,7 @@ def train_update(model, config, batch, optimizer, k, parallel=None, *, activatio
 @torch.no_grad()
 def rollout(model, config, batch, steps=4, cfg_scale=4.5, cached_blocks=-1, *, initial_noise=None, on_chunk=None,
             ttn_ablation="full", state_diagnostics=False, history_reference=None, on_state=None,
-            history_source=None, sink_options=None):
+            history_source=None, sink_options=None, replay_options=None):
     from diffusion.scheduler.self_forcing_flow_euler_sampler import SelfForcingFlowEulerCamCtrl
     initial = batch.get("initial_latent")
     if initial is None: initial = batch["clean_latents"][:, :, :1]
@@ -181,6 +181,9 @@ def rollout(model, config, batch, steps=4, cfg_scale=4.5, cached_blocks=-1, *, i
             raise ValueError("GT-history reference must stay on CPU with the exact rollout shape")
         if not torch.isfinite(history_reference).all() or not torch.equal(history_reference[:, :, :1], initial.cpu()):
             raise ValueError("GT-history reference is nonfinite or has a different observed frame")
+    if replay_options is not None and replay_options.active:
+        if not hasattr(model, "ttn_system") or history_source != "generated":
+            raise ValueError("observed replay requires a TTN model with generated history")
     if initial_noise is not None:
         if tuple(initial_noise.shape) != shape or initial_noise.device != initial.device:
             raise ValueError("initial noise shape/device must match the rollout")
@@ -191,7 +194,9 @@ def rollout(model, config, batch, steps=4, cfg_scale=4.5, cached_blocks=-1, *, i
     extras = {"chunk_plucker": batch["chunk_plucker"]} if "chunk_plucker" in batch else {}
     session = TTNSession(model, batch["camera_conditions"], batch["width"], batch["height"],
                          batch.get("frame_valid_mask"), extras, ablation=ttn_ablation,
-                         diagnostics=state_diagnostics, **({"sink_options": sink_options} if sink_options is not None else {})) if hasattr(model, "ttn_system") else None
+                         diagnostics=state_diagnostics,
+                         **({"sink_options": sink_options} if sink_options is not None else {}),
+                         **({"replay_options": replay_options} if replay_options is not None else {})) if hasattr(model, "ttn_system") else None
     from .session import repeat_batch
     cfg_batch = initial.shape[0] * (2 if cfg_scale > 1 else 1)
     camera = repeat_batch(batch["camera_conditions"], cfg_batch).clone()
@@ -258,6 +263,9 @@ def rollout(model, config, batch, steps=4, cfg_scale=4.5, cached_blocks=-1, *, i
         if session.runtime.sink_options.active and session.runtime.sink_reference is not None:
             session.runtime.verify_sink_reference()
             session.runtime.sink_reference_verified = True
+        if session.runtime.replay_observations:
+            session.runtime.verify_replay_reference()
+            session.runtime.replay_reference_verified = True
     if not torch.equal(noise[:, :, :1], initial.float()): raise AssertionError("initial frame was modified")
     return noise, session.runtime if session is not None else None, records
 
@@ -879,9 +887,12 @@ def main(argv=None):
     parser.add_argument("--latent-width", type=int, default=40)
     from .sink import add_sink_arguments, sink_options_from_args
     add_sink_arguments(parser)
+    from .replay import add_replay_arguments, replay_options_from_args
+    add_replay_arguments(parser)
     args = parser.parse_args(argv)
     try:
         sink = sink_options_from_args(args)
+        replay = replay_options_from_args(args)
     except ValueError as error:
         parser.error(str(error))
     try:
@@ -891,7 +902,8 @@ def main(argv=None):
     if args.benchmark_save_checkpoint and (args.command != "train" or not benchmark_run(args)):
         parser.error("--benchmark-save-checkpoint requires a train benchmark/profiler/layout run")
     if args.command != "evaluate" and (args.ttn_ablation != "full" or args.history_source != "generated"
-            or args.state_diagnostics or args.eval_methods != ["sana", "ttn"] or args.tla_sink != "off"):
+            or args.state_diagnostics or args.eval_methods != ["sana", "ttn"] or args.tla_sink != "off"
+            or args.tla_replay != "off"):
         parser.error("mechanism interventions are evaluate-only; training semantics are unchanged")
     if args.history_source in ("ttn-gt", "native-gt") and args.eval_methods != ["ttn"]:
         parser.error("mixed history interventions require TTN-only --eval-methods ttn")

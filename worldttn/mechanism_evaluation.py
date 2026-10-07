@@ -72,6 +72,9 @@ def collect_mechanisms(output):
         if not path.is_file(): continue
         summary = json.loads(path.read_text())
         protocol = summary["protocol"]
+        from .replay import ReplayOptions
+        if ReplayOptions(**protocol.get("tla_replay", {})).active:
+            raise ValueError("mechanism/history comparisons require TLA replay off")
         if (protocol["ttn_ablation"], protocol["history_source"], protocol["eval_methods"]) != (ablation, history, methods):
             raise ValueError(f"{name}: wrong runtime intervention/history/methods")
         if not protocol["state_diagnostics"] or protocol["stage"] != "C":

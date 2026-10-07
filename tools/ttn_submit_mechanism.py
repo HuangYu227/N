@@ -27,6 +27,9 @@ def prepare(evaluation, output=None, fixed_cases=None, suite="mechanisms"):
     from worldttn.mechanism_evaluation import sink_identity, suite_variants
     if sink_identity(protocol) != {"mode": "off"}:
         raise ValueError("source evaluation must have TLA sink off")
+    from worldttn.replay import ReplayOptions
+    if ReplayOptions(**protocol.get("tla_replay", {})).active:
+        raise ValueError("source evaluation must have TLA replay off")
     variants = suite_variants(suite, any(protocol.get("meta_ttt", {}).values()))
     snapshot = Path(protocol["training_run"])
     metadata = json.loads((snapshot / "snapshot.json").read_text())

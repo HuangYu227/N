@@ -30,6 +30,19 @@ def validate_inference_interventions(args, config):
     """Reject incompatible diagnostic combinations before loading cases/models."""
     from .sink import sink_options_from_args
     sink = sink_options_from_args(args)
+    from .replay import replay_options_from_args, validate_replay
+    from .performance import ExecutionOptions
+    replay = replay_options_from_args(args)
+    if replay.active:
+        validate_replay(replay, config, getattr(args, "ttn_ablation", "full"),
+            ExecutionOptions(getattr(args, "ttn_core_backend", "reference"),
+                             getattr(args, "ttn_psi_backend", "reference")), check_grad=False)
+        if (sink.active or getattr(args, "history_source", "generated") != "generated"
+                or "ttn" not in getattr(args, "eval_methods", ["sana", "ttn"])
+                or getattr(args, "camera_ablation", False)
+                or getattr(args, "camera_attention", None) not in (None, "sana")
+                or getattr(args, "ttn_compare_reference", False)):
+            raise ValueError("observed replay requires generated TTN history without sink/camera/backend interventions")
     history = getattr(args, "history_source", "generated")
     if history not in HISTORY_ACCESS:
         raise ValueError("unknown clean history source")
@@ -370,6 +383,8 @@ def evaluate_command(args):
     methods = getattr(args, "eval_methods", ("sana", "ttn"))
     diagnostics = getattr(args, "state_diagnostics", False)
     sink = validate_inference_interventions(args, ttn)
+    from .replay import replay_options_from_args
+    replay = replay_options_from_args(args)
     if ablation != "full" and ttn.stage != "C": raise ValueError("mechanism ablations require a Stage C checkpoint")
     if getattr(args, "ttn_compare_reference", False):
         if tuple(methods) != ("sana", "ttn") or ablation != "full" or diagnostics:
@@ -409,6 +424,7 @@ def evaluate_command(args):
                 "stage": ttn.stage, "step": last_train["step"], "frames": args.frames, "steps": args.steps,
                 "ttn_ablation": ablation, "history_source": history, "eval_methods": list(methods),
                 "tla_sink": asdict(sink),
+                "tla_replay": asdict(replay),
                 "meta_ttt": {"local_update": ttn.local_update, "persistent_meta": ttn.persistent_meta},
                 "state_diagnostics": diagnostics,
                 "history_access": HISTORY_ACCESS[history],
@@ -483,6 +499,8 @@ def evaluate_command(args):
                 runtime_options.update(ttn_ablation=ablation, state_diagnostics=diagnostics)
             if method == "ttn" and sink.active:
                 runtime_options["sink_options"] = sink
+            if method == "ttn" and replay.active:
+                runtime_options["replay_options"] = replay
             if history != "generated":
                 runtime_options.update(history_reference=gt, history_source=history)
             (generated, runtime, chunks), timing = timed_cuda(lambda: rollout(
@@ -502,6 +520,10 @@ def evaluate_command(args):
                    "sink_reference_sha256": getattr(runtime, "sink_reference_sha256", None),
                    "sink_reference_verified": getattr(runtime, "sink_reference_verified", None)
                        if getattr(runtime, "sink_reference_sha256", None) is not None else None}
+            if replay.active and method == "ttn":
+                row.update(replay_reference_sha256=runtime.replay_reference_sha256,
+                           replay_reference_verified=runtime.replay_reference_verified,
+                           replay_storage_bytes=chunks[-1]["replay_storage_bytes"])
             if diagnostics and args.frames >= 13:
                 row["prefix_13_metrics"] = latent_metrics(generated[:, :, :13], gt[:, :, :13],
                     [p for p in case["revisit_pairs"] if p["frame_b"] < 13], **metric_options)
