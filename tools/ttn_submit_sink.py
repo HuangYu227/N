@@ -33,8 +33,10 @@ def check_smoke(root):
                     camera_attention="sana", history_source="generated", ttn_ablation="full",
                     execution="reference/reference", state_diagnostics=True,
                     tla_sink=asdict(SinkOptions("protected")))
-    if any(protocol.get(key) != value for key, value in expected.items()):
-        raise ValueError("smoke requires step100, 16 latents, four solver steps and protected .1 temporal-realign from chunk5")
+    mismatches = {key: {"actual": protocol.get(key, "<missing>"), "expected": value}
+                  for key, value in expected.items() if protocol.get(key) != value}
+    if mismatches:
+        raise ValueError("smoke protocol mismatch: " + json.dumps(mismatches, ensure_ascii=False))
     cfg = protocol.get("cfg_scale")
     if isinstance(cfg, bool) or not isinstance(cfg, (int, float)) or not math.isfinite(cfg) or cfg < 1:
         raise ValueError("invalid smoke CFG")

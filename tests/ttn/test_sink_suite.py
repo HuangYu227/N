@@ -65,6 +65,21 @@ def test_smoke_checks_actual_noisy_effect_and_cli_publishes_report(tmp_path, cfg
     assert '"status": "passed"' in capsys.readouterr().out
 
 
+def test_smoke_protocol_error_identifies_changed_and_missing_fields(tmp_path):
+    from tools.ttn_submit_sink import main
+    result = smoke_result(tmp_path)
+    result["protocol"]["steps"] = 20
+    result["protocol"].pop("state_diagnostics")
+    (tmp_path / "summary.json").write_text(json.dumps(result))
+    with pytest.raises(ValueError, match="smoke protocol mismatch"):
+        main(["--check-smoke", str(tmp_path)])
+    failure = json.loads((tmp_path / "smoke-validation.json").read_text())
+    mismatch = json.loads(failure["error"].split(": ", 1)[1])
+    assert mismatch == {"steps": {"actual": 20, "expected": 4},
+                        "state_diagnostics": {"actual": "<missing>", "expected": True}}
+    assert failure["status"] == "failed" and failure["first_exception"]
+
+
 @pytest.mark.parametrize("corrupt", ["early", "fifth", "missing-anchor", "shift", "mode", "gain", "position",
     "hash", "unverified", "zero-noisy", "missing-noisy", "nan", "commit", "video"])
 def test_smoke_rejects_inactive_or_ineffective_sink_and_records_failure(tmp_path, corrupt):
