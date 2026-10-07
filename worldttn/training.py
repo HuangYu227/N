@@ -1,9 +1,75 @@
 """Causal clean-history training, one optimizer step per clip, explicit TBPTT windows."""
 from contextlib import nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, replace
+import math
 import torch
 from .session import TTNSession, carry_cache
 from .cuda_debug import trace_backward
+
+
+def history_settings(value=None):
+    """An explicit training protocol, included verbatim in exact-resume identity."""
+    defaults = {"source": "gt", "steps": 4, "flow_shift": 9.8, "cached_chunks": -1, "cfg_scale": 1.}
+    value = {} if value is None else value
+    if not isinstance(value, dict): raise ValueError("history_training must be a mapping")
+    if set(value) - set(defaults): raise ValueError("unknown history_training setting")
+    result = defaults | value
+    if result["source"] not in ("gt", "generated"): raise ValueError("history source must be gt or generated")
+    if isinstance(result["steps"], bool) or not isinstance(result["steps"], int) or result["steps"] < 1:
+        raise ValueError("history steps must be a positive integer")
+    if (isinstance(result["flow_shift"], bool) or not isinstance(result["flow_shift"], (int, float))
+            or not math.isfinite(result["flow_shift"]) or result["flow_shift"] <= 0):
+        raise ValueError("history flow shift must be positive and finite")
+    if (isinstance(result["cached_chunks"], bool) or not isinstance(result["cached_chunks"], int)
+            or result["cached_chunks"] not in (-1, 1, 2)):
+        raise ValueError("history cached_chunks must be -1, 1 or 2")
+    if isinstance(result["cfg_scale"], bool) or result["cfg_scale"] != 1.:
+        raise ValueError("generated-history training currently requires conditional CFG=1")
+    return result
+
+
+def _history_scheduler(steps, shift, device):
+    # Same installed scheduler and per-token sign convention as the native sampler.
+    from diffusers import FlowMatchEulerDiscreteScheduler
+    scheduler = FlowMatchEulerDiscreteScheduler(shift=shift)
+    scheduler.set_timesteps(steps, device=device)
+    return scheduler
+
+
+@torch.no_grad()
+def generate_history_chunk(session, initial_noise, observed, y, context, cache, start, end,
+                           mask, data_info, protocol):
+    """Stop-gradient rollout; only the later clean transaction changes history.
+
+    No future GT argument exists. The live training context and native caches
+    are isolated so solver calls cannot overwrite their tensors or telemetry.
+    """
+    from .history import _clone_tree
+    probe = replace(context, **{f.name: _clone_tree(getattr(context, f.name))
+                                for f in fields(context) if f.name != "system"})
+    probe.collect_local_stats = False
+    scratch = _clone_tree(cache)
+    x = initial_noise.detach().clone()
+    if start == 0: x[:, :, :1] = observed
+    scheduler = _history_scheduler(protocol["steps"], protocol["flow_shift"], x.device)
+    b, c, frames, h, w = x.shape
+    # A no-grad cast must never poison the following live AMP weight cache.
+    with torch.autocast(device_type=x.device.type, enabled=torch.is_autocast_enabled(x.device.type),
+                        dtype=torch.get_autocast_dtype(x.device.type), cache_enabled=False):
+        for i, timestep in enumerate(scheduler.timesteps):
+            t = timestep.to(x.device).float().expand(b, 1, frames).clone()
+            if start == 0: t[:, :, 0] = 0
+            sigma = scheduler.sigmas[i].to(x.device).expand_as(t).clone()
+            if start == 0: sigma[:, :, 0] = 0
+            prediction, _ = session.forward(x, t, y, probe, [list(s) for s in scratch], start, end,
+                                            mask, data_info, noise_sigma=sigma)
+            token_t = t[:, 0, :, None].expand(b, frames, h*w).reshape(b, -1)
+            x = scheduler.step(-prediction.float().flatten(2).transpose(1, 2), timestep,
+                               x.float().flatten(2).transpose(1, 2), per_token_timesteps=token_t,
+                               return_dict=False)[0].transpose(1, 2).reshape(b, c, frames, h, w)
+            if start == 0: x[:, :, :1] = observed
+            if not torch.isfinite(x).all(): raise FloatingPointError("nonfinite generated training history")
+    return x
 
 
 def activation_storage(mode):
@@ -119,6 +185,8 @@ class ClipTrainingContext:
     total_loss: float = 0.
     memory_callback: object = None
     prefill_stats: dict = field(default_factory=dict)
+    history: dict = field(default_factory=history_settings)
+    history_noise: torch.Tensor | None = None
 
 
 class TTNTrainingWindow(torch.nn.Module):
@@ -148,6 +216,14 @@ class TTNTrainingWindow(torch.nn.Module):
         for index in range(first, last):
             start, end = episode.ranges[index]
             context = session.begin_chunk(start, end)
+            if episode.history["source"] == "generated":
+                _memory_phase(episode.memory_callback, "history_generate_begin", chunk=index)
+                clean_history = generate_history_chunk(session, episode.history_noise[:, :, start:end],
+                    episode.clean[:, :, :1], episode.y, context, episode.cache, start, end,
+                    episode.mask, episode.data_info, episode.history)
+                _memory_phase(episode.memory_callback, "history_generate_end", chunk=index)
+            else:
+                clean_history = episode.clean[:, :, start:end]
             lm = episode.loss_valid[:, None, start:end, None, None].to(torch.float32)
             callback = (lambda output, i=index: on_prediction(i, output)) if on_prediction else None
             _memory_phase(episode.memory_callback, "noisy_begin", chunk=index, start=start, end=end)
@@ -160,12 +236,16 @@ class TTNTrainingWindow(torch.nn.Module):
             losses_in_window.append(loss)
             episode.total_loss += float(loss.detach())
             _memory_phase(episode.memory_callback, "noisy_end", chunk=index, start=start, end=end)
-            # The current GT clean chunk becomes history only AFTER its noisy prediction.
+            # The clean transaction is live; the generated sample itself is stop-gradient.
             _memory_phase(episode.memory_callback, "clean_begin", chunk=index, start=start, end=end)
             with annotation(execution, "CleanForward"):
-                _, episode.cache = session.clean_forward(episode.clean[:, :, start:end], episode.y, context,
-                                                          episode.cache, start, end, episode.mask, episode.data_info)
-            episode.records.append(dict(session.runtime.last_stats, chunk=index, start=start, end=end))
+                _, episode.cache = session.clean_forward(clean_history, episode.y, context,
+                                                          episode.cache, start, end, episode.mask, episode.data_info,
+                                                          cached_chunks=episode.history["cached_chunks"])
+            episode.records.append(dict(session.runtime.last_stats, chunk=index, start=start, end=end,
+                history_source=episode.history["source"],
+                history_generation_steps=episode.history["steps"] if episode.history_noise is not None else 0,
+                clean_history_rms=float(clean_history.detach().float().square().mean().sqrt())))
             _memory_phase(episode.memory_callback, "clean_end", chunk=index, start=start, end=end)
         return torch.stack(losses_in_window).sum()
 
@@ -193,10 +273,18 @@ def train_clip(model,
                parallel=None,
                activation_offload="none",
                memory_callback=None,
-               audit_update=False):
+               audit_update=False,
+               history_training=None):
     if tbptt not in (1, 2, 4): raise ValueError("reference TBPTT supports K=1,2,4")
     if activation_offload not in ("none", "cpu"): raise ValueError("activation_offload must be none or cpu")
     b, _, frames, _, _ = clean.shape
+    history = history_settings(history_training if history_training is not None
+                               else getattr(model, "ttn_history_training", None))
+    if history["source"] == "generated" and (frames < 4 or frames % 3 != 1 or chunk_size != 3):
+        raise ValueError("generated history requires 1+3n frames and chunk size 3")
+    if history["source"] == "generated" and data_info and any(
+            key in data_info for key in ("image_vae_embeds", "image_embeds")):
+        raise ValueError("generated history accepts initial latent conditioning only; image extras need a leakage audit")
     if timesteps.ndim == 1: timesteps = timesteps[:, None, None].expand(b, 1, frames).clone()
     if timesteps.shape != (b, 1, frames) or noise.shape != clean.shape:
         raise ValueError("noise/timestep dimensions mismatch")
@@ -214,6 +302,9 @@ def train_clip(model,
     episode = ClipTrainingContext(session, clean, y, timesteps, noise, loss_valid, total,
                                   chunk_ranges(frames, chunk_size), [[None] * 10 for _ in model.blocks], mask, data_info,
                                   memory_callback=memory_callback)
+    episode.history = history
+    # Independent of flow-supervision noise. Global RNG is saved by the existing checkpoint path.
+    if history["source"] == "generated": episode.history_noise = torch.randn_like(clean)
     runner = parallel.window if parallel else window_model
     if runner is None: runner = TTNTrainingWindow(model, loss_fn)
     if parallel: parallel.validate_schedule(frames, tbptt, len(episode.ranges), b)
@@ -249,6 +340,8 @@ def train_clip(model,
             _memory_phase(memory_callback, "backward_end", first=first, last=last)
         runtime.detach()
         episode.cache = carry_cache(episode.cache, model.ttn_system.config.camera_attention)
+    runtime.verify_sink_reference()
+    runtime.verify_replay_reference()
     params = [p for p in model.parameters() if p.requires_grad]
     grad_norm = parallel.clip_grad_norm(outer_clip) if parallel else torch.nn.utils.clip_grad_norm_(
         params, outer_clip, error_if_nonfinite=True)

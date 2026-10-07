@@ -99,3 +99,27 @@ def test_meta_modes_require_stage_c_and_default_to_legacy():
         with pytest.raises(ValueError, match="Stage C"):
             core.TTNConfig(**{field: True})
         assert getattr(core.TTNConfig(stage="C", **{field: True}), field)
+
+
+def test_rotation_is_blind_to_radial_error_but_direct_s_can_correct_it():
+    # Even the COMPLETE skew basis cannot change singular values: more psi
+    # coefficients do not fix this limitation. This is not a broken gradient.
+    d = 4
+    eye = torch.eye(d, dtype=torch.float64)
+    pairs = torch.combinations(torch.arange(d))
+    u, vgen = eye[pairs[:, 0]], eye[pairs[:, 1]]
+    c = torch.zeros(len(pairs), dtype=torch.float64, requires_grad=True)
+    state = eye.clone()
+    k, v = eye, 2 * eye
+    w = torch.ones(d, dtype=eye.dtype)
+    mask = torch.ones(d, dtype=torch.bool)
+    factors = core.CayleyFactors(u, vgen, c)
+    loss, h = core.innovation_objective(factors.right(state), k, v, w, mask, normalized=True)
+    analytic = core.coefficient_gradient(state, h, factors.p, factors.l)
+    oracle = torch.autograd.grad(loss.sum(), c)[0]
+    assert loss > .24 and h.norm() > 0
+    torch.testing.assert_close(analytic, oracle, atol=1e-12, rtol=0)
+    assert analytic.count_nonzero() == 0
+    corrected, _ = core.correct(state, k, v, .5 * w, mask, alpha_s=.5)
+    after, _ = core.innovation_objective(corrected, k, v, w, mask, normalized=True)
+    assert after < loss and not torch.equal(corrected, state)

@@ -1,0 +1,18 @@
+{
+  "sana_config": "configs/worldttn/sana_teacher_single_gpu.yaml",
+  "ttn": {
+    "heads": 20, "head_dim": 112, "generators": 16,
+    "alpha_s": 0.5, "eps": 0.000001, "delta_psi": 1,
+    "eta_psi": 0.01, "inner_clip": 1, "stage": "C", "camera_attention": "sana",
+    "local_update": true, "persistent_meta": true, "persistent_update": true,
+    "sink_gain": 0.25, "sink_position": "temporal-realign",
+    "replay_strength": 0.25, "replay_budget": 128, "memory_start_chunk": 5
+  },
+  "training_latent_frames": 25,
+  "tbptt": 4,
+  "learning_rate": 0.00001,
+  "history_training": {
+    "source": "generated", "steps": 4, "flow_shift": 9.8,
+    "cached_chunks": 2, "cfg_scale": 1.0
+  }
+}

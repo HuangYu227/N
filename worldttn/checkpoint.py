@@ -6,7 +6,7 @@ import tempfile
 from pathlib import Path
 import torch
 from .anchor import is_ttn_parameter, is_ttn_new_parameter, offline_state_dict
-from .core import BASE_REVISION
+from .core import BASE_REVISION, TTNConfig
 from .training_health import optimizer_parameter_names, audit_training_parameters
 
 
@@ -107,10 +107,7 @@ def read_checkpoint(path, model, resume=False):
     if payload.get("base_sha256") != getattr(model, "base_load_report", {}).get("sha256"):
         raise ValueError("base weight SHA256 mismatch")
     current = model.ttn_system.config.to_dict()
-    stored = dict(payload["config"])
-    stored.setdefault("camera_attention", "linear")
-    stored.setdefault("local_update", False)
-    stored.setdefault("persistent_meta", False)
+    stored = TTNConfig(**payload["config"]).to_dict()
     stage = stored.pop("stage")
     current_stage = current.pop("stage")
     if stored != current: raise ValueError("checkpoint architecture/config/base identity mismatch")

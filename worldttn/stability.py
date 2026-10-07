@@ -3,6 +3,22 @@ import torch
 
 
 @torch.no_grad()
+def rotation_gradient_stats(predicted, state_gradient, coefficient_gradient):
+    """Skew(T^T H) tests sensitivity to ANY infinitesimal right rotation.
+
+    This is geometry telemetry, not the fraction of loss explained by psi.
+    The finite generator basis restricts that tangent space further.
+    """
+    product = predicted.detach().transpose(-1, -2) @ state_gradient.detach()
+    skew = .5*(product-product.transpose(-1, -2))
+    norm = product.norm(dim=(-2, -1))
+    return {"state_loss_gradient_norm": state_gradient.detach().norm(dim=(-2, -1)).cpu().tolist(),
+            "coefficient_gradient_norm": coefficient_gradient.detach().norm(dim=-1).cpu().tolist(),
+            "TtH_norm": norm.cpu().tolist(), "rotation_sensitivity_defined": (norm > 0).cpu().tolist(),
+            "skew_fraction_of_TtH": (skew.norm(dim=(-2, -1))/norm.clamp_min(torch.finfo(norm.dtype).tiny)).cpu().tolist()}
+
+
+@torch.no_grad()
 def state_dynamics(previous, predicted, candidate, eps):
     """Evaluation-only, per [CFG branch, head]. Spectral concentration is not failure."""
     previous, predicted, candidate = (t.detach().float() for t in (previous, predicted, candidate))

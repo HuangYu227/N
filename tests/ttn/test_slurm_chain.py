@@ -352,12 +352,16 @@ def test_periodic_boundaries_and_first_unfrozen_step_are_exact(chain, plan):
     assert chain.segment_stop(plan, 499) == 500
 
 
-def test_evaluation_submission_pins_snapshot_and_uses_separate_single_gpu(chain, plan, monkeypatch):
+@pytest.mark.parametrize("long_training", [False, True])
+def test_evaluation_submission_pins_snapshot_and_uses_separate_single_gpu(chain, plan, monkeypatch, long_training):
     import tools.ttn_eval_snapshot as snapshots
     snapshot = Path(plan["output"]) / "immutable-snapshot"
     monkeypatch.setattr(snapshots, "snapshot_training_run", lambda source, **kw: snapshot)
     plan["evaluation"] = {"every": 25, "seed": 3407, "steps": 20, "cases": 1,
                           "fixed_cases": "shared/fixed-cases.pt", "output": str(Path(plan["output"]) / "eval")}
+    if long_training:
+        plan.update(time_limit="12:00:00", memory="320G")
+        plan["evaluation"].update(frames=121, cfg_scale=1., steps=4)
     monkeypatch.setenv("SLURM_JOB_ID", "old")
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "old")
     monkeypatch.setenv("CAMERA_ATTENTION", "linear")
@@ -373,9 +377,15 @@ def test_evaluation_submission_pins_snapshot_and_uses_separate_single_gpu(chain,
     assert "--dependency=afterok:123455" in cmd
     assert env["TRAINING_RUN"] == str(snapshot) and env["FIXED_CASES"] == "shared/fixed-cases.pt"
     assert env["COMMAND"] == "stage-evaluate" and env["PYTHON"] == plan["environment"]["PYTHON"]
+    assert env["FRAMES"] == ("121" if long_training else "61")
+    assert env["CFG_SCALE"] == ("1.0" if long_training else "4.5")
+    assert ("--time=12:00:00" if long_training else "--time=01:00:00") in cmd
     assert not any(k in env for k in ("SLURM_JOB_ID", "ADAPTER", "CUDA_VISIBLE_DEVICES", "CAMERA_ATTENTION", "CAMERA_ABLATION"))
     row = json.loads((Path(plan["output"]) / "eval_jobs.jsonl").read_text())
     assert row["step"] == 25 and row["job"] == "123456"
+    if long_training:
+        chain.submit(plan, Path(plan["output"])/"chain.json", 6)
+        assert "--time=12:00:00" in calls[1][0] and "--mem=320G" in calls[1][0]
 
 
 def test_checkpoint_exists_but_saved_step_is_stale_stops_chain(chain, tmp_path):

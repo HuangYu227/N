@@ -90,7 +90,9 @@ def test_old_checkpoint_without_meta_fields_still_loads_in_legacy_mode(tmp_path)
     path = tmp_path / "legacy.pt"
     save_checkpoint(path, old, make_optimizer(old), 3)
     payload = torch.load(path, weights_only=False)
-    for flag in ("local_update", "persistent_meta"): payload["config"].pop(flag)
+    for flag in ("local_update", "persistent_meta", "persistent_update", "sink_gain", "sink_position",
+                 "replay_strength", "replay_budget", "memory_start_chunk"):
+        payload["config"].pop(flag)
     torch.save(payload, path)
     assert read_checkpoint(path, model(False, False), resume=True)["step"] == 3
     with pytest.raises(ValueError, match="architecture"):

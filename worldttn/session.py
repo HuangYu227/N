@@ -96,6 +96,7 @@ class TTNSession:
         self.replay_options = replay_options
 
     def reset(self, batch_size):
+        self.camera_cache_lengths = {index: [] for index in ANCHORS}
         self.runtime = TTNRuntimeState.create(self.model.ttn_system.config, batch_size, self.camera.device,
                                              ablation=self.ablation, diagnostics=self.diagnostics,
                                              collect_local_stats=self.collect_local_stats, sink_options=self.sink_options,
@@ -169,7 +170,26 @@ class TTNSession:
         self.runtime.prefill(c)
         return c
 
-    def clean_forward(self, clean, y, context, cache, start, end, mask=None, data_info=None):
+    def carry_clean_cache(self, current, previous, *, cached_chunks=-1):
+        """Bound actual camera K/V tokens, including packed/patchified layouts."""
+        carried = carry_cache(current, self.model.ttn_system.config.camera_attention, previous=previous)
+        if cached_chunks < 0: return carried
+        if cached_chunks < 1: raise ValueError("cached_chunks must be positive or -1")
+        lengths = {i: list(v) for i, v in self.camera_cache_lengths.items()}
+        for anchor in ANCHORS:
+            key, value = current[anchor][2:4]
+            if key is None and value is None: continue
+            if key is None or value is None or key.shape != value.shape or key.shape[2] < 1:
+                raise ValueError("native camera cache must supply matching nonempty current-chunk K/V")
+            lengths[anchor] = (lengths[anchor]+[key.shape[2]])[-cached_chunks:]
+            tokens = sum(lengths[anchor])
+            for slot in (2, 3):
+                # clone releases the evicted prefix allocation; a sliced view would retain it.
+                carried[anchor][slot] = carried[anchor][slot][:, :, -tokens:].detach().clone()
+        self.camera_cache_lengths = lengths
+        return carried
+
+    def clean_forward(self, clean, y, context, cache, start, end, mask=None, data_info=None, *, cached_chunks=-1):
         c = context.for_clean()
         out, new_cache = self.forward(clean,
                                       torch.zeros(clean.shape[0], device=clean.device),
@@ -182,8 +202,15 @@ class TTNSession:
                                       data_info,
                                       save=True)
         validate_clean_output(out, clean)
-        self.runtime.commit_chunk(c)
+        # Validate/crop before publishing the TTN transaction.
+        previous_lengths = self.camera_cache_lengths
+        carried = self.carry_clean_cache(new_cache, cache, cached_chunks=cached_chunks)
+        try:
+            self.runtime.commit_chunk(c)
+        except Exception:
+            self.camera_cache_lengths = previous_lengths
+            raise
         # Detached factors are clean-only; outer predicted/state graphs remain live.
         context.psi_snapshot = c.psi_snapshot = None
         context.live_factors = c.live_factors = None
-        return out, carry_cache(new_cache, self.model.ttn_system.config.camera_attention, previous=cache)
+        return out, carried

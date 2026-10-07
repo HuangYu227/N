@@ -1,4 +1,4 @@
-"""Inference-only protected initial-observation reads; no parameters or writes."""
+"""Protected initial-observation reads, with explicit opt-in for training."""
 from dataclasses import dataclass
 import hashlib
 import math
@@ -29,26 +29,35 @@ class SinkOptions:
 
 
 def add_sink_arguments(parser):
-    parser.add_argument("--tla-sink", choices=("off", "protected", "zero"), default="off")
+    parser.add_argument("--tla-sink", choices=("off", "protected", "zero"), default=None,
+                        help="defaults to checkpoint math; off explicitly disables the sink")
     parser.add_argument("--sink-gain", type=float, default=.1)
     parser.add_argument("--sink-position", choices=("absolute", "temporal-realign"), default="temporal-realign")
     parser.add_argument("--sink-start-chunk", type=int, default=5)
 
 
-def sink_options_from_args(args):
-    return SinkOptions(getattr(args, "tla_sink", "off"), getattr(args, "sink_gain", .1),
+def sink_options_from_args(args, config=None):
+    mode = getattr(args, "tla_sink", None)
+    if mode is None: return trained_options(config) if config is not None else SinkOptions()
+    return SinkOptions(mode, getattr(args, "sink_gain", .1),
                        getattr(args, "sink_position", "temporal-realign"), getattr(args, "sink_start_chunk", 5))
+
+
+def trained_options(config):
+    return SinkOptions("protected" if config.sink_gain else "off", config.sink_gain,
+                       config.sink_position, config.memory_start_chunk)
 
 
 def validate_sink(options, config, ablation="full", execution=None):
     if not isinstance(options, SinkOptions):
         raise TypeError("sink_options must be SinkOptions")
     if not options.active: return
-    if torch.is_grad_enabled():
+    if torch.is_grad_enabled() and options != trained_options(config):
         raise ValueError("TLA sink is inference-only; disable gradients before creating or using the runtime")
     if config.stage != "C": raise ValueError("TLA sink requires Stage C")
     if config.camera_attention != "sana": raise ValueError("TLA sink requires native SANA camera")
-    if ablation != "full": raise ValueError("TLA sink requires full TTN; combine interventions in separate experiments")
+    if ablation != "full" and not (config.sink_gain and ablation in ("no-local", "no-persistent")):
+        raise ValueError("TLA sink requires full TTN; combine interventions in separate experiments")
     if execution is not None and (execution.core_backend != "reference" or execution.psi_backend != "reference"):
         raise ValueError("TLA sink requires reference/reference")
 

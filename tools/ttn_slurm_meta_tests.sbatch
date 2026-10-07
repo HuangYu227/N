@@ -26,5 +26,13 @@ case "${SLURM_NTASKS:?}" in
   4) tests=(tests/ttn/test_meta_cuda.py) ;;
   *) echo 'Meta acceptance requires one or four nodes/tasks' >&2; exit 2 ;;
 esac
+if [[ "${FULL_MEMORY_TESTS:-0}" == 1 ]]; then
+  "$PYTHON" -c 'from diffusers import FlowMatchEulerDiscreteScheduler'
+  if [[ "$SLURM_NTASKS" == 4 ]]; then
+    tests=(tests/ttn/test_full_training.py::test_full_memory_four_gpu_future_credit_and_resume)
+  else
+    tests=(tests/ttn/test_meta_core.py tests/ttn/test_full_training.py -k 'not four_gpu')
+  fi
+fi
 exec srun --mpi=none --kill-on-bad-exit=1 --ntasks="$SLURM_NTASKS" --ntasks-per-node=1 --gres=gpu:1 \
   --chdir="$PROJECT_ROOT" bash tools/ttn_slurm_worker.sh -q -s "${tests[@]}" "$@"

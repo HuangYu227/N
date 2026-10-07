@@ -144,11 +144,11 @@ class TTNRuntimeState:
     @classmethod
     def create(cls, config, batch_size, device, *, ablation="full", diagnostics=False, collect_local_stats=False,
                sink_options=None, replay_options=None):
-        sink_options = sink.SinkOptions() if sink_options is None else sink_options
+        sink_options = sink.trained_options(config) if sink_options is None else sink_options
         sink.validate_sink(sink_options, config, ablation)
-        replay_options = replay.ReplayOptions() if replay_options is None else replay_options
+        replay_options = replay.trained_options(config) if replay_options is None else replay_options
         replay.validate_replay(replay_options, config, ablation)
-        if replay_options.active and sink_options.active:
+        if replay_options.active and sink_options.active and not (config.sink_gain and config.replay_strength):
             raise ValueError("run observed replay and read-time sink in separate experiments")
         if ablation not in ("full", "no-ttt", "identity", "no-local", "no-persistent"):
             raise ValueError("unknown TTN runtime ablation")
@@ -314,7 +314,7 @@ class TTNRuntimeState:
         grad = torch.stack(gradients, 1)
         clipped, scale = clip_inner_gradient(grad, self.config.inner_clip, self.config.eps)
         psi = (self.transition_fast - self.config.eta_psi * clipped
-               if self.config.stage == "C" and self.ablation in ("full", "no-local") else torch.zeros_like(self.transition_fast))
+               if self.config.stage == "C" and self.config.persistent_update and self.ablation in ("full", "no-local") else torch.zeros_like(self.transition_fast))
         if not self.config.persistent_meta: psi = psi.detach()
         if psi.dtype != torch.float32 or not torch.isfinite(psi).all():
             raise ValueError("nonfinite or non-FP32 Persistent psi; transaction not committed")
@@ -339,7 +339,7 @@ class TTNRuntimeState:
                 heads = stats["per_head"]
                 stats["persistent"] = {"objective": "raw_weighted_innovation", "eta": self.config.eta_psi,
                     "meta_gradient_enabled": self.config.persistent_meta and grad.requires_grad and self.ablation in ("full", "no-local") and not context.prefill_mode,
-                    "update_enabled": self.ablation in ("full", "no-local") and not context.prefill_mode,
+                    "update_enabled": self.config.persistent_update and self.ablation in ("full", "no-local") and not context.prefill_mode,
                     "prefill": context.prefill_mode,
                     "per_head": {"raw_grad_norm": heads["inner_grad_norm"],
                                  "clipped_grad_norm": heads["inner_grad_clipped_norm"],
@@ -364,7 +364,7 @@ class TTNRuntimeState:
             for i, stats in enumerate(anchor_stats):
                 stats.update(state_dynamics(context.previous[:, i], context.predicted[:, i],
                                             new_state[:, i], self.config.eps),
-                             inner_update_applied=self.config.stage == "C" and self.ablation in ("full", "no-local") and not context.prefill_mode)
+                             inner_update_applied=self.config.stage == "C" and self.config.persistent_update and self.ablation in ("full", "no-local") and not context.prefill_mode)
         previous_pose = self.previous_committed_pose.clone()
         committed = [set(s) for s in self.committed_frame_ids]
         for b in range(new_state.shape[0]):
@@ -403,6 +403,7 @@ class TTNRuntimeState:
     def detach(self):
         self.world_state = self.world_state.detach()
         self.transition_fast = self.transition_fast.detach()
+        if self.replay_values is not None: self.replay_values = self.replay_values.detach()
 
     def verify_sink_reference(self):
         """Hash once at rollout end, never in each solver call."""

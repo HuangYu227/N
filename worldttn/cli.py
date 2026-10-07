@@ -10,7 +10,7 @@ from dataclasses import replace, asdict
 import torch
 from .core import TTNConfig, BASE_ID, ANCHORS
 from .checkpoint import make_optimizer, save_checkpoint, load_checkpoint, read_checkpoint, apply_checkpoint_weights
-from .training import train_clip, SANAFlowLoss, chunk_ranges
+from .training import train_clip, SANAFlowLoss, chunk_ranges, history_settings
 from .session import TTNSession
 from .performance import ExecutionOptions, configure_from_args, execution_report, precision_audit
 
@@ -85,6 +85,11 @@ def build(args, stage=None, sana_path=None):
     source = Path(source)
     if not source.is_absolute(): source = ROOT / source
     config = load_sana_config(source)
+    if "training_latent_frames" in settings:
+        frames = settings["training_latent_frames"]
+        if isinstance(frames, bool) or not isinstance(frames, int) or frames < 4 or frames % 3 != 1:
+            raise ValueError("training_latent_frames must be 1+3n")
+        config.data.num_frames = config.data.vae_ratio[0] * (frames - 1) + 1
     root = getattr(args, "dataset_root", None)
     if root:
         from .sana import resolve_data_paths
@@ -97,6 +102,8 @@ def build(args, stage=None, sana_path=None):
     # Do not quantize inherited master weights to BF16 before joint fine-tuning.
     options = {"dtype": torch.float32} if getattr(args, "train_scope", "ttn") in ("ttn-visual", "ttn-new", "dit") else {}
     model = build_sana(config, ttn, args.base_weights, device=args.device, **options)
+    model.ttn_history_training = history_settings(settings.get("history_training"))
+    model.ttn_training_latent_frames = settings.get("training_latent_frames")
     configure_from_args(model, args)
     policy = configure_cross_attention(model, getattr(args, "cross_attn_backend", "auto"),
                                        diagnostic_unmask_all_valid=getattr(args, "diagnostic_unmask_all_valid", False))
@@ -109,6 +116,11 @@ def train_update(model, config, batch, optimizer, k, parallel=None, *, activatio
     from .cuda_debug import cuda_diagnostics
     from train_video_scripts.train_sana_wm_stage1 import _build_timesteps, _build_time_sampler
     clean = batch["clean_latents"].float()
+    expected = getattr(model, "ttn_training_latent_frames", None)
+    if expected is not None and clean.shape[2] != expected:
+        raise ValueError(f"training horizon mismatch: expected {expected}, received {clean.shape[2]}")
+    if expected is not None and "frame_valid_mask" in batch and not batch["frame_valid_mask"].all():
+        raise ValueError("long-training recipe requires a complete clip; padded exposure is not a long horizon")
     sampler = _build_time_sampler(config, clean.shape[2], clean.device)
     timesteps, _ = _build_timesteps(config, clean, clean.shape[2], True, time_sampler=sampler)
     noise = torch.randn_like(clean)
@@ -171,6 +183,11 @@ def rollout(model, config, batch, steps=4, cfg_scale=4.5, cached_blocks=-1, *, i
         raise ValueError("GT/mixed history requires an explicit reference; generated history cannot access it")
     if history_source in ("ttn-gt", "native-gt") and not hasattr(model, "ttn_system"):
         raise ValueError("mixed history requires a TTN model")
+    if hasattr(model, "ttn_system"):
+        from .sink import trained_options as trained_sink
+        from .replay import trained_options as trained_replay
+        if sink_options is None: sink_options = trained_sink(model.ttn_system.config)
+        if replay_options is None: replay_options = trained_replay(model.ttn_system.config)
     if sink_options is not None and sink_options.active:
         if not hasattr(model, "ttn_system"):
             raise ValueError("TLA sink requires a TTN model")
@@ -330,6 +347,11 @@ def _training_identity(args, config, settings, k):
                                 "local_objective": "weighted_v_energy_support", "persistent_objective": "raw_weighted_innovation",
                                 "support": "absolute_frame_xy_checkerboard", "local_eta_init": .01, "local_delta": 1.,
                                 "noise_gate": False}
+    if "history_training" in settings or "training_latent_frames" in settings:
+        identity["history_training"] = history_settings(settings.get("history_training"))
+        identity["training_latent_frames"] = settings.get("training_latent_frames")
+        identity["memory_training"] = {key: getattr(TTNConfig(**ttn), key) for key in
+            ("persistent_update", "sink_gain", "sink_position", "replay_strength", "replay_budget", "memory_start_chunk")}
     return identity
 
 
@@ -500,6 +522,15 @@ def train_command(args):
                                     "local_lifecycle": "ephemeral per noisy call" if model.ttn_system.config.local_update else "disabled"},
                "implementation": {name: {"path": str(path.resolve()), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
                                   for name, path in sources.items()}}
+        if "history_training" in identity:
+            history = identity["history_training"]
+            generated = history["source"] == "generated"
+            run["history_protocol"].update(identity["history_training"],
+                clean_commits="live clean update after current flow loss; " + (
+                    "generated samples detached" if generated else "ground-truth history"),
+                camera_cache=(f"last {history['cached_chunks']} chunks" if history['cached_chunks'] > 0
+                              else "unbounded") + "; no native sink",
+                observed_reference="detached initial prefill; immutable within episode")
         if unfreeze:
             run["initialization"] = {"checkpoint": str(Path(args.adapter).resolve()), "step": step,
                                      "optimizer_reset": True, "rng_and_data_cursor_restored": True}
@@ -902,9 +933,9 @@ def main(argv=None):
     if args.benchmark_save_checkpoint and (args.command != "train" or not benchmark_run(args)):
         parser.error("--benchmark-save-checkpoint requires a train benchmark/profiler/layout run")
     if args.command != "evaluate" and (args.ttn_ablation != "full" or args.history_source != "generated"
-            or args.state_diagnostics or args.eval_methods != ["sana", "ttn"] or args.tla_sink != "off"
-            or args.tla_replay != "off"):
-        parser.error("mechanism interventions are evaluate-only; training semantics are unchanged")
+            or args.state_diagnostics or args.eval_methods != ["sana", "ttn"] or args.tla_sink is not None
+            or args.tla_replay is not None):
+        parser.error("mechanism CLI interventions are evaluate-only; use the explicit config for training")
     if args.history_source in ("ttn-gt", "native-gt") and args.eval_methods != ["ttn"]:
         parser.error("mixed history interventions require TTN-only --eval-methods ttn")
     if sink.active and args.history_source != "generated":

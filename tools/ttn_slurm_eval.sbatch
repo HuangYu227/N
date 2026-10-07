@@ -44,7 +44,7 @@ command="${COMMAND:-evaluate}"
 case "$command" in
   evaluate) frames="${FRAMES:-61}"; suffix=eval ;;
   align-chunk) frames="${FRAMES:-4}"; suffix=align ;;
-  stage-evaluate) frames=61; suffix=stage-eval ;;
+  stage-evaluate) frames="${FRAMES:-61}"; suffix=stage-eval ;;
   *) echo 'COMMAND must be evaluate, align-chunk or stage-evaluate' >&2; exit 2 ;;
 esac
 output="${OUTPUT:-$project_root/output/worldttn/${suffix}-${SLURM_JOB_ID}}"

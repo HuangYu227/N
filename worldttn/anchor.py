@@ -7,7 +7,7 @@ from .core import (ANCHORS, correct, analytic_psi_gradient, correct_with_aux, Co
                    analytic_psi_gradient_dense_from_aux, analytic_psi_gradient_projected,
                    CayleyFactors, write_weights, innovation_objective, coefficient_gradient, clip_inner_gradient)
 from .performance import DEFAULT_EXECUTION, annotation, audit_layout
-from .stability import clean_anchor_stats, local_anchor_stats, matrix_scale
+from .stability import clean_anchor_stats, local_anchor_stats, matrix_scale, rotation_gradient_stats
 from .geometry import apply_complex_rope
 from .runtime import TTNSystem
 from .sink import sink_read_stats, sink_effective_stats, validate_sink
@@ -110,6 +110,7 @@ class TTNAnchor(nn.Module):
                 _, h = innovation_objective(predicted, k, v, w, support, normalized=True, eps=cfg.eps)
                 gradient = coefficient_gradient(ctx.previous[:, self.index], h,
                                                 factors.p[self.index], factors.l[:, self.index])
+                local_geometry = rotation_gradient_stats(predicted, h, gradient) if ctx.collect_local_stats else None
                 clipped, scale = clip_inner_gradient(gradient, cfg.inner_clip, cfg.eps)
                 eta = F.softplus(ctx.system.local_eta_logits[self.index])
                 local = -eta * clipped
@@ -157,10 +158,11 @@ class TTNAnchor(nn.Module):
                 reference = ctx.sink_reference[:, self.index]
                 raw = q @ ((1-ctx.sink_options.gain)*state + ctx.sink_options.gain*reference)
                 if ctx.clean_mode or ctx.collect_sink_stats or diagnostic is not None:
-                    before = q @ state
-                    sink_delta = raw-before
-                    sink_stats = sink_read_stats(before, q@reference, reference, sink_delta,
-                                                 ctx.sink_options, ctx.sink_shift, cfg.eps, ctx.sink_reference_sha256, read)
+                    with torch.no_grad():
+                        before = q @ state
+                        sink_delta = raw-before
+                        sink_stats = sink_read_stats(before, q@reference, reference, sink_delta,
+                                                     ctx.sink_options, ctx.sink_shift, cfg.eps, ctx.sink_reference_sha256, read)
                     sink_stats["active"] = True
             if ((ctx.collect_local_stats or diagnostic is not None) and (cfg.local_update or cfg.persistent_meta)
                     and not ctx.clean_mode and not ctx.prefill_mode):
@@ -173,6 +175,7 @@ class TTNAnchor(nn.Module):
                     stats = local_anchor_stats(ctx.previous[:, self.index], ctx.predicted[:, self.index], predicted,
                                                state, k, v, w, support, query, gradient, clipped, scale, local, eta, cfg.eps)
                     stats.update(ctx.noise_info, enabled=local_enabled, recorded=True)
+                    if local_enabled and local_geometry is not None: stats["rotation_geometry"] = local_geometry
                     ctx.local_stats[self.index] = stats
                     if ctx.local_trajectory:
                         ctx.local_trajectory[-1]["anchors"][self.index] = {
@@ -186,7 +189,8 @@ class TTNAnchor(nn.Module):
                 diagnostic("memory", (predicted, state, k, v, beta, w, write))
             if ctx.clean_mode:
                 gradient = torch.zeros_like(ctx.psi[:, self.index])
-                if cfg.stage == "C" and not ctx.prefill_mode:
+                persistent_geometry = None
+                if cfg.stage == "C" and cfg.persistent_update and not ctx.prefill_mode:
                     with annotation(execution, "Psi"):
                         if cfg.persistent_meta:
                             if ctx.ablation in ("full", "no-local"):
@@ -196,6 +200,8 @@ class TTNAnchor(nn.Module):
                                 gc = coefficient_gradient(ctx.previous[:, self.index], h,
                                                           factors.p[self.index], factors.l[:, self.index])
                                 gradient = cfg.delta_psi * (1 - ctx.psi[:, self.index].tanh().square()) * gc
+                                if ctx.collect_local_stats:
+                                    persistent_geometry = rotation_gradient_stats(predicted, h, gc)
                         elif execution.core_backend == "reference":
                             gradient = analytic_psi_gradient(ctx.previous[:, self.index], k, v, w, write,
                                                              ctx.system.generators.u[self.index].float(),
@@ -211,6 +217,7 @@ class TTNAnchor(nn.Module):
                 with annotation(execution, "Stats"):
                     stats = clean_anchor_stats(ctx.previous[:, self.index], ctx.predicted[:, self.index],
                                                state, q, k, v, beta, w, read, write, gradient, cfg)
+                    if persistent_geometry is not None: stats["persistent_rotation_geometry"] = persistent_geometry
                 ctx.stage(self.index, state, gradient, stats)
         raw = raw.transpose(1, 2).reshape(b, n, c)
         if ctx.clean_mode:
@@ -251,7 +258,9 @@ class TTNAnchor(nn.Module):
         gate = F.silu(self.output_gate(x).float())
         if replay_result is not None:
             replay_stats, replay_delta = replay_result
-            delta_raw = (q @ replay_delta).transpose(1, 2).reshape(b, n, c)
+            with torch.no_grad():
+                delta_raw = (q @ replay_delta).transpose(1, 2).reshape(b, n, c)
+                if ctx.sink_reference is not None: delta_raw = (1-ctx.sink_options.gain)*delta_raw
             sink_effective_stats(replay_stats, delta_raw, gate, self.proj, read, self.heads)
             if ctx.clean_mode:
                 ctx.replay_stats[self.index] = replay_stats

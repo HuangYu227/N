@@ -12,10 +12,10 @@ def stage_evaluate_command(args):
     from .provenance import implementation_identity
     output = Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=False)
-    if args.frames != 61 or not args.fixed_cases:
-        raise ValueError("stage-evaluate requires --frames 61 and a shared --fixed-cases path")
+    if args.frames < 61 or args.frames % 3 != 1 or not args.fixed_cases:
+        raise ValueError("stage-evaluate requires 1+3n frames >=61 and a shared --fixed-cases path")
     common = ["--parallel", "single", "--training-run", args.training_run, "--seed", str(args.seed),
-              "--eval-cases", str(args.eval_cases), "--fixed-cases", args.fixed_cases, "--noise-frames", "61",
+              "--eval-cases", str(args.eval_cases), "--fixed-cases", args.fixed_cases, "--noise-frames", str(args.frames),
               "--cross-attn-backend", args.cross_attn_backend, "--device", args.device]
     common += ["--ttn-core-backend", getattr(args, "ttn_core_backend", "reference"),
                "--ttn-psi-backend", getattr(args, "ttn_psi_backend", "reference")]
@@ -25,7 +25,7 @@ def stage_evaluate_command(args):
         if getattr(args, name, None): common += ["--" + name.replace("_", "-"), str(getattr(args, name))]
     commands = {
         # Long first creates the full immutable case bundle, then every diagnostic uses prefixes.
-        "long": ["evaluate", "--frames", "61", "--steps", str(args.steps),
+        "long": ["evaluate", "--frames", str(args.frames), "--steps", str(args.steps),
                  "--state-diagnostics",
                  "--cfg-scale", str(args.cfg_scale), "--cached-blocks", str(args.cached_blocks)],
         "short": ["evaluate", "--frames", "13", "--steps", str(args.steps),

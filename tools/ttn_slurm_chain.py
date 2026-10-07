@@ -127,7 +127,10 @@ def evaluation_settings(args, output):
         raise ValueError("positive eval-steps and eval-cases are required")
     key_steps = sorted(set(getattr(args, "keep_model_steps", (25, 50, 100, 250))) | {args.target_step})
     if any(step < 1 for step in key_steps): raise ValueError("key model steps must be positive")
+    frames = getattr(args, "eval_frames", 61)
+    if frames < 61 or frames % 3 != 1: raise ValueError("eval-frames must be 1+3n and >=61")
     return {"every": every, "seed": getattr(args, "eval_seed", 3407), "steps": getattr(args, "eval_steps", 20),
+            "frames": frames, "cfg_scale": getattr(args, "eval_cfg_scale", 4.5),
             "keep_model_steps": key_steps,
             "cases": getattr(args, "eval_cases", 1), "fixed_cases": str(Path(output) / "fixed-cases.pt"),
             "output": str(Path(output) / "evaluations")}
@@ -147,11 +150,12 @@ def submit_evaluation(plan, step, parent_job):
         env.pop(key, None)
     env.update(COMMAND="stage-evaluate", TRAINING_RUN=str(snapshot), OUTPUT=str(output),
                FIXED_CASES=evaluation["fixed_cases"], EVAL_CASES=str(evaluation["cases"]),
-               SEED=str(evaluation["seed"]), STEPS=str(evaluation["steps"]), CACHED_BLOCKS="2", CFG_SCALE="4.5")
+               SEED=str(evaluation["seed"]), STEPS=str(evaluation["steps"]), CACHED_BLOCKS="2",
+               CFG_SCALE=str(evaluation.get("cfg_scale", 4.5)), FRAMES=str(evaluation.get("frames", 61)))
     env.update(TTN_CORE_BACKEND="reference", TTN_PSI_BACKEND="reference")
     command = ["sbatch", "--parsable", "--export=ALL", "--kill-on-invalid-dep=yes", "--job-name=ttn-stage-eval",
                f"--partition={plan['partition']}", "--nodes=1", "--ntasks=1", "--ntasks-per-node=1",
-               "--gres=gpu:1", "--cpus-per-task=8", "--mem=128G", "--time=01:00:00",
+               "--gres=gpu:1", "--cpus-per-task=8", "--mem=128G", f"--time={plan.get('time_limit', '01:00:00')}",
                f"--chdir={plan['project']}", f"--output={output.parent}/step-{step:06d}-%j.out",
                f"--dependency=afterok:{parent_job}", str(Path(plan["project"]) / "tools/ttn_slurm_eval.sbatch")]
     result = subprocess.run(command, env=env, capture_output=True, text=True, check=True)
@@ -170,7 +174,7 @@ def submit(plan, manifest, start, dependency=None):
     command = ["sbatch", "--parsable", "--export=ALL", "--kill-on-invalid-dep=yes",
                "--job-name=ttn-formal", f"--partition={plan['partition']}",
                "--nodes=4", "--ntasks=4", "--ntasks-per-node=1", "--gres=gpu:1",
-               "--cpus-per-task=8", "--mem=256G", "--time=01:00:00",
+               "--cpus-per-task=8", f"--mem={plan.get('memory', '256G')}", f"--time={plan.get('time_limit', '01:00:00')}",
                f"--chdir={plan['project']}", f"--output={plan['output']}/slurm-%j.out"]
     if dependency:
         command.append(f"--dependency=afterok:{dependency}")
@@ -237,7 +241,8 @@ def start_chain(args):
     output.mkdir(parents=True, exist_ok=False)
     plan = {"source": str(source), "project": str(project), "output": str(output), "environment": profile,
             "initial_step": initial, "target_step": args.target_step, "source_checkpoint": checkpoint_report,
-            "segment_steps": args.segment_steps, "partition": args.partition}
+            "segment_steps": args.segment_steps, "partition": args.partition,
+            "time_limit": getattr(args, "time_limit", "01:00:00"), "memory": getattr(args, "memory", "256G")}
     if unfreeze: plan["unfreeze"] = True
     evaluation = evaluation_settings(args, output)
     if evaluation: plan["evaluation"] = evaluation
@@ -282,7 +287,8 @@ def fresh_chain(args):
     if args.base_weights: profile["BASE_WEIGHTS"] = args.base_weights
     plan = {"source": "", "fresh": True, "project": str(project), "output": str(warmup),
             "environment": profile, "initial_step": 0, "target_step": args.warmup_steps or args.target_step,
-            "segment_steps": args.segment_steps, "partition": args.partition}
+            "segment_steps": args.segment_steps, "partition": args.partition,
+            "time_limit": getattr(args, "time_limit", "01:00:00"), "memory": getattr(args, "memory", "256G")}
     if args.warmup_steps and not args.warmup_only:
         plan.update(joint_output=str(output / "joint"), joint_target_step=args.target_step)
     evaluation = evaluation_settings(args, output)
@@ -326,7 +332,8 @@ def _worker(plan, manifest, start, status):
     elif plan.get("joint_target_step"):
         start_chain(SimpleNamespace(from_run=plan["output"], after_job=job, unfreeze=True,
                                    output=plan["joint_output"], target_step=plan["joint_target_step"],
-                                   segment_steps=plan["segment_steps"], partition=plan["partition"], evaluation=evaluation))
+                                   segment_steps=plan["segment_steps"], partition=plan["partition"], evaluation=evaluation,
+                                   time_limit=plan.get("time_limit", "01:00:00"), memory=plan.get("memory", "256G")))
     else:
         print(f"[TTN chain] completed target step {stop}", flush=True)
 
@@ -377,10 +384,14 @@ def main():
     fresh.add_argument("--tbptt", type=int, choices=(1, 2, 4), default=2)
     fresh.add_argument("--backbone-lr", type=float, default=1e-6)
     for command in (start, fresh):
+        command.add_argument("--time-limit", default="01:00:00", help="Slurm wall time per training/evaluation allocation")
+        command.add_argument("--memory", default="256G", help="Slurm host memory per training node")
         command.add_argument("--eval-every", type=int, default=25, help="immutable fixed-case evaluation cadence; zero disables")
         command.add_argument("--eval-seed", type=int, default=3407)
         command.add_argument("--eval-steps", type=int, default=20)
         command.add_argument("--eval-cases", type=int, default=1)
+        command.add_argument("--eval-frames", type=int, default=61)
+        command.add_argument("--eval-cfg-scale", type=float, default=4.5)
         command.add_argument("--keep-model-steps", type=int, nargs="*", default=[25, 50, 100, 250],
                              help="pin evaluation models only at these steps and target; all metric logs remain")
     work = modes.add_parser("worker", help=argparse.SUPPRESS)

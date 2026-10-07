@@ -1,6 +1,7 @@
 """Persistent matrix correction and rank-2 Cayley transport (no token-pair matrix)."""
 from dataclasses import dataclass, asdict
 from typing import NamedTuple
+import math
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -31,6 +32,13 @@ class TTNConfig:
     # Missing in old checkpoints means the original detached Stage C update.
     local_update: bool = False
     persistent_meta: bool = False
+    persistent_update: bool = True
+    # Trained memory mechanisms; zeros preserve every legacy checkpoint's math.
+    sink_gain: float = 0.
+    sink_position: str = "temporal-realign"
+    replay_strength: float = 0.
+    replay_budget: int = 128
+    memory_start_chunk: int = 5
 
     def __post_init__(self):
         if self.stage not in ("A", "B", "C"):
@@ -39,6 +47,21 @@ class TTNConfig:
             raise ValueError("meta-update flags must be boolean")
         if (self.local_update or self.persistent_meta) and self.stage != "C":
             raise ValueError("Local/Persistent Meta-TTT requires Stage C")
+        if not isinstance(self.persistent_update, bool):
+            raise ValueError("persistent_update must be boolean")
+        if self.persistent_meta and not self.persistent_update:
+            raise ValueError("persistent_meta requires persistent_update")
+        if (any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v)
+                for v in (self.sink_gain, self.replay_strength))
+                or not 0 <= self.sink_gain <= 1 or self.replay_strength < 0):
+            raise ValueError("invalid trained Sink/DSR strength")
+        if self.sink_position not in ("absolute", "temporal-realign"):
+            raise ValueError("invalid trained Sink position")
+        if any(isinstance(v, bool) or not isinstance(v, int) or v < 1
+               for v in (self.replay_budget, self.memory_start_chunk)):
+            raise ValueError("memory budget/start chunk must be positive integers")
+        if (self.sink_gain or self.replay_strength) and (self.stage != "C" or self.camera_attention != "sana"):
+            raise ValueError("trained Sink/DSR requires Stage C and native SANA camera")
         if self.camera_attention not in ("linear", "sana"):
             raise ValueError("camera_attention must be linear or sana")
         if min(self.heads, self.head_dim, self.generators) < 1 or self.head_dim % 8:

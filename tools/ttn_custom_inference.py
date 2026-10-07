@@ -199,6 +199,8 @@ def main(argv=None):
                         help="after video encoding, require the step100 five-chunk sink acceptance checks")
     from worldttn.sink import add_sink_arguments
     add_sink_arguments(parser)
+    from worldttn.replay import add_replay_arguments
+    add_replay_arguments(parser)
     parser.set_defaults(adapter=None, stage=None, dataset_root=None, data_dir=None, vae_cache_dir=None)
     args = parser.parse_args(argv)
     case, image_path, prompt = load_case(args.case)
@@ -210,6 +212,8 @@ def main(argv=None):
         raise ValueError("invalid sampling steps/CFG")
     run, config, ttn, adapter, digest, last_train = load_evaluation_run(args)
     sink = validate_inference_interventions(args, ttn)
+    from worldttn.replay import replay_options_from_args
+    replay = replay_options_from_args(args, ttn)
     if ttn.camera_attention != "sana" or list(config.vae.vae_stride) != [8, 32, 32]:
         raise ValueError("custom paired inference requires native SANA camera and LTX [8,32,32]")
     from worldttn.cli import rollout, seed_everything, timed_cuda, to_device
@@ -261,7 +265,7 @@ def main(argv=None):
                 "steps": args.steps, "cfg_scale": args.cfg_scale, "cached_blocks": args.cached_blocks,
                 "flow_shift": config.scheduler.inference_flow_shift, "cross_attn_backend": args.cross_attn_backend,
                 "camera_attention": "sana", "history_source": "generated", "ttn_ablation": "full",
-                "stage": ttn.stage, "tla_sink": asdict(sink), "state_diagnostics": args.state_diagnostics,
+                "stage": ttn.stage, "tla_sink": asdict(sink), "tla_replay": asdict(replay), "state_diagnostics": args.state_diagnostics,
                 "ttn_config": ttn.to_dict(), "provenance": implementation_identity(),
                 "compile": {key: os.environ.get(key, "0") for key in ("GDN_DISABLE_COMPILE", "GDN_DISABLE_COMPLEX_COMPILE")},
                 "input_bundle_sha256": file_sha256(args.output / "input-bundle.pt"),
@@ -296,8 +300,8 @@ def main(argv=None):
             print("[TTN custom chunk] " + json.dumps({"method": method,
                   **{key: row[key] for key in ("chunk", "start", "end", "seconds")}}), flush=True)
         runtime_options = {}
-        if method == "ttn" and (sink.active or args.state_diagnostics):
-            runtime_options.update(sink_options=sink, state_diagnostics=args.state_diagnostics)
+        if method == "ttn":
+            runtime_options.update(sink_options=sink, replay_options=replay, state_diagnostics=args.state_diagnostics)
         with torch.no_grad():
             (generated, runtime, chunks), timing = timed_cuda(lambda: rollout(
                 model, config, gpu_batch, args.steps, args.cfg_scale, args.cached_blocks,

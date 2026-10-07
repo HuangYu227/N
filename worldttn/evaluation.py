@@ -29,15 +29,15 @@ HISTORY_ACCESS = {
 def validate_inference_interventions(args, config):
     """Reject incompatible diagnostic combinations before loading cases/models."""
     from .sink import sink_options_from_args
-    sink = sink_options_from_args(args)
+    sink = sink_options_from_args(args, config)
     from .replay import replay_options_from_args, validate_replay
     from .performance import ExecutionOptions
-    replay = replay_options_from_args(args)
+    replay = replay_options_from_args(args, config)
     if replay.active:
         validate_replay(replay, config, getattr(args, "ttn_ablation", "full"),
             ExecutionOptions(getattr(args, "ttn_core_backend", "reference"),
                              getattr(args, "ttn_psi_backend", "reference")), check_grad=False)
-        if (sink.active or getattr(args, "history_source", "generated") != "generated"
+        if ((sink.active and not (config.sink_gain and config.replay_strength)) or getattr(args, "history_source", "generated") != "generated"
                 or "ttn" not in getattr(args, "eval_methods", ["sana", "ttn"])
                 or getattr(args, "camera_ablation", False)
                 or getattr(args, "camera_attention", None) not in (None, "sana")
@@ -52,7 +52,8 @@ def validate_inference_interventions(args, config):
     if mixed and tuple(getattr(args, "eval_methods", ["sana", "ttn"])) != ("ttn",):
         raise ValueError("mixed history interventions require TTN-only evaluation")
     if sink.active or mixed:
-        if config.stage != "C" or getattr(args, "ttn_ablation", "full") != "full":
+        trained_control = config.sink_gain and getattr(args, "ttn_ablation", "full") in ("no-local", "no-persistent") and not mixed
+        if config.stage != "C" or (getattr(args, "ttn_ablation", "full") != "full" and not trained_control):
             raise ValueError("sink and mixed history require Full Stage C")
         if (config.camera_attention != "sana" or getattr(args, "camera_ablation", False)
                 or getattr(args, "camera_attention", None) not in (None, "sana")):
@@ -384,7 +385,7 @@ def evaluate_command(args):
     diagnostics = getattr(args, "state_diagnostics", False)
     sink = validate_inference_interventions(args, ttn)
     from .replay import replay_options_from_args
-    replay = replay_options_from_args(args)
+    replay = replay_options_from_args(args, ttn)
     if ablation != "full" and ttn.stage != "C": raise ValueError("mechanism ablations require a Stage C checkpoint")
     if getattr(args, "ttn_compare_reference", False):
         if tuple(methods) != ("sana", "ttn") or ablation != "full" or diagnostics:
@@ -497,10 +498,8 @@ def evaluate_command(args):
             runtime_options = {"on_state": save_state} if getattr(args, "ttn_compare_reference", False) else {}
             if method == "ttn" and (ablation != "full" or diagnostics):
                 runtime_options.update(ttn_ablation=ablation, state_diagnostics=diagnostics)
-            if method == "ttn" and sink.active:
-                runtime_options["sink_options"] = sink
-            if method == "ttn" and replay.active:
-                runtime_options["replay_options"] = replay
+            if method != "sana":
+                runtime_options.update(sink_options=sink, replay_options=replay)
             if history != "generated":
                 runtime_options.update(history_reference=gt, history_source=history)
             (generated, runtime, chunks), timing = timed_cuda(lambda: rollout(
