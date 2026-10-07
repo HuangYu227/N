@@ -44,3 +44,38 @@ There is no ground-truth future video: no GT latent MSE, PSNR, SSIM, or LPIPS
 is reported. This is a qualitative synthetic-input test, not a held-out video
 benchmark. The training mathematical implementation and history protocol are
 unchanged.
+
+## Closed orbit returning to the observed view
+
+`case_orbit.json` reuses the same first frame and seed, with `prompt_orbit.txt`
+describing static objects and a moving camera. The explicit OpenCV C2W path
+translates around a horizontal circle of radius 0.6 virtual scene units while
+looking inward at its fixed centre, initially `[0,0,0.6]`. It holds the initial
+view for 24 raw-frame intervals (1.5 s), completes a smooth 360-degree orbit
+at raw frame 432 (27 s), and holds the identical position/orientation/intrinsics
+for the final 48 intervals (3 s). Duration is 481/16 = 30.0625 s, with 61 latents
+and 20 predicted chunks. This is a synthetic trajectory, not a reconstruction
+of the room's dimensions or a guarantee that the circle clears its furniture.
+
+After the same step100 snapshot setup above, submit a separate output:
+
+```bash
+export CUSTOM_CASE=assets/worldttn/study_static/case_orbit.json
+export CUSTOM_OUTPUT="$RUN/custom-study-orbit-step100-$(date -u +%Y%m%dT%H%M%SZ)"
+ORBIT_JOB=$(sbatch --parsable tools/ttn_slurm_custom_video.sbatch)
+ORBIT_JOB="${ORBIT_JOB%%;*}"
+echo "ORBIT_JOB=$ORBIT_JOB"
+echo "ORBIT_OUTPUT=$CUSTOM_OUTPUT"
+```
+
+`camera_poses.npy` records all 481 C2W matrices. Episodes include initial-view
+latent MSE over returned latents 55..60: their complete eight-frame Plucker
+intervals match the initial view exactly; the still-moving closing interval
+of latent 54 is excluded. `videos/return-view.json` records decoded RGB MSE
+over raw frames 433..480 against the decoded observed frame 0, before MP4
+compression. `videos/return-comparison.png` shows initial/last views, SANA on
+the upper row and TTN on the lower row. Existing paired MP4s are also produced.
+These are consistency scores, not future-GT quality metrics. A video ignoring
+the camera can also obtain low return error: inspect the intervening motion
+and scene geometry alongside these scores. No model weights or training
+settings are changed.

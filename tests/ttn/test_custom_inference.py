@@ -57,7 +57,42 @@ def test_case_native_geometry_and_input_validation(monkeypatch, tmp_path):
         custom.load_case(tmp_path / "case.json")
 
 
-def test_custom_pair_reuses_inputs_and_noise_without_future_gt(monkeypatch, tmp_path):
+def test_closed_orbit_translation_orientation_and_native_return(monkeypatch):
+    native_cpu_helpers(monkeypatch)
+    case, _, prompt = custom.load_case(custom.REPO / "assets/worldttn/study_static/case_orbit.json")
+    assert "360-degree" in prompt and "stationary" not in prompt
+    poses = custom.camera_poses(case)
+    assert poses.shape == (481, 4, 4) and np.isfinite(poses).all()
+    np.testing.assert_array_equal(poses[:25], np.broadcast_to(np.eye(4), (25, 4, 4)))
+    np.testing.assert_array_equal(poses[432:], np.broadcast_to(np.eye(4), (49, 4, 4)))
+    rotation, centres = poses[:, :3, :3], poses[:, :3, 3]
+    np.testing.assert_allclose(rotation.transpose(0, 2, 1) @ rotation,
+                               np.broadcast_to(np.eye(3), rotation.shape), atol=2e-7)
+    np.testing.assert_allclose(np.linalg.det(rotation), 1, atol=2e-7)
+    target = np.array([0, 0, case["camera"]["radius"]])
+    # Translation and rotation must both occur; all optical axes look at the centre.
+    np.testing.assert_allclose(centres + case["camera"]["radius"] * rotation[:, :, 2],
+                               np.broadcast_to(target, centres.shape), atol=2e-7)
+    assert centres[:, 0].ptp() > 1 and centres[:, 2].max() == pytest.approx(1.2)
+    np.testing.assert_allclose(poses[228, :3, :3], np.diag([-1, 1, -1]), atol=1e-7)
+    batch = custom.make_geometry(case, [8, 32, 32])
+    generated = torch.zeros(1, 2, 61, 2, 2)
+    generated[:, :, 55:] = 2
+    metrics = custom.return_latent_metrics(generated, batch, case)
+    assert metrics["return_latent_ids"] == list(range(55, 61))
+    assert metrics["mean_return_to_observed_latent_mse"] == 4
+    batch["chunk_plucker"][:, :, -1] += .01
+    with pytest.raises(ValueError, match="camera/rays"):
+        custom.return_latent_metrics(generated, batch, case)
+    for key, invalid in (("radius", 0), ("radius", float("nan")),
+                         ("start_hold_raw_frames", 7), ("end_hold_raw_frames", 480)):
+        invalid_case = {**case, "camera": {**case["camera"], key: invalid}}
+        with pytest.raises(ValueError, match="closed orbit"):
+            custom.camera_poses(invalid_case)
+
+
+@pytest.mark.parametrize("case_name", ["case.json", "case_orbit.json"])
+def test_custom_pair_reuses_inputs_and_noise_without_future_gt(monkeypatch, tmp_path, case_name):
     native_cpu_helpers(monkeypatch)
     from worldttn import cli, sana, checkpoint, performance
     from worldttn.core import TTNConfig
@@ -113,7 +148,8 @@ def test_custom_pair_reuses_inputs_and_noise_without_future_gt(monkeypatch, tmp_
     monkeypatch.setattr(cli, "rollout", rollout)
     monkeypatch.setattr(decoder, "main", lambda argv: decoded.append(argv))
     output = tmp_path / "custom"
-    custom.main(["--training-run", str(tmp_path), "--output", str(output)])
+    custom.main(["--training-run", str(tmp_path), "--output", str(output),
+                 "--case", str(custom.REPO / "assets/worldttn/study_static" / case_name)])
     assert hashes[0] == hashes[1]
     assert [row["install_adapter"] for row in built] == [False, True]
     assert built[1]["dtype"] == torch.float32
@@ -121,3 +157,5 @@ def test_custom_pair_reuses_inputs_and_noise_without_future_gt(monkeypatch, tmp_
     assert summary["metrics"] is None and summary["protocol"]["no_training_dataset_read"]
     assert summary["protocol"]["step"] == 100 and len(decoded) == 1
     assert [tensor.shape[2] for tensor in latents] == [61, 61]
+    assert np.load(output / "camera_poses.npy").shape == (481, 4, 4)
+    assert all((row["return_view"] is None) == (case_name == "case.json") for row in summary["episodes"])

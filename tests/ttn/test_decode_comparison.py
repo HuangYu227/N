@@ -4,7 +4,7 @@ import pytest
 import torch
 from PIL import ImageFont
 
-from tools.ttn_decode_comparison import comparison_frame, load_pair, pixels
+from tools.ttn_decode_comparison import comparison_frame, load_pair, pixels, save_return_views
 
 
 def test_saved_pair_prefix_and_video_conversion(tmp_path):
@@ -36,3 +36,19 @@ def test_saved_pair_prefix_and_video_conversion(tmp_path):
     assert combined.shape == (66, 8, 3)
     np.testing.assert_array_equal(combined[64:, :4], video[0])
     np.testing.assert_array_equal(combined[64:, 4:], video[-1])
+
+
+def test_return_views_use_only_completed_orbit_and_observed_reference(tmp_path):
+    protocol = {"step": 100, "case": {"raw_frames": 481,
+                "camera": {"trajectory": "closed_orbit", "end_hold_raw_frames": 48}}}
+    a = np.zeros((481, 2, 4, 3), dtype=np.uint8)
+    b = a.copy()
+    a[433:] = 255
+    b[432] = 255  # Still-moving closing interval must not enter the return window.
+    assert save_return_views(tmp_path, [a[:121], b[:121]], protocol, ImageFont.load_default()) is None
+    assert not (tmp_path / "return-view.json").exists()
+    metrics = save_return_views(tmp_path, [a, b], protocol, ImageFont.load_default())
+    assert metrics["return_raw_frame_range"] == [433, 481]
+    assert metrics["methods"]["sana"]["mean_return_to_observed_rgb_mse"] == 1
+    assert metrics["methods"]["ttn"]["mean_return_to_observed_rgb_mse"] == 0
+    assert (tmp_path / "return-comparison.png").is_file()

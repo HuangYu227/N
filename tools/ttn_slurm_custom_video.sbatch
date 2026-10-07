@@ -26,4 +26,4 @@ unset RANK LOCAL_RANK WORLD_SIZE NODE_RANK LOCAL_WORLD_SIZE MASTER_ADDR MASTER_P
 [[ -x "$PYTHON" && -f "$CUSTOM_TRAINING_RUN/run_config.json" && -f "$CUSTOM_TRAINING_RUN/last.pt" ]]
 srun --mpi=none --kill-on-bad-exit=1 --nodes=1 --ntasks=1 --gres=gpu:1 \
     bash tools/ttn_slurm_worker.sh --training-run "$CUSTOM_TRAINING_RUN" \
-    --case assets/worldttn/study_static/case.json --output "$CUSTOM_OUTPUT" "$@"
+    --case "${CUSTOM_CASE:-assets/worldttn/study_static/case.json}" --output "$CUSTOM_OUTPUT" "$@"

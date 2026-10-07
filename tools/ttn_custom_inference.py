@@ -27,10 +27,11 @@ def load_case(path):
         raise ValueError("raw/latent frame count or 16-fps protocol disagrees")
     camera = case["camera"]
     intr = np.asarray(camera["intrinsics_px"], dtype=np.float32)
-    if (camera["trajectory"] != "static" or camera["intrinsics_grid_hw"] != [height, width]
+    if (camera["intrinsics_grid_hw"] != [height, width]
             or intr.shape != (4,) or not np.isfinite(intr).all() or np.any(intr[:2] <= 0)
             or not 0 <= intr[2] <= width or not 0 <= intr[3] <= height):
-        raise ValueError("invalid fixed virtual camera")
+        raise ValueError("invalid virtual camera intrinsics")
+    camera_poses(case)  # Validate the trajectory before allocating a model.
     image = path.parent / case["image"]
     if file_sha256(image) != case["image_sha256"]:
         raise ValueError("custom first-frame SHA256 mismatch")
@@ -40,10 +41,36 @@ def load_case(path):
     return case, image, prompt
 
 
+def camera_poses(case):
+    """OpenCV C2W: horizontal translated orbit, looking at a fixed circle centre."""
+    camera, frames = case["camera"], case["raw_frames"]
+    poses = np.repeat(np.eye(4, dtype=np.float32)[None], frames, axis=0)
+    if camera["trajectory"] == "static":
+        return poses
+    if camera["trajectory"] != "closed_orbit":
+        raise ValueError("unsupported custom camera trajectory")
+    radius = camera["radius"]
+    start, hold = camera["start_hold_raw_frames"], camera["end_hold_raw_frames"]
+    if (not np.isfinite(radius) or radius <= 0 or
+            any(type(n) is not int or n < 8 or n % 8 for n in (start, hold)) or
+            start + hold >= frames - 1):
+        raise ValueError("closed orbit requires positive radius and valid 8-frame-aligned holds")
+    end = frames - 1 - hold
+    phase = np.clip((np.arange(frames, dtype=np.float64) - start) / (end - start), 0, 1)
+    angle = 2 * np.pi * (3 * phase**2 - 2 * phase**3)  # Smooth start/stop.
+    c, s = np.cos(angle), np.sin(angle)
+    poses[:, 0, 0], poses[:, 0, 2] = c, -s
+    poses[:, 2, 0], poses[:, 2, 2] = s, c
+    poses[:, 0, 3], poses[:, 2, 3] = radius * s, radius * (1 - c)
+    # Exact closure, including intrinsics/rays; avoid sin(2*pi) rounding drift.
+    poses[:start + 1] = poses[end:] = np.eye(4, dtype=np.float32)
+    return poses
+
+
 def make_geometry(case, vae_stride):
     from inference_video_scripts.wm.inference_sana_wm import prepare_camera
     height, width = case["target_size_hw"]
-    poses = np.repeat(np.eye(4, dtype=np.float32)[None], case["raw_frames"], axis=0)
+    poses = camera_poses(case)
     intr = np.repeat(np.asarray(case["camera"]["intrinsics_px"], dtype=np.float32)[None], len(poses), axis=0)
     packed = prepare_camera(poses, intr, target_size=(height, width), vae_stride=vae_stride)
     camera = packed["raymap"].clone()
@@ -54,6 +81,24 @@ def make_geometry(case, vae_stride):
     if camera.shape != (case["latent_frames"], 20):
         raise ValueError("camera/frame count mismatch")
     return {"camera_conditions": camera[None], "chunk_plucker": packed["chunk_plucker"][None]}
+
+
+def return_latent_metrics(generated, batch, case):
+    """Initial-view consistency, not future-GT accuracy or proof of camera following."""
+    if case["camera"]["trajectory"] != "closed_orbit":
+        return None
+    # Exclude the closing latent's raw interval, which still contains movement.
+    first_raw = case["raw_frames"] - case["camera"]["end_hold_raw_frames"]
+    ids = list(range((first_raw + 7) // 8, case["latent_frames"]))
+    camera, rays = batch["camera_conditions"], batch["chunk_plucker"]
+    if (not ids or not torch.equal(camera[:, ids], camera[:, :1].expand(-1, len(ids), -1)) or
+            not torch.equal(rays[:, :, ids], rays[:, :, :1].expand(-1, -1, len(ids), -1, -1))):
+        raise ValueError("return window camera/rays do not match the observed view")
+    errors = (generated[:, :, ids].float() - generated[:, :, :1].float()).square().mean((0, 1, 3, 4))
+    return {"reference": "observed latent frame 0; no future GT",
+            "return_latent_ids": ids, "per_frame_latent_mse": errors.cpu().tolist(),
+            "mean_return_to_observed_latent_mse": errors.mean().item(),
+            "final_return_to_observed_latent_mse": errors[-1].item()}
 
 
 def encode_first_frame(case, image_path, config, output):
@@ -115,6 +160,7 @@ def main(argv=None):
     args.output.mkdir(parents=True, exist_ok=False)
     seed_everything(case["seed"])
     batch = make_geometry(case, config.vae.vae_stride)
+    np.save(args.output / "camera_poses.npy", camera_poses(case))
     batch["initial_latent"] = encode_first_frame(case, image_path, config, args.output)
     tokenizer, encoder = get_tokenizer_and_text_encoder(config.text_encoder.text_encoder_name, "cpu")
     encoder.eval().requires_grad_(False)
@@ -176,7 +222,8 @@ def main(argv=None):
         row = {"method": method, "case_id": case["case_id"], "seed": case["seed"],
                "input_sha256": inputs, "initial_noise_sha256": tensor_sha256(noise),
                "base_sha256": model.base_load_report["sha256"], "chunks": chunks, "timing": timing,
-               "commits": runtime.commit_count if runtime else None}
+               "commits": runtime.commit_count if runtime else None,
+               "return_view": return_latent_metrics(generated, gpu_batch, case)}
         torch.save({"latents": generated.cpu(), "method": method, "case_id": case["case_id"],
                     "seed": case["seed"], "chunks": [{key: c[key] for key in ("chunk", "start", "end")} for c in chunks]},
                    args.output / f"case-000-{method}.pt")

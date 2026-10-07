@@ -69,6 +69,39 @@ def comparison_frame(left, right, frame, stride, step, font):
     return np.asarray(canvas)
 
 
+def save_return_views(output, videos, protocol, font):
+    """Compare decoded initial/returned views before lossy MP4 encoding."""
+    case = protocol.get("case", {})
+    camera = case.get("camera", {})
+    if camera.get("trajectory") != "closed_orbit" or len(videos[0]) != case["raw_frames"]:
+        return None  # A prefix that has not returned cannot measure loop consistency.
+    from PIL import Image, ImageDraw
+    start = case["raw_frames"] - camera["end_hold_raw_frames"]
+    height, width, _ = videos[0].shape[1:]
+    canvas = Image.new("RGB", (2 * width, 2 * (height + 64)))
+    draw = ImageDraw.Draw(canvas)
+    metrics = {"reference": "decoded observed frame 0; RGB in [0,1], before MP4 encoding",
+               "return_raw_frame_range": [start, case["raw_frames"]],
+               "note": "Initial-view consistency only; no future GT. A static video can also score well: inspect camera motion separately.",
+               "methods": {}}
+    for row, (method, video) in enumerate(zip(("sana", "ttn"), videos)):
+        reference = video[0].astype(np.float32) / 255
+        errors = [float(np.square(frame.astype(np.float32) / 255 - reference).mean())
+                  for frame in video[start:]]
+        metrics["methods"][method] = {"mean_return_to_observed_rgb_mse": float(np.mean(errors)),
+                                      "final_return_to_observed_rgb_mse": errors[-1]}
+        top = row * (height + 64)
+        label = "SANA pretrained" if method == "sana" else f"TTN step {protocol['step']}"
+        for x, frame, name in ((0, video[0], "Observed reconstruction"),
+                                (width, video[-1], "Returned view")):
+            canvas.paste(Image.fromarray(frame), (x, top + 64))
+            draw.text((x + 12, top + 5), label, fill="white", font=font)
+            draw.text((x + 12, top + 34), name, fill="white", font=font)
+    canvas.save(output / "return-comparison.png")
+    (output / "return-view.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+    return metrics
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--evaluation", type=Path, required=True)
@@ -134,6 +167,10 @@ def main(argv=None):
                 "input_sha256": episode["input_sha256"], "initial_noise_sha256": episode["initial_noise_sha256"],
                 "vae": asdict(config.vae), "sana_config_sha256": hashlib.sha256(args.sana_config.read_bytes()).hexdigest(),
                 "decode_seconds": dict(zip(("sana", "ttn"), times)), "files": ["sana.mp4", "ttn.mp4", "comparison.mp4"]}
+    returned = save_return_views(args.output, videos, summary["protocol"], font)
+    if returned is not None:
+        metadata["return_view"] = returned
+        metadata["files"] += ["return-comparison.png", "return-view.json"]
     (args.output / "comparison.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     print(f"[TTN video] completed: {args.output}", flush=True)
 
