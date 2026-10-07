@@ -18,6 +18,42 @@ from .core import TTNConfig, BASE_REVISION
 from .training import chunk_ranges
 
 
+HISTORY_ACCESS = {
+    "generated": "one observed frame; generated chunks update all history",
+    "gt": "GT slice after current denoising; commits TTN + GDN/camera/FFN caches; output remains generated",
+    "ttn-gt": "GT clean pass supplies TTN S/psi; generated clean pass supplies native GDN/camera/FFN caches",
+    "native-gt": "generated clean pass supplies TTN S/psi; GT clean pass supplies native GDN/camera/FFN caches",
+}
+
+
+def validate_inference_interventions(args, config):
+    """Reject incompatible diagnostic combinations before loading cases/models."""
+    from .sink import sink_options_from_args
+    sink = sink_options_from_args(args)
+    history = getattr(args, "history_source", "generated")
+    if history not in HISTORY_ACCESS:
+        raise ValueError("unknown clean history source")
+    mixed = history in ("ttn-gt", "native-gt")
+    if sink.active and "ttn" not in getattr(args, "eval_methods", ["sana", "ttn"]):
+        raise ValueError("active sink requires a TTN evaluation method")
+    if mixed and tuple(getattr(args, "eval_methods", ["sana", "ttn"])) != ("ttn",):
+        raise ValueError("mixed history interventions require TTN-only evaluation")
+    if sink.active or mixed:
+        if config.stage != "C" or getattr(args, "ttn_ablation", "full") != "full":
+            raise ValueError("sink and mixed history require Full Stage C")
+        if (config.camera_attention != "sana" or getattr(args, "camera_ablation", False)
+                or getattr(args, "camera_attention", None) not in (None, "sana")):
+            raise ValueError("sink and mixed history require native SANA camera without overrides")
+        if (getattr(args, "ttn_core_backend", "reference"),
+                getattr(args, "ttn_psi_backend", "reference")) != ("reference", "reference"):
+            raise ValueError("sink and mixed history require reference/reference")
+        if getattr(args, "ttn_compare_reference", False):
+            raise ValueError("sink/history interventions cannot be used for backend comparison")
+    if sink.active and history != "generated":
+        raise ValueError("sink experiments require generated history; run H1/H2 separately")
+    return sink
+
+
 def latent_metrics(generated, reference, revisit_pairs, *, training_frames=None):
     if generated.shape != reference.shape or generated.ndim != 5 or generated.shape[0] != 1:
         raise ValueError("paired latents must have identical [1,C,F,H,W] shapes")
@@ -333,6 +369,7 @@ def evaluate_command(args):
     history = getattr(args, "history_source", "generated")
     methods = getattr(args, "eval_methods", ("sana", "ttn"))
     diagnostics = getattr(args, "state_diagnostics", False)
+    sink = validate_inference_interventions(args, ttn)
     if ablation != "full" and ttn.stage != "C": raise ValueError("mechanism ablations require a Stage C checkpoint")
     if getattr(args, "ttn_compare_reference", False):
         if tuple(methods) != ("sana", "ttn") or ablation != "full" or diagnostics:
@@ -371,10 +408,10 @@ def evaluate_command(args):
                 "training_run": str(training_run), "checkpoint": str(adapter), "checkpoint_sha256": adapter_digest,
                 "stage": ttn.stage, "step": last_train["step"], "frames": args.frames, "steps": args.steps,
                 "ttn_ablation": ablation, "history_source": history, "eval_methods": list(methods),
+                "tla_sink": asdict(sink),
                 "meta_ttt": {"local_update": ttn.local_update, "persistent_meta": ttn.persistent_meta},
                 "state_diagnostics": diagnostics,
-                "history_access": "GT slice after current denoising; commits TTN + GDN/camera/FFN caches; output remains generated"
-                    if history == "gt" else "one observed frame; generated chunks update all history",
+                "history_access": HISTORY_ACCESS[history],
                 "train_scope": last_train.get("train_scope", run["arguments"].get("train_scope", "ttn")),
                 "weight_scope": last_train.get("weight_scope", "ttn"),
                 "provenance": implementation_identity(), "training_provenance": run.get("provenance"),
@@ -444,7 +481,10 @@ def evaluate_command(args):
             runtime_options = {"on_state": save_state} if getattr(args, "ttn_compare_reference", False) else {}
             if method == "ttn" and (ablation != "full" or diagnostics):
                 runtime_options.update(ttn_ablation=ablation, state_diagnostics=diagnostics)
-            if history == "gt": runtime_options["history_reference"] = gt
+            if method == "ttn" and sink.active:
+                runtime_options["sink_options"] = sink
+            if history != "generated":
+                runtime_options.update(history_reference=gt, history_source=history)
             (generated, runtime, chunks), timing = timed_cuda(lambda: rollout(
                 model, config, batch, args.steps, args.cfg_scale, args.cached_blocks, initial_noise=noise,
                 on_chunk=progress, **runtime_options))
@@ -458,7 +498,10 @@ def evaluate_command(args):
                    "base_sha256": model.base_load_report["sha256"],
                    "parameter_dtypes": sorted({str(p.dtype) for p in model.parameters()}),
                    "commits": runtime.commit_count if runtime else None,
-                   "predictions": runtime.predict_count if runtime else None}
+                   "predictions": runtime.predict_count if runtime else None,
+                   "sink_reference_sha256": getattr(runtime, "sink_reference_sha256", None),
+                   "sink_reference_verified": getattr(runtime, "sink_reference_verified", None)
+                       if getattr(runtime, "sink_reference_sha256", None) is not None else None}
             if diagnostics and args.frames >= 13:
                 row["prefix_13_metrics"] = latent_metrics(generated[:, :, :13], gt[:, :, :13],
                     [p for p in case["revisit_pairs"] if p["frame_b"] < 13], **metric_options)

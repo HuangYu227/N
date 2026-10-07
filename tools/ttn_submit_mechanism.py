@@ -1,4 +1,4 @@
-"""Submit four single-GPU interventions using a completed milestone's pinned snapshot."""
+"""Submit single-GPU interventions using a completed milestone's pinned snapshot."""
 import argparse
 from datetime import datetime, timezone
 import hashlib
@@ -16,7 +16,7 @@ def digest(path):
     return result.hexdigest()
 
 
-def prepare(evaluation, output=None, fixed_cases=None):
+def prepare(evaluation, output=None, fixed_cases=None, suite="mechanisms"):
     evaluation = Path(evaluation).resolve()
     completed = json.loads((evaluation / "summary.json").read_text())
     if completed["status"] != "completed": raise ValueError("source milestone evaluation must be completed")
@@ -24,6 +24,10 @@ def prepare(evaluation, output=None, fixed_cases=None):
     if protocol["stage"] != "C" or protocol["frames"] != 61 or protocol["ttn_camera_attention"] != "sana":
         raise ValueError("requires a C / original-SANA-camera / 61-frame milestone")
     if protocol.get("camera_ablation", False): raise ValueError("source evaluation must not override the trained camera")
+    from worldttn.mechanism_evaluation import sink_identity, suite_variants
+    if sink_identity(protocol) != {"mode": "off"}:
+        raise ValueError("source evaluation must have TLA sink off")
+    variants = suite_variants(suite, any(protocol.get("meta_ttt", {}).values()))
     snapshot = Path(protocol["training_run"])
     metadata = json.loads((snapshot / "snapshot.json").read_text())
     if metadata["step"] != protocol["step"] or digest(snapshot / "last.pt") != protocol["checkpoint_sha256"]:
@@ -33,11 +37,10 @@ def prepare(evaluation, output=None, fixed_cases=None):
     cases = next((p for p in candidates if p.is_file() and digest(p) == protocol["fixed_cases_sha256"]), None)
     if cases is None: raise ValueError("matching fixed cases not found; pass --fixed-cases explicitly")
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    output = Path(output).resolve() if output else evaluation.parent / f"mechanisms-step-{protocol['step']:06d}-{stamp}"
+    output = Path(output).resolve() if output else evaluation.parent / f"{suite}-step-{protocol['step']:06d}-{stamp}"
     if output.exists(): raise ValueError("use a new mechanism output directory")
-    from worldttn.mechanism_evaluation import VARIANTS, META_VARIANTS
-    variants = META_VARIANTS if any(protocol.get("meta_ttt", {}).values()) else VARIANTS
     return {"output": str(output), "source_evaluation": str(evaluation), "snapshot": str(snapshot),
+            "suite": suite, "interventions": {name: list(spec) for name, spec in variants.items()},
             "variants": list(variants), "array": f"0-{len(variants)-1}%1",
             "fixed_cases": str(cases.resolve()), "checkpoint_sha256": protocol["checkpoint_sha256"],
             "fixed_cases_sha256": protocol["fixed_cases_sha256"], "step": protocol["step"],
@@ -53,10 +56,11 @@ def main():
     parser.add_argument("--evaluation", required=True, help="completed joint/evaluations/step-000100 directory")
     parser.add_argument("--fixed-cases")
     parser.add_argument("--output")
+    parser.add_argument("--suite", choices=("mechanisms", "histories"), default="mechanisms")
     parser.add_argument("--partition", default="short")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
-    plan = prepare(args.evaluation, args.output, args.fixed_cases)
+    plan = prepare(args.evaluation, args.output, args.fixed_cases, args.suite)
     project = Path(__file__).resolve().parents[1]
     root = Path(os.environ.get("ROOT", "/data/group/zhaolab/home/z2zhang/huangyu"))
     python = root / "envs/worldttn/bin/python"
@@ -67,7 +71,8 @@ def main():
         if key.startswith(("SLURM_", "SBATCH_")) or key in (
             "RANK", "LOCAL_RANK", "WORLD_SIZE", "NODE_RANK", "LOCAL_WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT",
             "CUDA_VISIBLE_DEVICES", "COMMAND", "ADAPTER", "CAMERA_ATTENTION", "CAMERA_ABLATION", "NOISE_FRAMES",
-            "TTN_ABLATION", "HISTORY_SOURCE", "STATE_DIAGNOSTICS", "EVAL_METHODS", "CONFIG", "SANA_CONFIG", "BASE_WEIGHTS"):
+            "TTN_ABLATION", "HISTORY_SOURCE", "STATE_DIAGNOSTICS", "EVAL_METHODS", "CONFIG", "SANA_CONFIG", "BASE_WEIGHTS",
+            "TLA_SINK", "SINK_GAIN", "SINK_POSITION", "SINK_START_CHUNK", "TTN_CORE_BACKEND", "TTN_PSI_BACKEND"):
             env.pop(key, None)
     env.update(ROOT=str(root), PYTHON=str(python), PROJECT_ROOT=str(project), TRAINING_RUN=plan["snapshot"],
         MECHANISM_OUTPUT=plan["output"], FIXED_CASES=plan["fixed_cases"], STEPS=str(plan["steps"]),

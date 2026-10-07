@@ -14,16 +14,34 @@ VARIANTS = {
 }
 META_VARIANTS = {**VARIANTS, "no-local": ("no-local", "generated", ["ttn"]),
                  "no-persistent": ("no-persistent", "generated", ["ttn"])}
+HISTORY_VARIANTS = {
+    "full": ("full", "generated", ["sana", "ttn"]),
+    "ttn-gt-history": ("full", "ttn-gt", ["ttn"]),
+    "native-gt-history": ("full", "native-gt", ["ttn"]),
+    "gt-history": ("full", "gt", ["sana", "ttn"]),
+}
 IDENTITY = ("stage", "step", "checkpoint_sha256", "fixed_cases_sha256", "frames", "noise_frames",
             "steps", "cfg_scale", "cached_blocks", "flow_shift", "ttn_camera_attention",
             "cross_attn_backend", "training_latent_frames", "provenance")
 
 
 def atomic_json(path, value):
-    path = Path(path)
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n", encoding="utf-8")
-    temporary.replace(path)
+    from .checkpoint_integrity import atomic_json as publish
+    json.dumps(value, allow_nan=False)  # Reject invalid metrics before replacing an existing result.
+    publish(value, path)  # Reuse private temporary files + fsync for concurrent status readers/writers.
+
+
+def suite_variants(suite, meta=False):
+    if suite == "histories": return HISTORY_VARIANTS
+    if suite == "mechanisms": return META_VARIANTS if meta else VARIANTS
+    raise ValueError(f"unexpected intervention suite: {suite}")
+
+
+def sink_identity(protocol):
+    """Legacy missing sink and the exact zero-gain fast path are both off."""
+    sink = protocol.get("tla_sink", {"mode": "off"})
+    if not isinstance(sink, dict): raise ValueError("invalid TLA sink protocol")
+    return {"mode": "off"} if sink.get("mode") == "off" or sink.get("gain") == 0 else sink
 
 
 def collect_mechanisms(output):
@@ -34,10 +52,13 @@ def collect_mechanisms(output):
     meta = json.loads(full.read_text())["protocol"].get("meta_ttt", {}) if full.is_file() else {}
     plan_path = output / "plan.json"
     plan = json.loads(plan_path.read_text()) if plan_path.is_file() else {}
-    names = plan.get("variants", list(META_VARIANTS if any(meta.values()) else VARIANTS))
-    if names not in (list(VARIANTS), list(META_VARIANTS)):
+    suite = plan.get("suite", "mechanisms")
+    available = suite_variants(suite, any(meta.values()))
+    names = plan.get("variants", list(available))
+    allowed = (list(VARIANTS), list(META_VARIANTS)) if suite == "mechanisms" else (list(HISTORY_VARIANTS),)
+    if names not in allowed:
         raise ValueError("unexpected mechanism variants")
-    variants = {name: META_VARIANTS[name] for name in names}
+    variants = {name: (META_VARIANTS if suite == "mechanisms" else available)[name] for name in names}
     for name, (ablation, history, methods) in variants.items():
         folder = output / name
         status = output / f"{name}-status.json"
@@ -52,15 +73,22 @@ def collect_mechanisms(output):
             raise ValueError("mechanism comparisons require C checkpoints and state diagnostics")
         current = {key: protocol[key] for key in IDENTITY}
         current["meta_ttt"] = protocol.get("meta_ttt", {"local_update": False, "persistent_meta": False})
+        current["tla_sink"] = sink_identity(protocol)
+        if suite == "histories" and current["tla_sink"] != {"mode": "off"}:
+            raise ValueError("history isolation requires TLA sink off")
         if identity is not None and current != identity:
             raise ValueError("mechanism runs used different checkpoints/cases/sampling/source")
         identity = current
         summaries[name] = summary
         statuses[name] = {"status": "completed", "path": str(path)}
-    result = {"status": "running", "identity": identity, "variants": statuses,
+    result = {"status": "running", "suite": suite, "identity": identity, "variants": statuses,
               "interpretation": "same-weight runtime interventions; single-case results are not causal proof or a benchmark",
               "prefix_protocol": "13-frame metrics are the causal prefix of each 61-frame rollout",
               "results": {}, "contrasts": {}}
+    if suite == "histories":
+        result["interpretation"] = ("same-weight conditional history interventions in a coupled system; "
+                                    "TTN and native features are not independent modules; "
+                                    "single-case results are not causal proof or a benchmark")
     if any(s["status"] == "failed" for s in statuses.values()): result["status"] = "failed"
     if "full" not in summaries: return result
     def rows(name, method):
@@ -73,6 +101,8 @@ def collect_mechanisms(output):
     signatures = ("input_sha256", "initial_noise_sha256", "base_sha256")
     if plan_path.is_file():
         original = json.loads((Path(plan["source_evaluation"]) / "long/summary.json").read_text())
+        if sink_identity(original["protocol"]) != sink_identity(summaries["full"]["protocol"]):
+            raise ValueError("Full C differs from the source milestone TLA sink protocol")
         for field in ("checkpoint_sha256", "fixed_cases_sha256", "stage", "step", "frames", "steps",
                       "cfg_scale", "cached_blocks", "flow_shift", "ttn_camera_attention"):
             if original["protocol"][field] != summaries["full"]["protocol"][field]:
@@ -118,6 +148,18 @@ def collect_mechanisms(output):
     if "gt-history" in summaries:
         result["contrasts"]["ttn_gt_history_minus_generated_history"] = contrast("gt-history", "full")
         result["contrasts"]["sana_gt_history_minus_generated_history"] = contrast("gt-history", "full", "sana")
+    for name, key in (("ttn-gt-history", "ttn_gt_state_minus_generated_state"),
+                      ("native-gt-history", "native_gt_cache_minus_generated_cache")):
+        if name in summaries: result["contrasts"][key] = contrast(name, "full")
+    if suite == "histories" and len(summaries) == len(variants):
+        interaction = {}
+        for horizon in ("short", "long"):
+            interaction[horizon] = {}
+            for metric in result["results"]["full"][horizon]["metrics"]:
+                values = [result["results"][name][horizon]["metrics"][metric]["ttn"] for name in variants]
+                interaction[horizon][metric] = (values[0] - values[1] - values[2] + values[3]
+                                                if all(v is not None for v in values) else None)
+        result["contrasts"]["history_factorial_interaction"] = interaction
     if len(summaries) == len(variants): result["status"] = "completed"
     return result
 
@@ -125,7 +167,7 @@ def collect_mechanisms(output):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output")
-    parser.add_argument("--variant", choices=META_VARIANTS)
+    parser.add_argument("--variant", choices={**META_VARIANTS, **HISTORY_VARIANTS})
     parser.add_argument("--status", choices=("running", "completed", "failed"))
     args = parser.parse_args()
     output = Path(args.output).resolve()

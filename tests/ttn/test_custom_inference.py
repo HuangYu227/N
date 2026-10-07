@@ -137,7 +137,7 @@ def test_custom_pair_reuses_inputs_and_noise_without_future_gt(monkeypatch, tmp_
     monkeypatch.setattr(checkpoint, "load_checkpoint", lambda *a: None)
     monkeypatch.setattr(performance, "configure_execution", lambda *a: None)
     monkeypatch.setattr(cli, "timed_cuda", lambda call: (call(), {"seconds": 0}))
-    def rollout(model, config, batch, *args, initial_noise, on_chunk):
+    def rollout(model, config, batch, *args, initial_noise, on_chunk, **runtime_options):
         assert "clean_latents" not in batch and batch["initial_latent"].shape[2] == 1
         hashes.append(custom.tensor_sha256(initial_noise))
         result = initial_noise.clone()
@@ -159,3 +159,16 @@ def test_custom_pair_reuses_inputs_and_noise_without_future_gt(monkeypatch, tmp_
     assert [tensor.shape[2] for tensor in latents] == [61, 61]
     assert np.load(output / "camera_poses.npy").shape == (481, 4, 4)
     assert all((row["return_view"] is None) == (case_name == "case.json") for row in summary["episodes"])
+    # The intervention reuses the already encoded observation/text and original SANA rollout.
+    monkeypatch.setattr(custom, "encode_first_frame", lambda *a: pytest.fail("shared first frame must not be re-encoded"))
+    intervention = tmp_path / "sink"
+    custom.main(["--training-run", str(tmp_path), "--output", str(intervention),
+                 "--case", str(custom.REPO / "assets/worldttn/study_static" / case_name),
+                 "--reuse-baseline", str(output), "--tla-sink", "protected", "--state-diagnostics"])
+    changed = json.loads((intervention / "summary.json").read_text())
+    assert len(built) == 3 and built[-1]["install_adapter"]
+    assert changed["protocol"]["tla_sink"]["mode"] == "protected"
+    assert changed["protocol"]["input_bundle_sha256"] == summary["protocol"]["input_bundle_sha256"]
+    assert hashes[0] == hashes[1] == hashes[2]
+    assert len(decoded) == 3 and decoded[-1][-4:] == ["--left-evaluation", str(output), "--left-method", "ttn"]
+    assert decoded[-1][decoded[-1].index("--output") + 1] == str(intervention / "videos-vs-ttn-baseline")

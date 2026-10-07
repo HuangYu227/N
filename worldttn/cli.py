@@ -154,7 +154,8 @@ def train_update(model, config, batch, optimizer, k, parallel=None, *, activatio
 
 @torch.no_grad()
 def rollout(model, config, batch, steps=4, cfg_scale=4.5, cached_blocks=-1, *, initial_noise=None, on_chunk=None,
-            ttn_ablation="full", state_diagnostics=False, history_reference=None, on_state=None):
+            ttn_ablation="full", state_diagnostics=False, history_reference=None, on_state=None,
+            history_source=None, sink_options=None):
     from diffusion.scheduler.self_forcing_flow_euler_sampler import SelfForcingFlowEulerCamCtrl
     initial = batch.get("initial_latent")
     if initial is None: initial = batch["clean_latents"][:, :, :1]
@@ -163,6 +164,18 @@ def rollout(model, config, batch, steps=4, cfg_scale=4.5, cached_blocks=-1, *, i
     frames = batch["camera_conditions"].shape[1]
     if frames < 4 or frames % 3 != 1: raise ValueError("native first-plus-one rollout requires 1+3n latent frames")
     shape = (initial.shape[0], initial.shape[1], frames, *initial.shape[-2:])
+    history_source = history_source or ("gt" if history_reference is not None else "generated")
+    if history_source not in ("generated", "gt", "ttn-gt", "native-gt"):
+        raise ValueError("unknown clean history source")
+    if (history_source != "generated") != (history_reference is not None):
+        raise ValueError("GT/mixed history requires an explicit reference; generated history cannot access it")
+    if history_source in ("ttn-gt", "native-gt") and not hasattr(model, "ttn_system"):
+        raise ValueError("mixed history requires a TTN model")
+    if sink_options is not None and sink_options.active:
+        if not hasattr(model, "ttn_system"):
+            raise ValueError("TLA sink requires a TTN model")
+        if history_source != "generated":
+            raise ValueError("TLA sink requires generated history")
     if history_reference is not None:
         if history_reference.device.type != "cpu" or tuple(history_reference.shape) != shape:
             raise ValueError("GT-history reference must stay on CPU with the exact rollout shape")
@@ -178,7 +191,7 @@ def rollout(model, config, batch, steps=4, cfg_scale=4.5, cached_blocks=-1, *, i
     extras = {"chunk_plucker": batch["chunk_plucker"]} if "chunk_plucker" in batch else {}
     session = TTNSession(model, batch["camera_conditions"], batch["width"], batch["height"],
                          batch.get("frame_valid_mask"), extras, ablation=ttn_ablation,
-                         diagnostics=state_diagnostics) if hasattr(model, "ttn_system") else None
+                         diagnostics=state_diagnostics, **({"sink_options": sink_options} if sink_options is not None else {})) if hasattr(model, "ttn_system") else None
     from .session import repeat_batch
     cfg_batch = initial.shape[0] * (2 if cfg_scale > 1 else 1)
     camera = repeat_batch(batch["camera_conditions"], cfg_batch).clone()
@@ -205,7 +218,8 @@ def rollout(model, config, batch, steps=4, cfg_scale=4.5, cached_blocks=-1, *, i
     last = time.perf_counter()
     try:
         history_kwargs = {} if history_reference is None else {
-            "clean_history_provider": lambda start, end: history_reference[:, :, start:end].to(initial.device)}
+            "clean_history_provider": lambda start, end: history_reference[:, :, start:end].to(initial.device),
+            "clean_history_source": history_source}
         solver = SelfForcingFlowEulerCamCtrl(model,
                                              batch["y"],
                                              batch.get("uncondition", torch.zeros_like(batch["y"])),
@@ -228,7 +242,8 @@ def rollout(model, config, batch, steps=4, cfg_scale=4.5, cached_blocks=-1, *, i
                     "seconds": now - last,
                     **(session.runtime.last_stats if session is not None else {})
                 })
-                if history_reference is not None: records[-1]["clean_history_source"] = "GT after current prediction; all caches"
+                if history_reference is not None:
+                    records[-1]["clean_history_source"] = history_source
                 if on_chunk is not None: on_chunk(records[-1])
                 if on_state is not None and session is not None: on_state(index, session.runtime)
                 last = now
@@ -240,6 +255,9 @@ def rollout(model, config, batch, steps=4, cfg_scale=4.5, cached_blocks=-1, *, i
             raise AssertionError("prefill/chunk state counters disagree")
         if any(len(ids) != frames for ids in session.runtime.committed_frame_ids):
             raise AssertionError("duplicate/missing frame writes")
+        if session.runtime.sink_options.active and session.runtime.sink_reference is not None:
+            session.runtime.verify_sink_reference()
+            session.runtime.sink_reference_verified = True
     if not torch.equal(noise[:, :, :1], initial.float()): raise AssertionError("initial frame was modified")
     return noise, session.runtime if session is not None else None, records
 
@@ -772,7 +790,7 @@ def diagnose_update_command(args):
         print(json.dumps(report), flush=True)
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("train", "infer", "smoke", "distributed-smoke", "distributed-check", "diagnose-update", "evaluate", "align-chunk", "stage-evaluate"))
     parser.add_argument("--training-run", help="completed training output directory; evaluate restores its config")
@@ -784,7 +802,7 @@ def main():
     parser.add_argument("--fixed-cases", help="immutable CPU case bundle pinned by stage evaluation (shared full horizon)")
     parser.add_argument("--ttn-ablation", choices=("full", "no-ttt", "identity", "no-local", "no-persistent"), default="full",
                         help="evaluate only: runtime intervention on the same C checkpoint, without changing stage/weights")
-    parser.add_argument("--history-source", choices=("generated", "gt"), default="generated",
+    parser.add_argument("--history-source", choices=("generated", "gt", "ttn-gt", "native-gt"), default="generated",
                         help="evaluate only: gt commits current GT after prediction to ALL caches; output stays generated")
     parser.add_argument("--state-diagnostics", action="store_true", help="evaluate only: detached per-head spectra/transport; adds diagnostic overhead")
     parser.add_argument("--eval-methods", nargs="+", choices=("sana", "ttn"), default=["sana", "ttn"],
@@ -859,7 +877,13 @@ def main():
     parser.add_argument("--frames", type=int, default=13)
     parser.add_argument("--latent-height", type=int, default=22)
     parser.add_argument("--latent-width", type=int, default=40)
-    args = parser.parse_args()
+    from .sink import add_sink_arguments, sink_options_from_args
+    add_sink_arguments(parser)
+    args = parser.parse_args(argv)
+    try:
+        sink = sink_options_from_args(args)
+    except ValueError as error:
+        parser.error(str(error))
     try:
         resolve_train_scope(args)
     except (ValueError, OSError) as error:
@@ -867,8 +891,12 @@ def main():
     if args.benchmark_save_checkpoint and (args.command != "train" or not benchmark_run(args)):
         parser.error("--benchmark-save-checkpoint requires a train benchmark/profiler/layout run")
     if args.command != "evaluate" and (args.ttn_ablation != "full" or args.history_source != "generated"
-            or args.state_diagnostics or args.eval_methods != ["sana", "ttn"]):
+            or args.state_diagnostics or args.eval_methods != ["sana", "ttn"] or args.tla_sink != "off"):
         parser.error("mechanism interventions are evaluate-only; training semantics are unchanged")
+    if args.history_source in ("ttn-gt", "native-gt") and args.eval_methods != ["ttn"]:
+        parser.error("mixed history interventions require TTN-only --eval-methods ttn")
+    if sink.active and args.history_source != "generated":
+        parser.error("sink experiments require generated history; run H1/H2 separately")
     if len(set(args.eval_methods)) != len(args.eval_methods): parser.error("--eval-methods must be distinct")
     if args.camera_attention is not None and args.command != "evaluate":
         parser.error("--camera-attention is an evaluate-only ablation; train with an explicit reference config")

@@ -10,6 +10,7 @@ from .performance import DEFAULT_EXECUTION, annotation, audit_layout
 from .stability import clean_anchor_stats, local_anchor_stats, matrix_scale
 from .geometry import apply_complex_rope
 from .runtime import TTNSystem
+from .sink import sink_read_stats, sink_effective_stats, validate_sink
 
 
 class TTNAnchor(nn.Module):
@@ -86,6 +87,7 @@ class TTNAnchor(nn.Module):
         diagnostic = kwargs.get("ttn_diagnostic")
         cfg = self.config
         execution = getattr(self, "ttn_execution", DEFAULT_EXECUTION)
+        validate_sink(ctx.sink_options, cfg, ctx.ablation, execution)
         b, n, c = x.shape
         if diagnostic is not None: diagnostic("input", x)
         read, write = ctx.token_masks(n)
@@ -119,7 +121,7 @@ class TTNAnchor(nn.Module):
             with annotation(execution, "CorrectRead"):
                 if execution.core_backend == "reference":
                     state, w = correct(predicted, k, v, beta, write, cfg.alpha_s, cfg.eps)
-                    raw = q @ state
+                    raw = q @ state if ctx.sink_reference is None else None
                 elif execution.core_backend == "compiled":
                     from . import compiled
                     if ctx.clean_mode or diagnostic is not None:
@@ -132,6 +134,16 @@ class TTNAnchor(nn.Module):
                     aux = correct_with_aux(predicted, k, v, beta, write, cfg.alpha_s, cfg.eps)
                     state, w = aux.candidate, aux.w
                     raw = q @ state
+            sink_stats = sink_delta = None
+            if ctx.sink_reference is not None:
+                reference = ctx.sink_reference[:, self.index]
+                raw = q @ ((1-ctx.sink_options.gain)*state + ctx.sink_options.gain*reference)
+                if ctx.clean_mode or ctx.collect_sink_stats or diagnostic is not None:
+                    before = q @ state
+                    sink_delta = raw-before
+                    sink_stats = sink_read_stats(before, q@reference, reference, sink_delta,
+                                                 ctx.sink_options, ctx.sink_shift, cfg.eps, ctx.sink_reference_sha256, read)
+                    sink_stats["active"] = True
             if ((ctx.collect_local_stats or diagnostic is not None) and (cfg.local_update or cfg.persistent_meta)
                     and not ctx.clean_mode and not ctx.prefill_mode):
                 if not local_enabled:
@@ -219,6 +231,14 @@ class TTNAnchor(nn.Module):
             raw = raw + camera_contribution
         if diagnostic is not None: diagnostic("fused_raw", raw)
         gate = F.silu(self.output_gate(x).float())
+        if sink_stats is not None:
+            sink_effective_stats(sink_stats, sink_delta.transpose(1, 2).reshape(b, n, c), gate,
+                                 self.proj, read, self.heads)
+            if ctx.clean_mode:
+                ctx.sink_stats[self.index] = sink_stats
+            elif ctx.collect_sink_stats and ctx.sink_trajectory:
+                ctx.sink_trajectory[-1]["anchors"][self.index] = sink_stats
+            if diagnostic is not None: diagnostic("sink_read", sink_stats)
         gated = (raw * gate).to(x.dtype)
         if diagnostic is not None: diagnostic("gated_raw", gated)
         out = self.proj(gated) * read[..., None].to(x.dtype)

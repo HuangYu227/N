@@ -9,8 +9,9 @@ import sys
 import pytest
 
 
-@pytest.mark.parametrize("task,fail", [(0, False), (1, False), (2, False), (3, False), (4, False), (5, False), (0, True)])
-def test_array_is_single_gpu_sequential_and_forwards_intervention(task, fail, tmp_path):
+@pytest.mark.parametrize("task,fail,suite", [*( (task, False, "mechanisms") for task in range(6)),
+    (0, True, "mechanisms"), *( (task, False, "histories") for task in range(4))])
+def test_array_is_single_gpu_sequential_and_forwards_intervention(task, fail, suite, tmp_path):
     bash = Path("D:/Git/bin/bash.exe")
     if not bash.exists():
         candidate = shutil.which("bash")
@@ -30,6 +31,10 @@ def test_array_is_single_gpu_sequential_and_forwards_intervention(task, fail, tm
     python.parent.mkdir(parents=True)
     writer = tmp_path / "writer.py"
     writer.write_text("import json,os,sys\nfrom pathlib import Path\n"
+                     "if sys.argv[1]=='-':\n"
+                     "    sys.argv=sys.argv[1:]\n"
+                     "    exec(compile(sys.stdin.read(),'<dispatch>','exec'))\n"
+                     "    sys.exit(0)\n"
                      "p=Path(os.environ['CAPTURE'])\n"
                      "with p.open('a') as s: s.write(json.dumps(sys.argv[1:])+'\\n')\n"
                      "sys.exit(7 if sys.argv[1]=='srun' and os.environ['FAIL']=='1' else 0)\n")
@@ -40,9 +45,18 @@ def test_array_is_single_gpu_sequential_and_forwards_intervention(task, fail, tm
     (bins / "srun").write_text('#!/usr/bin/env bash\nexec "$REAL_PYTHON" "$WRITER" srun "$@"\n', newline="\n")
     (bins / "srun").chmod(0o755)
     capture = tmp_path / "capture.jsonl"
+    results = tmp_path / "results"
+    if suite == "histories":
+        results.mkdir()
+        interventions = {"full": ["full", "generated", ["sana", "ttn"]],
+                         "ttn-gt-history": ["full", "ttn-gt", ["ttn"]],
+                         "native-gt-history": ["full", "native-gt", ["ttn"]],
+                         "gt-history": ["full", "gt", ["sana", "ttn"]]}
+        (results / "plan.json").write_text(json.dumps({"suite": suite, "variants": list(interventions),
+                                                      "interventions": interventions}))
     env = {k: v for k, v in os.environ.items() if not k.startswith(("SLURM_", "SBATCH_"))}
     env.update(ROOT=tmp_path.as_posix(), PROJECT_ROOT=project.as_posix(), PYTHON=python.as_posix(),
-               TRAINING_RUN=training.as_posix(), MECHANISM_OUTPUT=(tmp_path / "results").as_posix(),
+               TRAINING_RUN=training.as_posix(), MECHANISM_OUTPUT=results.as_posix(),
                SLURM_JOB_ID="12345", SLURM_ARRAY_TASK_ID=str(task), SLURM_NTASKS="1", SLURM_JOB_NUM_NODES="1",
                REAL_PYTHON=Path(sys.executable).as_posix(), WRITER=writer.as_posix(), CAPTURE=capture.as_posix(),
                MOCK_BIN=bins.as_posix(), SCRIPT=(project / "tools/ttn_slurm_mechanism.sbatch").as_posix(), FAIL=str(int(fail)))
@@ -56,8 +70,10 @@ def test_array_is_single_gpu_sequential_and_forwards_intervention(task, fail, tm
     assert records[0][-1] == "running" and records[-1][-1] == ("failed" if fail else "completed")
     args = next(row for row in records if row[0] == "srun")
     assert "--nodes=1" in args and "--ntasks=1" in args and "--gres=gpu:1" in args
-    assert args[args.index("--ttn-ablation") + 1] == ("full", "no-ttt", "identity", "full", "no-local", "no-persistent")[task]
-    assert args[args.index("--history-source") + 1] == ("gt" if task == 3 else "generated")
+    assert args[args.index("--ttn-ablation") + 1] == ("full" if suite == "histories" else
+        ("full", "no-ttt", "identity", "full", "no-local", "no-persistent")[task])
+    assert args[args.index("--history-source") + 1] == (("generated", "ttn-gt", "native-gt", "gt")[task]
+        if suite == "histories" else "gt" if task == 3 else "generated")
     assert "--state-diagnostics" in args and args[args.index("--frames") + 1] == "61"
     methods_index = args.index("--eval-methods")
     assert args[methods_index + 1] == ("ttn" if task in (1, 2, 4, 5) else "sana")

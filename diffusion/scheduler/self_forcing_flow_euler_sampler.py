@@ -303,6 +303,7 @@ class SelfForcingFlowEulerCamCtrl(SelfForcingFlowEuler):
         # Diagnostic callback only: never injected into a model's kwargs.
         # It is consulted AFTER the current chunk has finished denoising.
         self.clean_history_provider = kw.pop("clean_history_provider", None)
+        self.clean_history_source = kw.pop("clean_history_source", None)
         self._extra_model_kwargs = _pop_extra_model_kwargs(model_kwargs)
         super().__init__(
             model_fn,
@@ -428,6 +429,10 @@ class SelfForcingFlowEulerCamCtrl(SelfForcingFlowEuler):
         and returns ``latents`` after exhaustion, so the legacy whole-volume
         API is preserved.
         """
+        from worldttn.history import (clean_history_transaction, resolve_clean_history_source,
+                                     validate_history_reference)
+        history_source = resolve_clean_history_source(getattr(self, "clean_history_source", None),
+                                                      self.clean_history_provider, self.ttn_session)
         # Resolve scheduler factory once (a fresh instance is built per chunk).
         if denoising_step_list is not None:
             if len(denoising_step_list) < 2 or denoising_step_list[-1] != 0:
@@ -598,14 +603,15 @@ class SelfForcingFlowEulerCamCtrl(SelfForcingFlowEuler):
                 if do_classifier_free_guidance:
                     timestep_tensor_model = torch.cat([timestep_tensor_model, timestep_tensor_model], dim=0)
 
-                if ttn_context is not None and ttn_context.collect_local_stats and (ttn_context.system.config.local_update or
-                                                ttn_context.system.config.persistent_meta):
+                if ttn_context is not None and (ttn_context.sink_reference is not None or
+                        (ttn_context.collect_local_stats and (ttn_context.system.config.local_update or
+                                                            ttn_context.system.config.persistent_meta))):
                     from worldttn.session import record_noise
                     sigma_frames = self.scheduler.sigmas[i].to(device=device, dtype=torch.float32).expand_as(timestep_frames)
                     if condition_frame_mask is not None: sigma_frames = sigma_frames * (1.0 - condition_frame_mask)
                     sigma_model = sigma_frames[:, None, :]
                     if do_classifier_free_guidance: sigma_model = torch.cat([sigma_model, sigma_model], dim=0)
-                    record_noise(ttn_context, timestep_tensor_model, sigma_model)
+                    record_noise(ttn_context, timestep_tensor_model, sigma_model, total_calls=len(timesteps))
 
                 noise_pred, _ = self.model(
                     latent_model_input,
@@ -668,38 +674,33 @@ class SelfForcingFlowEulerCamCtrl(SelfForcingFlowEuler):
             if kv_save_stride == 0:
                 do_kv_save = bool(self.sink_token and chunk_idx == 0)
             if do_kv_save:
-                clean_chunk = latents[:, :, start_f:end_f]
-                if self.clean_history_provider is not None:
-                    clean_chunk = self.clean_history_provider(start_f, end_f)
-                    if (not isinstance(clean_chunk, torch.Tensor) or clean_chunk.shape != latents[:, :, start_f:end_f].shape
-                            or clean_chunk.device != device or not torch.isfinite(clean_chunk).all()):
-                        raise ValueError("invalid diagnostic clean history chunk")
-                latent_model_input = (
-                    torch.cat([clean_chunk] * 2)
+                generated_chunk = latents[:, :, start_f:end_f]
+                reference_chunk = None
+                if history_source != "generated":
+                    reference_chunk = self.clean_history_provider(start_f, end_f)
+                    validate_history_reference(reference_chunk, generated_chunk)
+                generated_input = (
+                    torch.cat([generated_chunk] * 2)
                     if do_classifier_free_guidance
-                    else clean_chunk
+                    else generated_chunk
                 )
-                timestep = torch.zeros(latent_model_input.shape[0], device=device)
+                reference_input = (torch.cat([reference_chunk] * 2) if do_classifier_free_guidance
+                                   else reference_chunk) if reference_chunk is not None else None
+                timestep = torch.zeros(generated_input.shape[0], device=device)
 
-                ttn_clean_context = ttn_context.for_clean() if ttn_context is not None else None
-                noise_pred, updated_kv_cache = self.model(
-                    latent_model_input,
-                    timestep,
-                    prompt_embeds,
-                    start_f=rope_start_f,
-                    end_f=rope_end_f,
-                    frame_index=frame_index,
-                    save_kv_cache=True,
-                    ttn_chunk_context=ttn_clean_context,
-                    kv_cache=chunk_kv_cache,
-                    mask=mask,
-                    data_info=local_data_info,
-                    **self.model_kwargs,
+                def clean_forward(clean_input, clean_context, native_cache):
+                    return self.model(
+                        clean_input, timestep, prompt_embeds,
+                        start_f=rope_start_f, end_f=rope_end_f, frame_index=frame_index,
+                        save_kv_cache=True, ttn_chunk_context=clean_context, kv_cache=native_cache,
+                        mask=mask, data_info=local_data_info, **self.model_kwargs,
+                    )
+
+                noise_pred, updated_kv_cache = clean_history_transaction(
+                    clean_forward, generated_input, chunk_kv_cache, source=history_source,
+                    reference=reference_input, context=ttn_context,
+                    runtime=self.ttn_session.runtime if self.ttn_session is not None else None,
                 )
-                if ttn_clean_context is not None:
-                    from worldttn.session import validate_clean_output
-                    validate_clean_output(noise_pred, latent_model_input)
-                    self.ttn_session.runtime.commit_chunk(ttn_clean_context)
                 kv_cache[chunk_idx] = updated_kv_cache
             else:
                 kv_cache[chunk_idx] = [[None] * _NUM_CACHE_SLOTS for _ in range(self.num_model_blocks)]

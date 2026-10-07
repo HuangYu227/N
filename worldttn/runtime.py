@@ -7,6 +7,7 @@ from .core import ANCHORS, TTNConfig, Rank2Generators, CayleyFactors, DetachedCa
 from .performance import DEFAULT_EXECUTION, annotation, validate_execution
 from .stability import committed_anchor_stats, matrix_scale, write_direction_stats
 from .controller import TransitionController
+from . import sink
 
 
 class TTNSystem(nn.Module):
@@ -47,6 +48,14 @@ class TTNChunkContext:
     noise_info: dict = field(default_factory=dict)
     collect_local_stats: bool = False
     local_trajectory: list = field(default_factory=list)
+    sink_options: sink.SinkOptions = field(default_factory=sink.SinkOptions)
+    sink_reference: torch.Tensor | None = None
+    sink_reference_sha256: str | None = None
+    sink_shift: torch.Tensor | None = None
+    sink_stats: dict = field(default_factory=dict)
+    sink_trajectory: list = field(default_factory=list)
+    noise_call_count: int = 0
+    collect_sink_stats: bool = False
 
     def for_clean(self):
         return TTNChunkContext(self.predicted, self.previous, self.psi, self.cbase, self.system, self.frame_ids,
@@ -54,7 +63,10 @@ class TTNChunkContext:
                                self.prefill_mode, begin_id=self.begin_id, psi_snapshot=self.psi_snapshot,
                                write_history=self.write_history, live_factors=self.live_factors,
                                local_stats=self.local_stats, ablation=self.ablation,
-                               collect_local_stats=self.collect_local_stats, local_trajectory=self.local_trajectory)
+                               collect_local_stats=self.collect_local_stats, local_trajectory=self.local_trajectory,
+                               sink_options=self.sink_options, sink_reference=self.sink_reference,
+                               sink_shift=self.sink_shift, sink_trajectory=self.sink_trajectory,
+                               sink_reference_sha256=self.sink_reference_sha256)
 
     def token_masks(self, n):
         f = self.frame_ids.shape[-1]
@@ -106,9 +118,16 @@ class TTNRuntimeState:
     collect_local_stats: bool = False
     # Diagnostic-only detached writes, never persistent learned state or checkpoint content.
     write_history: tuple = ()
+    sink_options: sink.SinkOptions = field(default_factory=sink.SinkOptions)
+    sink_reference: torch.Tensor | None = None
+    sink_reference_sha256: str | None = None
+    sink_reference_verified: bool | None = None
 
     @classmethod
-    def create(cls, config, batch_size, device, *, ablation="full", diagnostics=False, collect_local_stats=False):
+    def create(cls, config, batch_size, device, *, ablation="full", diagnostics=False, collect_local_stats=False,
+               sink_options=None):
+        sink_options = sink.SinkOptions() if sink_options is None else sink_options
+        sink.validate_sink(sink_options, config, ablation)
         if ablation not in ("full", "no-ttt", "identity", "no-local", "no-persistent"):
             raise ValueError("unknown TTN runtime ablation")
         if ablation in ("no-local", "no-persistent") and not (config.local_update or config.persistent_meta):
@@ -125,7 +144,8 @@ class TTNRuntimeState:
         psi = torch.zeros(batch_size, 5, config.heads, config.generators, device=device, dtype=torch.float32)
         pose = torch.eye(4, device=device).expand(batch_size, 4, 4).clone()
         return cls(config, s, psi, pose, [set() for _ in range(batch_size)],
-                   ablation=ablation, diagnostics=diagnostics, collect_local_stats=collect_local_stats)
+                   ablation=ablation, diagnostics=diagnostics, collect_local_stats=collect_local_stats,
+                   sink_options=sink_options)
 
     def reset(self):
         self.world_state = torch.zeros_like(self.world_state)
@@ -139,8 +159,11 @@ class TTNRuntimeState:
         self.prefilled = False
         self.last_stats = {}
         self.write_history = ()
+        self.sink_reference = None
+        self.sink_reference_sha256 = None
+        self.sink_reference_verified = None
 
-    def begin_chunk(self, system, poses, intrinsics, frame_ids, valid_mask, width, height, prefill=False):
+    def begin_chunk(self, system, poses, intrinsics, frame_ids, valid_mask, width, height, prefill=False, *, rope=None):
         if system.config != self.config: raise ValueError("runtime/system configurations differ")
         b = self.world_state.shape[0]
         if frame_ids.ndim == 1: frame_ids = frame_ids[None].expand(b, -1)
@@ -155,8 +178,21 @@ class TTNRuntimeState:
         if prefill and (self.prefilled or self.commit_count): raise RuntimeError("prefill already completed")
         previous_pose = poses[:, 0] if prefill else self.previous_committed_pose
         options = getattr(system, "ttn_execution", DEFAULT_EXECUTION)
+        sink.validate_sink(self.sink_options, self.config, self.ablation, options)
         meta = self.config.local_update or self.config.persistent_meta
         validate_execution(options, self.config.stage, self.ablation, self.diagnostics, meta=meta)
+        reference = shift = None
+        if self.sink_options.active and not prefill and self.commit_count >= self.sink_options.start_chunk:
+            if not self.prefilled: raise RuntimeError("sink requires a successful observed-frame prefill")
+            shift = torch.zeros(b, device=frame_ids.device, dtype=torch.long)
+            if self.sink_options.mode == "zero":
+                reference = torch.zeros_like(self.world_state)
+            else:
+                if self.sink_reference is None: raise RuntimeError("missing protected prefill reference")
+                reference = self.sink_reference
+                if self.sink_options.position == "temporal-realign":
+                    shift = (frame_ids.min(-1).values - 1).clamp_min(0)
+                    reference = sink.realign_reference(reference, rope, shift)
         snapshot = None
         live_factors = None
         history = self.write_history
@@ -189,14 +225,20 @@ class TTNRuntimeState:
                                id(self),
                                prefill_mode=prefill, begin_id=self.predict_count, psi_snapshot=snapshot,
                                write_history=history, live_factors=live_factors if meta else None,
-                               ablation=self.ablation, collect_local_stats=self.collect_local_stats or self.diagnostics)
+                               ablation=self.ablation, collect_local_stats=self.collect_local_stats or self.diagnostics,
+                               sink_options=self.sink_options, sink_reference=reference, sink_shift=shift,
+                               sink_reference_sha256=self.sink_reference_sha256)
 
     def prefill(self, context):
         if self.prefilled or self.commit_count: raise RuntimeError("initial image can only be prefilled once")
+        if self.sink_options.active and not context.prefill_mode:
+            raise RuntimeError("sink reference requires an observed-frame prefill transaction")
         self.commit_chunk(context)
         self.prefilled = True
 
     def commit_chunk(self, context):
+        sink.validate_sink(self.sink_options, self.config, self.ablation,
+                           getattr(context.system, "ttn_execution", DEFAULT_EXECUTION))
         if not context.clean_mode or context.revision != self.revision or context.runtime_id != id(self):
             raise RuntimeError("not a current clean transaction")
         if context.psi_snapshot is not None:
@@ -214,6 +256,12 @@ class TTNRuntimeState:
             states.append(s)
             gradients.append(g)
         new_state = torch.stack(states, 1)
+        reference = self.sink_reference
+        reference_hash = self.sink_reference_sha256
+        if self.sink_options.active and self.sink_options.mode == "protected" and context.prefill_mode:
+            if self.prefilled or self.commit_count: raise RuntimeError("sink reference can only be captured once")
+            reference = sink.freeze_reference(new_state)
+            reference_hash = sink.reference_sha256(reference)
         grad = torch.stack(gradients, 1)
         clipped, scale = clip_inner_gradient(grad, self.config.inner_clip, self.config.eps)
         psi = (self.transition_fast - self.config.eta_psi * clipped
@@ -223,6 +271,13 @@ class TTNRuntimeState:
             raise ValueError("nonfinite or non-FP32 Persistent psi; transaction not committed")
         anchor_stats = [committed_anchor_stats(context.candidates[i][2], self.transition_fast[:, i], psi[:, i],
                         grad[:, i], scale[:, i], context.cbase[:, i], ANCHORS[i], context.prefill_mode) for i in range(5)]
+        if self.sink_options.active:
+            for i, stats in enumerate(anchor_stats):
+                stats["sink"] = context.sink_stats.get(i, {"active": False, "mode": self.sink_options.mode,
+                    "gain": self.sink_options.gain, "reason": "prefill/before activation"})
+                if context.sink_trajectory:
+                    stats["sink_trajectory"] = [{key: value for key, value in call.items() if key != "anchors"} |
+                        call["anchors"][i] for call in context.sink_trajectory if i in call["anchors"]]
         if self.config.local_update or self.config.persistent_meta:
             for i, stats in enumerate(anchor_stats):
                 heads = stats["per_head"]
@@ -264,6 +319,8 @@ class TTNRuntimeState:
         # Assign only after every validation/computation succeeds. The context
         # keeps its old prediction/psi; the new psi is consumed next chunk.
         self.world_state = new_state
+        self.sink_reference = reference
+        self.sink_reference_sha256 = reference_hash
         self.write_history = history
         self.transition_fast = psi
         self.previous_committed_pose = previous_pose
@@ -286,3 +343,10 @@ class TTNRuntimeState:
     def detach(self):
         self.world_state = self.world_state.detach()
         self.transition_fast = self.transition_fast.detach()
+
+    def verify_sink_reference(self):
+        """Hash once at rollout end, never in each solver call."""
+        if self.sink_reference is None: return None
+        if sink.reference_sha256(self.sink_reference) != self.sink_reference_sha256:
+            raise RuntimeError("protected sink reference changed during the episode")
+        return self.sink_reference_sha256

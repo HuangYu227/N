@@ -7,6 +7,30 @@ from PIL import ImageFont
 from tools.ttn_decode_comparison import comparison_frame, load_pair, pixels, save_return_views
 
 
+def test_encoded_video_is_decodable_and_has_expected_frames(monkeypatch, tmp_path):
+    import imageio.v2 as iio
+    from tools.ttn_decode_comparison import verify_video
+    path = tmp_path / "comparison.mp4"
+    path.write_bytes(b"encoded")
+    class Reader:
+        frames = 481
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def count_frames(self): return self.frames
+        def get_meta_data(self): return {"fps": 16, "size": (32, 24)}
+        def get_data(self, index): return np.zeros((24, 32, 3), dtype=np.uint8)
+    reader = Reader()
+    monkeypatch.setattr(iio, "get_reader", lambda *a, **kw: reader)
+    assert verify_video(path, 481, (24, 32), 16)["frames"] == 481
+    reader.frames = 17
+    with pytest.raises(ValueError, match="frame count"):
+        verify_video(path, 481, (24, 32), 16)
+    reader.frames = 481
+    reader.get_data = lambda i: (_ for _ in ()).throw(OSError("truncated video"))
+    with pytest.raises(OSError, match="truncated"):
+        verify_video(path, 481, (24, 32), 16)
+
+
 def test_saved_pair_prefix_and_video_conversion(tmp_path):
     identity = dict(case_id="fixed", seed=3407, input_sha256={"camera": "same"},
                     initial_noise_sha256="same", base_sha256="same")
@@ -52,3 +76,25 @@ def test_return_views_use_only_completed_orbit_and_observed_reference(tmp_path):
     assert metrics["methods"]["sana"]["mean_return_to_observed_rgb_mse"] == 1
     assert metrics["methods"]["ttn"]["mean_return_to_observed_rgb_mse"] == 0
     assert (tmp_path / "return-comparison.png").is_file()
+
+
+def test_explicit_ttn_baseline_pair_checks_identity_and_active_sink(tmp_path):
+    identity = dict(case_id="fixed", seed=3407, input_sha256={"camera": "same"},
+                    initial_noise_sha256="same", base_sha256="same")
+    baseline, variant = tmp_path / "full", tmp_path / "sink"
+    baseline.mkdir(); variant.mkdir()
+    protocol = dict(history_source="generated", ttn_ablation="full", step=100,
+                    checkpoint_sha256="weights", steps=20, cfg_scale=4.5, cached_blocks=2)
+    for directory, gain in ((baseline, 0), (variant, .1)):
+        row = dict(identity, method="ttn")
+        summary = dict(protocol={**protocol, "tla_sink": {"mode": "protected", "gain": gain}}, episodes=[row])
+        (directory / "summary.json").write_text(json.dumps(summary))
+        torch.save(dict(row, latents=torch.zeros(1, 2, 61, 2, 2)), directory / "case-000-ttn.pt")
+    _, _, latents = load_pair(variant, 0, 20, left_evaluation=baseline, left_method="ttn")
+    assert len(latents) == 2
+    with pytest.raises(ValueError, match="left-evaluation"):
+        load_pair(variant, 0, 20, left_method="ttn")
+    protocol["checkpoint_sha256"] = "wrong"
+    (baseline / "summary.json").write_text(json.dumps(dict(protocol=protocol, episodes=[dict(identity, method="ttn")])))
+    with pytest.raises(ValueError, match="checkpoint_sha256"):
+        load_pair(variant, 0, 20, left_evaluation=baseline, left_method="ttn")

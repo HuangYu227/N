@@ -1,6 +1,9 @@
 """Mechanism interventions must leave slow weights and training semantics alone."""
 import copy
 import json
+from concurrent.futures import ThreadPoolExecutor
+import os
+import threading
 import importlib.util
 from pathlib import Path
 import sys
@@ -13,6 +16,24 @@ from test_runtime import begin, stage_all
 from worldttn.core import TTNConfig
 from worldttn.runtime import TTNSystem, TTNRuntimeState
 
+
+def test_result_publication_has_private_temporary_files_and_rejects_nan(tmp_path, monkeypatch):
+    from worldttn.mechanism_evaluation import atomic_json
+    if os.name == "nt":
+        # Windows rejects simultaneous replacement of one target. Keep writes
+        # concurrent and serialize only that OS operation on the CPU test host.
+        replace, lock = os.replace, threading.Lock()
+        def windows_replace(source, target):
+            with lock: replace(source, target)
+        monkeypatch.setattr(os, "replace", windows_replace)
+    path = tmp_path / "summary.json"
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(lambda i: atomic_json(path, {"writer": i}), range(20)))
+    original = json.loads(path.read_text())
+    assert original["writer"] in range(20)
+    with pytest.raises(ValueError): atomic_json(path, {"metric": float("nan")})
+    assert json.loads(path.read_text()) == original
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["summary.json"]
 
 def test_runtime_abc_interventions_use_same_c_weights_and_next_chunk_psi():
     torch.manual_seed(7)
@@ -163,7 +184,7 @@ def test_mechanism_options_reject_training_before_cuda_check():
     assert result.returncode != 0 and "evaluate-only" in result.stderr
 
 
-def mechanism_files(output, meta=False):
+def mechanism_files(output, meta=False, histories=False):
     from worldttn.evaluation import latent_metrics
     from worldttn.mechanism_evaluation import VARIANTS, IDENTITY
     protocol = {key: "same" for key in IDENTITY}
@@ -178,14 +199,68 @@ def mechanism_files(output, meta=False):
                     prefix_13_metrics=latent_metrics(generated[:, :, :13], gt[:, :, :13], [], training_frames=13))
     variants = dict(VARIANTS, **({"no-local": ("no-local", "generated", ["ttn"]),
                                "no-persistent": ("no-persistent", "generated", ["ttn"])} if meta else {}))
+    if histories:
+        variants = {"full": ("full", "generated", ["sana", "ttn"]),
+                    "ttn-gt-history": ("full", "ttn-gt", ["ttn"]),
+                    "native-gt-history": ("full", "native-gt", ["ttn"]),
+                    "gt-history": ("full", "gt", ["sana", "ttn"])}
     protocol["meta_ttt"] = {"local_update": meta, "persistent_meta": meta}
     for variant, (ablation, history, methods) in variants.items():
         folder = output / variant
         folder.mkdir(parents=True)
         p = dict(protocol, ttn_ablation=ablation, history_source=history, eval_methods=methods)
-        values = {"full": 4., "no-ttt": 3., "identity": 5., "gt-history": 2., "no-local": 6., "no-persistent": 7.}
+        values = {"full": 4., "no-ttt": 3., "identity": 5., "gt-history": 2., "no-local": 6., "no-persistent": 7.,
+                  "ttn-gt-history": 3., "native-gt-history": 2.5}
         records = [record(method, values[variant] if method == "ttn" else .5 if history == "gt" else 1.) for method in methods]
         (folder / "summary.json").write_text(json.dumps({"protocol": p, "episodes": records}))
+    if histories:
+        original = output.parent / f"{output.name}-source" / "long"
+        original.mkdir(parents=True)
+        original.joinpath("summary.json").write_text(output.joinpath("full/summary.json").read_text())
+        output.joinpath("plan.json").write_text(json.dumps({"suite": "histories", "variants": list(variants),
+                                                           "source_evaluation": str(original.parent)}))
+
+
+def test_history_suite_collects_conditional_contrasts_and_null_safe_interaction(tmp_path):
+    from worldttn.mechanism_evaluation import collect_mechanisms
+    mechanism_files(tmp_path, meta=True, histories=True)
+    result = collect_mechanisms(tmp_path)
+    assert result["status"] == "completed" and result["suite"] == "histories"
+    assert result["full_c_reproduction"]["cases"][0]["within_tolerance"]
+    contrasts = result["contrasts"]
+    assert contrasts["ttn_gt_state_minus_generated_state"]["long"]["mean_future_latent_mse"] == pytest.approx(-1.)
+    assert contrasts["native_gt_cache_minus_generated_cache"]["long"]["mean_future_latent_mse"] == pytest.approx(-1.5)
+    assert contrasts["history_factorial_interaction"]["long"]["mean_future_latent_mse"] == pytest.approx(.5)
+    assert contrasts["history_factorial_interaction"]["long"]["revisit_return_gt_latent_mse"] is None
+    assert "coupled" in result["interpretation"]
+    json.dumps(result, allow_nan=False)
+
+
+@pytest.mark.parametrize("corrupt", ["variants", "active-sink", "noise", "history"])
+def test_history_suite_rejects_wrong_suite_or_protocol(tmp_path, corrupt):
+    from worldttn.mechanism_evaluation import collect_mechanisms
+    mechanism_files(tmp_path, histories=True)
+    path = tmp_path / ("plan.json" if corrupt == "variants" else "ttn-gt-history/summary.json")
+    value = json.loads(path.read_text())
+    if corrupt == "variants": value["variants"][1] = "no-ttt"
+    elif corrupt == "active-sink": value["protocol"]["tla_sink"] = {"mode": "protected", "gain": .1}
+    elif corrupt == "noise": value["episodes"][0]["initial_noise_sha256"] = "other"
+    else: value["protocol"]["history_source"] = "native-gt"
+    path.write_text(json.dumps(value))
+    with pytest.raises(ValueError): collect_mechanisms(tmp_path)
+
+
+def test_history_suite_accepts_explicit_off_sink_and_preserves_failed_partial_status(tmp_path):
+    from worldttn.mechanism_evaluation import collect_mechanisms
+    mechanism_files(tmp_path, histories=True)
+    path = tmp_path / "ttn-gt-history/summary.json"
+    value = json.loads(path.read_text())
+    value["protocol"]["tla_sink"] = {"mode": "off", "gain": .1, "position": "temporal-realign", "start_chunk": 5}
+    path.write_text(json.dumps(value))
+    assert collect_mechanisms(tmp_path)["status"] == "completed"
+    path.unlink()
+    (tmp_path / "ttn-gt-history-status.json").write_text('{"status":"failed"}')
+    assert collect_mechanisms(tmp_path)["status"] == "failed"
 
 
 def test_meta_collector_requires_both_contributions_and_reports_separate_contrasts(tmp_path):
@@ -277,6 +352,15 @@ def test_submitter_reuses_verified_immutable_snapshot_and_fixed_cases(tmp_path):
     plan = prepare(evaluation)
     assert plan["snapshot"] == str(snapshot) and plan["fixed_cases"] == str(fixed)
     assert not Path(plan["output"]).exists() and checkpoint.read_bytes() == b"immutable model"
+    history_plan = prepare(evaluation, suite="histories")
+    assert history_plan["suite"] == "histories" and history_plan["array"] == "0-3%1"
+    assert history_plan["variants"] == ["full", "ttn-gt-history", "native-gt-history", "gt-history"]
+    assert history_plan["interventions"]["ttn-gt-history"] == ["full", "ttn-gt", ["ttn"]]
+    protocol["tla_sink"] = {"mode": "protected", "gain": .1}
+    path.write_text(json.dumps({"protocol": protocol}))
+    with pytest.raises(ValueError, match="sink off"): prepare(evaluation, suite="histories")
+    protocol.pop("tla_sink")
+    path.write_text(json.dumps({"protocol": protocol}))
     checkpoint.write_bytes(b"changed")
     with pytest.raises(ValueError, match="checkpoint"): prepare(evaluation)
 
