@@ -25,7 +25,7 @@ def cached_ffn():
                      build_act=runpy.run_path(str(root/"diffusion/model/act.py"))["build_act"],
                      build_norm=runpy.run_path(str(root/"diffusion/model/norms.py"))["build_norm"],
                      _INT32_SAFE_CONV_ELEMENTS=1 << 30)
-    for filename, names in [("diffusion/model/utils.py", {"val2list", "val2tuple", "get_same_padding"}),
+    for filename, names in [("diffusion/model/utils.py", {"val2list", "val2tuple", "get_same_padding", "checkpoint_preserving_strides"}),
                             ("diffusion/model/nets/basic_modules.py",
                              {"ConvLayer", "GLUMBConv", "GLUMBConvTemp", "CachedGLUMBConvTemp"})]:
         source = root/filename
@@ -111,18 +111,75 @@ def test_text_checkpoint_preserves_padding_rng_and_outer_gradients(text_attentio
     assert torch.equal(mask, torch.tensor([[1, 1, 1, 0, 0]]))
 
 
-def test_spatial_recompute_preserves_input_stride_after_cpu_packing(cached_ffn):
-    module = cached_ffn(8, 24).double()
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_spatial_recompute_preserves_input_stride_after_cpu_packing(cached_ffn, device):
+    if device == "cuda" and not torch.cuda.is_available(): pytest.skip("requires CUDA activation offload")
+    from worldttn.training import activation_storage
+    module = cached_ffn(8, 24).to(device=device, dtype=torch.float32 if device == "cuda" else torch.float64)
     module.ttn_activation_checkpointing = True
     strides = []
     module.inverted_conv.register_forward_pre_hook(lambda layer, args: strides.append(args[0].stride()))
-    x = torch.randn(1, 12, 8, dtype=torch.float64, requires_grad=True)
+    x = torch.randn(1, 12, 8, device=device, dtype=next(module.parameters()).dtype, requires_grad=True)
     # save_on_cpu(pin_memory=True) reconstructs packed tensors by shape. Model
     # that layout change on CPU without requiring a CUDA/pinned allocator.
-    with torch.autograd.graph.saved_tensors_hooks(lambda value: value.detach().contiguous().clone(), lambda value: value):
+    storage = (activation_storage("cpu", device=device) if device == "cuda" else
+               torch.autograd.graph.saved_tensors_hooks(lambda value: value.detach().contiguous().clone(), lambda value: value))
+    with storage, torch.autocast(device, dtype=torch.bfloat16, enabled=device == "cuda", cache_enabled=False):
         output = module(x, HW=(3, 2, 2))
     output.square().sum().backward()
     assert len(strides) == 2 and strides[0] == strides[1]
+    assert torch.isfinite(x.grad).all() and all(torch.isfinite(p.grad).all() for p in module.parameters())
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("amp", [False, True])
+@pytest.mark.parametrize("broadcast", [False, True])
+@pytest.mark.parametrize("qk_norm", [False, True])
+def test_text_cpu_packing_preserves_strided_dispatch_and_gradients(text_attention, device, amp, broadcast, qk_norm):
+    if device == "cuda" and not torch.cuda.is_available(): pytest.skip("requires CUDA activation offload")
+    from contextlib import nullcontext
+    from worldttn.training import activation_storage
+    torch.manual_seed(3407)
+    dtype = torch.float32 if amp else torch.float64
+    a = text_attention(16, 2, proj_drop=.2, qk_norm=qk_norm).to(device=device, dtype=dtype)
+    b = copy.deepcopy(a)
+    b.ttn_activation_checkpointing = True
+    for module in (a, b): module.set_sdpa_backend("math")
+    x = torch.randn(2, 16, 7, device=device, dtype=dtype).transpose(1, 2).requires_grad_()
+    cond = torch.randn(1 if broadcast else 2, 1, 16, 5, device=device, dtype=dtype).transpose(2, 3).requires_grad_()
+    mask = torch.tensor([[1, 1, 1, 0, 0]], device=device)
+    if broadcast:
+        cond = cond.expand(2, 1, 5, 16)
+        mask = mask.expand(2, 5)
+    else:
+        mask = mask.repeat(2, 1)
+    expected_mask = mask.clone()
+    probe = torch.randn_like(x)
+    rng = torch.get_rng_state()
+    cuda_rng = torch.cuda.get_rng_state(device) if device == "cuda" else None
+    results, strides = [], []
+    for module in (a, b):
+        torch.set_rng_state(rng)
+        if cuda_rng is not None: torch.cuda.set_rng_state(cuda_rng, device)
+        seen = []
+        module.q_linear.register_forward_pre_hook(lambda layer, args, seen=seen: seen.append(args[0].stride()))
+        storage = (activation_storage("cpu", device=device) if device == "cuda" else
+                   torch.autograd.graph.saved_tensors_hooks(lambda value: value.detach().contiguous().clone(), lambda value: value))
+        with torch.autocast(device, dtype=torch.bfloat16, enabled=amp, cache_enabled=False):
+            # Reference keeps its graph normally. Candidate offloads the
+            # checkpoint's inputs through native CUDA storage or a CPU oracle.
+            with storage if module is b else nullcontext():
+                out = module(x, cond, mask)
+            loss = (out*probe).square().sum()
+        parameters = (x, cond, *module.parameters())
+        grads = torch.autograd.grad(loss, parameters, create_graph=not amp)
+        higher = torch.autograd.grad(sum(g.square().sum() for g in grads), parameters) if not amp else ()
+        results.append((out, grads, higher, torch.get_rng_state(),
+                        torch.cuda.get_rng_state(device) if cuda_rng is not None else None))
+        strides.append(seen)
+    identical(results[0], results[1], "strided text output/gradients/meta/RNG")
+    assert all(stride == x.stride() for stride in strides[1]) and len(strides[1]) >= 2
+    assert torch.equal(mask, expected_mask)
 
 
 def test_combined_checkpoint_future_credit_updates_and_saved_payload(monkeypatch, cached_sana, cached_ffn, text_attention):

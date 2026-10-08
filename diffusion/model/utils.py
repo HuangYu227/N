@@ -50,6 +50,23 @@ def set_grad_checkpoint(model, gc_step=1):
     model.apply(set_attr)
 
 
+def checkpoint_preserving_strides(function, *args):
+    """Keep CPU-packed inputs on the original Linear/conv forward path."""
+    strides = tuple(value.stride() if isinstance(value, torch.Tensor) else None for value in args)
+    def recompute(*values):
+        restored = []
+        for value, stride in zip(values, strides):
+            if stride is not None and value.stride() != stride:
+                # Broadcast masks/conditioning have zero strides. Copy only
+                # their unique elements, then restore the broadcast view.
+                shape = tuple(size if step != 0 else 1 for size, step in zip(value.shape, stride))
+                unique = value[tuple(slice(None) if step != 0 else slice(0, 1) for step in stride)]
+                value = torch.empty_strided(shape, stride, dtype=value.dtype, device=value.device).copy_(unique).expand(value.shape)
+            restored.append(value)
+        return function(*restored)
+    return checkpoint(recompute, *args, use_reentrant=False)
+
+
 def set_fp32_attention(model):
     assert isinstance(model, nn.Module)
 

@@ -25,14 +25,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
-from torch.utils.checkpoint import checkpoint
 from einops import rearrange
 from timm.models.vision_transformer import Attention as Attention_
 from timm.models.vision_transformer import Mlp
 from transformers import AutoModelForCausalLM
 
 from diffusion.model.norms import RMSNorm
-from diffusion.model.utils import get_same_padding, to_2tuple, to_3tuple
+from diffusion.model.utils import checkpoint_preserving_strides, get_same_padding, to_2tuple, to_3tuple
 from diffusion.utils.import_utils import is_xformers_available
 
 _xformers_available = False if os.environ.get("DISABLE_XFORMERS", "0") == "1" else is_xformers_available()
@@ -99,7 +98,7 @@ class MultiHeadCrossAttention(nn.Module):
 
     def forward(self, x, cond, mask=None):
         if getattr(self, "ttn_activation_checkpointing", False) and torch.is_grad_enabled():
-            return checkpoint(self._forward, x, cond, mask, use_reentrant=False)
+            return checkpoint_preserving_strides(self._forward, x, cond, mask)
         return self._forward(x, cond, mask)
 
     def _forward(self, x, cond, mask=None):

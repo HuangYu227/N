@@ -15,7 +15,7 @@ def implementation_identity():
              "worldttn/evaluation.py", "worldttn/alignment.py", "worldttn/alignment_detail.py", "worldttn/stability.py",
              "worldttn/stage_evaluation.py", "worldttn/mechanism_evaluation.py", "worldttn/checkpoint.py", "worldttn/distributed.py",
              "worldttn/parallel_checkpoint.py", "worldttn/checkpoint_integrity.py", "worldttn/failure.py", "worldttn/parallel_data.py",
-             "diffusion/model/nets/sana_blocks.py", "diffusion/model/nets/basic_modules.py", "diffusion/model/nets/sana_gdn_blocks.py",
+             "diffusion/model/nets/sana_blocks.py", "diffusion/model/nets/basic_modules.py", "diffusion/model/utils.py", "diffusion/model/nets/sana_gdn_blocks.py",
              "diffusion/model/nets/sana_camctrl_blocks.py", "diffusion/data/datasets/video/sana_wm_zip_latent_data.py",
              "diffusion/model/nets/sana_gdn_camctrl_blocks.py",
              "diffusion/model/nets/sana_multi_scale_video_camctrl.py",

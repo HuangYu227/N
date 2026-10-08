@@ -23,7 +23,13 @@ def text_attention():
                 if isinstance(node, ast.ClassDef) and node.name == "MultiHeadCrossAttention")
     namespace = {"nn": nn, "torch": torch, "checkpoint": checkpoint, "F": F, "Optional": Optional, "_xformers_available": False,
                  "nullcontext": nullcontext, "SDPBackend": SDPBackend, "sdpa_kernel": sdpa_kernel}
-    exec(compile(ast.Module(body=[node], type_ignores=[]), str(source), "exec"), namespace)
+    utils = source.parents[1]/"utils.py"
+    helper = next(n for n in ast.parse(utils.read_text(encoding="utf-8")).body
+                  if isinstance(n, ast.FunctionDef) and n.name == "checkpoint_preserving_strides")
+    norms = source.parents[1]/"norms.py"
+    norm = next(n for n in ast.parse(norms.read_text(encoding="utf-8")).body
+                if isinstance(n, ast.ClassDef) and n.name == "RMSNorm")
+    exec(compile(ast.Module(body=[helper, norm, node], type_ignores=[]), str(source), "exec"), namespace)
     return namespace["MultiHeadCrossAttention"]
 
 
