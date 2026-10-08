@@ -25,6 +25,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
+from torch.utils.checkpoint import checkpoint
 from einops import rearrange
 from timm.models.vision_transformer import Attention as Attention_
 from timm.models.vision_transformer import Mlp
@@ -97,6 +98,11 @@ class MultiHeadCrossAttention(nn.Module):
         self.use_xformers = bool(enabled and _xformers_available)
 
     def forward(self, x, cond, mask=None):
+        if getattr(self, "ttn_activation_checkpointing", False) and torch.is_grad_enabled():
+            return checkpoint(self._forward, x, cond, mask, use_reentrant=False)
+        return self._forward(x, cond, mask)
+
+    def _forward(self, x, cond, mask=None):
         # query: img tokens; key/value: condition; mask: if padding tokens
         B, N, C = x.shape
         first_dim = 1 if self.use_xformers else B

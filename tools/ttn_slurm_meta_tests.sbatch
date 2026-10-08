@@ -31,7 +31,7 @@ if [[ "${FULL_MEMORY_TESTS:-0}" == 1 ]]; then
   if [[ "$SLURM_NTASKS" == 4 ]]; then
     tests=(tests/ttn/test_full_training.py::test_full_memory_four_gpu_future_credit_and_resume)
   else
-    tests=(tests/ttn/test_meta_core.py tests/ttn/test_full_training.py
+    tests=(tests/ttn/test_meta_core.py tests/ttn/test_full_training.py tests/ttn/test_activation_checkpoint.py
            tests/ttn/test_training.py::test_save_on_cpu_reduces_live_cuda_saved_activations_without_changing_gradients
            -k 'not four_gpu')
   fi

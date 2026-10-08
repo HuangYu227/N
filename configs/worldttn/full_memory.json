@@ -10,6 +10,7 @@
   },
   "training_latent_frames": 121,
   "tbptt": 4,
+  "activation_checkpointing": "ffn-cross-attn",
   "learning_rate": 0.00001,
   "history_training": {
     "source": "generated", "steps": 4, "flow_shift": 9.8,

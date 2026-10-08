@@ -11,6 +11,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
+from torch.utils.checkpoint import checkpoint
 
 from worldttn.training import activation_storage
 
@@ -20,7 +21,7 @@ def text_attention():
     source = Path(__file__).resolve().parents[2] / "diffusion/model/nets/sana_blocks.py"
     node = next(node for node in ast.parse(source.read_text(encoding="utf-8")).body
                 if isinstance(node, ast.ClassDef) and node.name == "MultiHeadCrossAttention")
-    namespace = {"nn": nn, "F": F, "Optional": Optional, "_xformers_available": False,
+    namespace = {"nn": nn, "torch": torch, "checkpoint": checkpoint, "F": F, "Optional": Optional, "_xformers_available": False,
                  "nullcontext": nullcontext, "SDPBackend": SDPBackend, "sdpa_kernel": sdpa_kernel}
     exec(compile(ast.Module(body=[node], type_ignores=[]), str(source), "exec"), namespace)
     return namespace["MultiHeadCrossAttention"]

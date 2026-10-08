@@ -79,7 +79,7 @@ def synthetic_bundle(config, device, frames=13, height=22, width=40):
 
 
 def build(args, stage=None, sana_path=None):
-    from .sana import load_sana_config, build_sana, configure_cross_attention
+    from .sana import load_sana_config, build_sana, configure_cross_attention, configure_activation_checkpointing
     ttn, settings = read_reference(args.config, stage or args.stage)
     source = sana_path or args.sana_config or settings["sana_config"]
     source = Path(source)
@@ -104,11 +104,13 @@ def build(args, stage=None, sana_path=None):
     model = build_sana(config, ttn, args.base_weights, device=args.device, **options)
     model.ttn_history_training = history_settings(settings.get("history_training"))
     model.ttn_training_latent_frames = settings.get("training_latent_frames")
+    memory_policy = configure_activation_checkpointing(model, settings.get("activation_checkpointing", "none"))
     configure_from_args(model, args)
     policy = configure_cross_attention(model, getattr(args, "cross_attn_backend", "auto"),
                                        diagnostic_unmask_all_valid=getattr(args, "diagnostic_unmask_all_valid", False))
     from .distributed import rank_world
     if rank_world()[0] == 0: print("[TTN SDPA] " + json.dumps(policy), flush=True)
+    if rank_world()[0] == 0: print("[TTN activation checkpoint] " + json.dumps(memory_policy), flush=True)
     return model, config, settings
 
 
@@ -334,6 +336,8 @@ def _training_identity(args, config, settings, k):
             "execution": {"core_backend": getattr(args, "ttn_core_backend", "reference"),
                           "psi_backend": getattr(args, "ttn_psi_backend", "reference")},
             "data": None if args.batch_file else asdict(config.data)}
+    if settings.get("activation_checkpointing", "none") != "none":
+        identity["execution"]["activation_checkpointing"] = settings["activation_checkpointing"]
     # Preserve existing frozen-backbone resume identities exactly.
     if getattr(args, "train_scope", "ttn") == "dit":
         identity.update(train_scope="dit", backbone_lr=getattr(args, "backbone_lr", 1e-6), optimizer_foreach=False)

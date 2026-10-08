@@ -6,6 +6,7 @@ from pathlib import Path
 from test_training import TinyWorldModel, TinyBlock, inputs
 from test_sink import actual_rope
 from test_alignment_detail import cached_sana
+from test_activation_checkpoint import cached_ffn, text_attention
 from worldttn import training
 from worldttn.anchor import configure_train_scope, install_ttn
 from worldttn.checkpoint import make_optimizer, save_checkpoint, load_checkpoint
@@ -422,7 +423,8 @@ def test_rotation_geometry_distinguishes_radial_and_tangent_gradients():
 
 @pytest.mark.skipif(not torch.cuda.is_available() or "META_TEST_OUTPUT" not in os.environ,
                    reason="requires the isolated four-node LTU allocation")
-def test_full_memory_four_gpu_future_credit_and_resume(cached_sana):
+@pytest.mark.parametrize("pure_checkpoint", [False, True], ids=["original", "pure-checkpoint"])
+def test_full_memory_four_gpu_future_credit_and_resume(cached_sana, cached_ffn, text_attention, pure_checkpoint):
     import copy
     import torch.distributed as dist
     from diffusers import FlowMatchEulerDiscreteScheduler  # required, never silently skip this gate
@@ -434,7 +436,14 @@ def test_full_memory_four_gpu_future_credit_and_resume(cached_sana):
     torch.cuda.set_device(0)
     dist.init_process_group("nccl", init_method="env://", rank=launch["rank"], world_size=4)
     try:
-        m = model(cached_sana).cuda()
+        def network():
+            if not pure_checkpoint: return model(cached_sana).cuda()
+            from test_activation_checkpoint import pure_model
+            result = pure_model(cached_sana, cached_ffn, text_attention).cuda()
+            for block in result.blocks:
+                block.mlp.ttn_activation_checkpointing = block.cross_attn.ttn_activation_checkpointing = True
+            return result
+        m = network()
         live = []
         def retain(module, args, out):
             context = args[2]
@@ -463,8 +472,10 @@ def test_full_memory_four_gpu_future_credit_and_resume(cached_sana):
         assert all(value.grad is not None and value.grad.norm() > 0 for value in live[4])
         assert all(value.grad is None for value in live[3]+live[7])
         live.clear()
-        path = Path(os.environ["META_TEST_OUTPUT"])/"full-memory-resume"/"last.pt"
-        identity = {"tbptt": 4, "history_training": training.history_settings(protocol)}
+        path = Path(os.environ["META_TEST_OUTPUT"])/f"full-memory-resume-{pure_checkpoint}"/"last.pt"
+        identity = {"tbptt": 4, "history_training": training.history_settings(protocol),
+                    "execution": {"core_backend": "reference", "psi_backend": "reference",
+                                  **({"activation_checkpointing": "ffn-cross-attn"} if pure_checkpoint else {})}}
         cursor = {"epoch": 1, "batch_in_epoch": 2}
         save_training_checkpoint(path, engine, opt, 1, cursor, identity)
         expected = train(m, opt, engine)
@@ -472,7 +483,7 @@ def test_full_memory_four_gpu_future_credit_and_resume(cached_sana):
                  for name, value in m.state_dict().items()}
         expected_optimizer = copy.deepcopy(opt.state_dict())
         rng = torch.cuda.get_rng_state().clone()
-        resumed = model(cached_sana).cuda()
+        resumed = network()
         load_checkpoint(path, resumed)
         resumed_engine = ParallelTraining(resumed, training.linear_flow_loss, "fsdp2", activation_offload="cpu")
         resumed_opt = make_optimizer(resumed)

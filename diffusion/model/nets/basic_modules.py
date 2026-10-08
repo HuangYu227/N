@@ -18,6 +18,7 @@
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 from timm.models.vision_transformer import Mlp
 from torch.distributed.nn import functional as dist_nn
 
@@ -173,9 +174,14 @@ class GLUMBConv(nn.Module):
         # Conservative estimate of the largest intermediate (after inverted_conv).
         elements_per_bt = self.inverted_conv.conv.out_channels * H * W
         max_bt = max(1, _INT32_SAFE_CONV_ELEMENTS // elements_per_bt)
+        # Only pure spatial computation is replayed. Temporal cache writes stay
+        # in forward(), outside this checkpoint and outside its recomputation.
+        spatial = self._apply_spatial
+        if getattr(self, "ttn_activation_checkpointing", False) and torch.is_grad_enabled():
+            spatial = lambda value: checkpoint(self._apply_spatial, value, use_reentrant=False)
         if BT <= max_bt:
-            return self._apply_spatial(x)
-        return torch.cat([self._apply_spatial(x[s : s + max_bt]) for s in range(0, BT, max_bt)], dim=0)
+            return spatial(x)
+        return torch.cat([spatial(x[s : s + max_bt]) for s in range(0, BT, max_bt)], dim=0)
 
     def forward(self, x: torch.Tensor, HW=None) -> torch.Tensor:
         B, N, C = x.shape

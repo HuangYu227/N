@@ -43,7 +43,8 @@ def execution_report(model):
                       "dense_reused" if options.psi_backend == "reference" else "projected")
     cfg = getattr(getattr(model, "ttn_system", None), "config", None)
     if cfg is not None and (cfg.local_update or cfg.persistent_meta): implementation = "live_projected_meta"
-    return {**asdict(options), "psi_implementation": implementation, "triton_available": False}
+    return {**asdict(options), "psi_implementation": implementation, "triton_available": False,
+            "activation_checkpointing": getattr(model, "ttn_activation_checkpointing", "none")}
 
 
 def configure_execution(model, options=None):

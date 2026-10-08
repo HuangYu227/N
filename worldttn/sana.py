@@ -80,6 +80,33 @@ def build_sana(config, ttn_config, base_weights=None, device="cuda", dtype=torch
     return model
 
 
+def configure_activation_checkpointing(model, policy="none"):
+    """Recompute pure FFN/text operations; never replay a block or transaction."""
+    if policy not in ("none", "ffn-cross-attn"):
+        raise ValueError("activation_checkpointing must be none or ffn-cross-attn")
+    targets = []
+    if policy != "none":
+        from diffusion.model.nets.basic_modules import CachedGLUMBConvTemp
+        from diffusion.model.nets.sana_blocks import MultiHeadCrossAttention
+        for i, block in enumerate(getattr(model, "blocks", ())):
+            if (type(getattr(block, "mlp", None)) is not CachedGLUMBConvTemp
+                    or type(getattr(block, "cross_attn", None)) is not MultiHeadCrossAttention):
+                raise ValueError("activation checkpointing requires cached SANA spatial FFN and standard text attention")
+            if any(isinstance(m, torch.nn.modules.batchnorm._BatchNorm) for m in block.mlp.modules()):
+                raise ValueError("activation checkpointing cannot replay BatchNorm running-stat updates")
+            targets.extend([(f"blocks.{i}.mlp/spatial", block.mlp),
+                            (f"blocks.{i}.cross_attn", block.cross_attn)])
+        if not targets: raise ValueError("no cached SANA blocks for activation checkpointing")
+    for _, module in targets: module.ttn_activation_checkpointing = True
+    if policy == "none":
+        for module in model.modules():
+            if hasattr(module, "ttn_activation_checkpointing"): module.ttn_activation_checkpointing = False
+    model.ttn_activation_checkpointing = policy
+    model.activation_checkpoint_report = {"policy": policy, "modules": [name for name, _ in targets],
+                                         "use_reentrant": False, "stateful_recomputation": False}
+    return model.activation_checkpoint_report
+
+
 def configure_cross_attention(model, backend="auto", *, diagnostic_unmask_all_valid=False):
     """Select the standard text cross-attention call site, never visual/camera SDPA."""
     from diffusion.model.nets.sana_blocks import MultiHeadCrossAttention
