@@ -30,13 +30,15 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.fixture
-def allocation():
+def allocation(request):
     launch = resolve_launch_environment()
     if launch["world_size"] < 2:
         pytest.skip("proximal FSDP2 acceptance requires at least two ranks")
     assert launch["world_size"] in (2, 3, 4)
     assert torch.cuda.device_count() == 1, "one visible GPU per pytest rank"
     torch.cuda.set_device(0)
+    print(f"[TTN meta case] rank={launch['rank']} test={request.node.nodeid} "
+          f"master={launch['master_addr']}:{launch['master_port']}", flush=True)
     dist.init_process_group("nccl", init_method="env://", rank=launch["rank"],
                             world_size=launch["world_size"])
     try:
@@ -53,10 +55,15 @@ def _inputs(rank):
 def _train(model, optimizer, engine, inputs, offload="cpu", callback=None):
     # Use the installed scheduler, not the CPU Euler oracle.
     clean, noise, timestep, camera = inputs
+    def progress(phase, **info):
+        indices = {key: info[key] for key in ("chunk", "first", "last") if key in info}
+        print(f"[TTN meta phase] rank={engine.rank} phase={phase} {indices}", flush=True)
+        if callback is not None:
+            callback(phase, **info)
     return training.train_clip(model, clean, torch.zeros(1, 1, 2, 8, device="cuda"),
         camera, optimizer, training.linear_flow_loss, timestep, noise, width=100,
         height=100, tbptt=4, activation_offload=offload, parallel=engine,
-        memory_callback=callback,
+        memory_callback=progress,
         history_training={"source": "generated", "steps": 4, "cached_chunks": 2})
 
 

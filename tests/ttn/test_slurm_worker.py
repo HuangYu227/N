@@ -68,8 +68,10 @@ def worker_setup(tmp_path):
     return bash, script, capture, writer, personal, env
 
 
-@pytest.mark.parametrize("tasks", [1, 3, 5])
-def test_proximal_meta_launcher_selects_tests_and_rejects_invalid_topology(worker_setup, tmp_path, tasks):
+@pytest.mark.parametrize("tasks,fail_second", [(1, False), (2, False), (3, False), (4, False),
+                                             (5, False), (4, True)])
+def test_proximal_meta_launcher_selects_tests_and_rejects_invalid_topology(
+        worker_setup, tmp_path, tasks, fail_second):
     bash, worker, capture, writer, personal, env = worker_setup
     project = tmp_path / "project"
     (project / "tools").mkdir(parents=True)
@@ -81,8 +83,13 @@ def test_proximal_meta_launcher_selects_tests_and_rejects_invalid_topology(worke
                       encoding="utf-8", newline="\n")
     python.chmod(0o755)
     writer.write_text("import json,os,sys\nfrom pathlib import Path\n"
-        "Path(os.environ['CAPTURE']).write_text(json.dumps({'args':sys.argv[1:],"
-        "'master':os.environ['MASTER_ADDR'],'module':os.environ['TTN_ENTRY_MODULE']}))\n", encoding="utf-8")
+        "path=Path(os.environ['CAPTURE'])\n"
+        "count=len(path.read_text().splitlines()) if path.exists() else 0\n"
+        "record={'args':sys.argv[1:],'master':os.environ['MASTER_ADDR'],"
+        "'port':os.environ['MASTER_PORT'],'module':os.environ['TTN_ENTRY_MODULE'],"
+        "'output':os.environ['META_TEST_OUTPUT']}\n"
+        "with path.open('a') as stream: stream.write(json.dumps(record)+'\\n')\n"
+        "sys.exit(7 if os.environ['FAIL_SECOND']=='1' and count==1 else 0)\n", encoding="utf-8")
     mocks = tmp_path / "mocks"
     mocks.mkdir()
     for name, body in (
@@ -93,7 +100,8 @@ def test_proximal_meta_launcher_selects_tests_and_rejects_invalid_topology(worke
         path.write_text("#!/usr/bin/env bash\n" + body + "\n", encoding="utf-8", newline="\n")
         path.chmod(0o755)
     env.update(PROJECT_ROOT=project.as_posix(), PROXIMAL_MEMORY_TESTS="1", FULL_MEMORY_TESTS="1",
-               SLURM_NTASKS=str(tasks), SLURM_JOB_NODELIST="ltu-hpc-1")
+               SLURM_NTASKS=str(tasks), SLURM_JOB_NODELIST="ltu-hpc-1",
+               FAIL_SECOND="1" if fail_second else "0")
     env["PATH"] = str(mocks) + os.pathsep + env["PATH"]
     result = subprocess.run([str(bash), str(project / "tools/ttn_slurm_meta_tests.sbatch")], env=env,
                             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
@@ -101,16 +109,33 @@ def test_proximal_meta_launcher_selects_tests_and_rejects_invalid_topology(worke
         assert result.returncode == 2 and "requires one, two, three or four" in result.stderr
         assert not capture.exists()
         return
-    assert result.returncode == 0, result.stderr
-    record = json.loads(capture.read_text())
-    assert record["master"] == "10.0.0.1" and record["module"] == "pytest"
-    assert f"--ntasks={tasks}" in record["args"] and "--kill-on-bad-exit=1" in record["args"]
-    tests = [arg for arg in record["args"] if arg.startswith("tests/")]
-    if tasks == 3:
-        assert tests == ["tests/ttn/test_proximal_cuda.py"]
-    else:
+    assert result.returncode == (7 if fail_second else 0), result.stderr
+    records = [json.loads(line) for line in capture.read_text().splitlines()]
+    for record in records:
+        assert record["master"] == "10.0.0.1" and record["module"] == "pytest"
+        assert f"--ntasks={tasks}" in record["args"] and "--kill-on-bad-exit=1" in record["args"]
+    if tasks == 1:
+        assert len(records) == 1
+        tests = [arg for arg in records[0]["args"] if arg.startswith("tests/")]
         assert "tests/ttn/test_proximal_device.py" in tests and "tests/ttn/test_proximal_runtime.py" in tests
         assert "tests/ttn/test_meta_cuda.py" not in tests
+        return
+    expected = [
+        "tests/ttn/test_proximal_cuda.py::test_proximal_fsdp_cache_only_future_credit[live-cache]",
+        "tests/ttn/test_proximal_cuda.py::test_proximal_fsdp_cache_only_future_credit[detached-cache-control]",
+        "tests/ttn/test_proximal_cuda.py::test_proximal_fsdp_offload_and_exact_resume",
+    ]
+    assert len(records) == (2 if fail_second else 3), "failed cases must stop the remaining acceptance steps"
+    assert len({record["output"] for record in records}) == len(records)
+    assert [int(record["port"]) for record in records] == list(
+        range(int(records[0]["port"]), int(records[0]["port"])+len(records)))
+    for record, test in zip(records, expected):
+        args = record["args"]
+        assert [arg for arg in args if arg.startswith("tests/")] == [test]
+        assert all(flag in args for flag in ("-x", "-vv", "-s"))
+        output = next((arg.split("=", 1)[1] for arg in args if arg.startswith("--output=")), None)
+        if output is None: output = args[args.index("--output")+1]
+        assert output == f"{record['output']}/rank-%t.out", "each case must preserve separate per-rank logs"
 
 
 @pytest.mark.parametrize("rank", [0, 1, 2])

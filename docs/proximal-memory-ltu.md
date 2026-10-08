@@ -40,6 +40,8 @@ sacct -X -j "$OP_JOB,$META_JOB" --format=JobID,State,ExitCode,Elapsed
 
 单卡包括 FP64 oracle、meta 导数、真实 anchor/native camera、BF16 输出以及 offload 小模型。四卡包括 isolated-cache future credit、TBPTT截断、offload梯度、保存恢复后模型/Adam/RNG/游标/runtime。四卡测试模型很小，只检验分布式接线，不测完整模型容量。任一失败都先看首个失败，不把随后 NCCL 退出当成根因。
 
+四卡的 live-cache、detached-cache-control、offload/resume 三组分别在独立 `srun` step 中执行，使用新 Python 进程和不同 rendezvous 端口。每组四个 rank 并行，三组依次执行；失败立即停止。主作业日志记录 `[TTN acceptance]`，详细日志在 `output/meta-tests-$META_JOB/case-{0,1,2}/rank-{0,1,2,3}.out`，包含测试 ID 和 chunk/forward/backward 阶段。此隔离防止各 rank 在不同 pytest 测试中重新建立通信组；不改变模型数学、通信超时或比较阈值。
+
 ## 3. 完整 SANA，25 latent，2 steps
 
 只有上一步全部 COMPLETED/0:0 后执行。数据目录默认使用原项目目录；如果实际数据根不同，只修改 DATASET_ROOT。

@@ -27,7 +27,10 @@ if [[ "${PROXIMAL_MEMORY_TESTS:-0}" == 1 ]]; then
               tests/ttn/test_proximal_evaluation.py tests/ttn/test_proximal_device.py tests/ttn/test_sana_camera_restore.py
               tests/ttn/test_meta_training.py::test_production_flow_records_exact_scheduler_sigma_separately_from_mapped_timestep
               tests/ttn/test_activation_checkpoint.py) ;;
-    2|3|4) tests=(tests/ttn/test_proximal_cuda.py) ;;
+    2|3|4) tests=(
+              'tests/ttn/test_proximal_cuda.py::test_proximal_fsdp_cache_only_future_credit[live-cache]'
+              'tests/ttn/test_proximal_cuda.py::test_proximal_fsdp_cache_only_future_credit[detached-cache-control]'
+              tests/ttn/test_proximal_cuda.py::test_proximal_fsdp_offload_and_exact_resume) ;;
     *) echo 'Proximal acceptance requires one, two, three or four nodes/tasks' >&2; exit 2 ;;
   esac
 else
@@ -46,6 +49,32 @@ if [[ "${FULL_MEMORY_TESTS:-0}" == 1 ]]; then
            -k 'not four_gpu')
   fi
 fi
+fi
+if [[ "${PROXIMAL_MEMORY_TESTS:-0}" == 1 && "$SLURM_NTASKS" != 1 ]]; then
+  # A rank-local pytest failure must not let that rank enter another NCCL test.
+  suite_output="$META_TEST_OUTPUT"
+  suite_port="$MASTER_PORT"
+  for index in "${!tests[@]}"; do
+    export MASTER_PORT="$((suite_port + index))" META_TEST_OUTPUT="$suite_output/case-$index"
+    mkdir -p "$META_TEST_OUTPUT"
+    printf '[TTN acceptance] start case=%s test=%s port=%s logs=%s/rank-%%t.out\n' \
+      "$index" "${tests[index]}" "$MASTER_PORT" "$META_TEST_OUTPUT"
+    if srun --mpi=none --kill-on-bad-exit=1 --ntasks="$SLURM_NTASKS" --ntasks-per-node=1 --gres=gpu:1 \
+        --chdir="$PROJECT_ROOT" --output="$META_TEST_OUTPUT/rank-%t.out" \
+        bash tools/ttn_slurm_worker.sh -x -vv -s "${tests[index]}" "$@"; then
+      printf '[TTN acceptance] completed case=%s\n' "$index"
+    else
+      status=$?
+      printf '[TTN acceptance] failed case=%s exit=%s logs=%s\n' "$index" "$status" "$META_TEST_OUTPUT" >&2
+      for log in "$META_TEST_OUTPUT"/rank-*.out; do
+        [[ -f "$log" ]] || continue
+        printf '[TTN acceptance] log=%s\n' "$log" >&2
+        tail -n 60 "$log" >&2
+      done
+      exit "$status"
+    fi
+  done
+  exit 0
 fi
 exec srun --mpi=none --kill-on-bad-exit=1 --ntasks="$SLURM_NTASKS" --ntasks-per-node=1 --gres=gpu:1 \
   --chdir="$PROJECT_ROOT" bash tools/ttn_slurm_worker.sh -q -s "${tests[@]}" "$@"
