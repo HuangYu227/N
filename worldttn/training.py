@@ -1,5 +1,6 @@
 """Causal clean-history training, one optimizer step per clip, explicit TBPTT windows."""
 from contextlib import nullcontext
+from collections import Counter
 from dataclasses import dataclass, field, fields, replace
 import math
 import torch
@@ -72,7 +73,7 @@ def generate_history_chunk(session, initial_noise, observed, y, context, cache, 
     return x
 
 
-def activation_storage(mode, *, device=None):
+def activation_storage(mode, *, device=None, audit=None):
     """Copy saved tensors to host before FSDP resharding; never replay TTN forwards.
 
     Native save_on_cpu copies values (including weight views) during forward,
@@ -84,8 +85,28 @@ def activation_storage(mode, *, device=None):
         # CPU tensors already live on the host. Pinned packing would only
         # change their strides and can change backward rounding on GPU hosts.
         if device is not None and torch.device(device).type == "cpu": return nullcontext()
-        return torch.autograd.graph.save_on_cpu(pin_memory=True)
+        storage = torch.autograd.graph.save_on_cpu(pin_memory=True)
+        if audit is not None:
+            pack = storage.pack_hook
+            def record(tensor):
+                packed = pack(tensor)
+                key = (str(tensor.device), str(tensor.dtype), tuple(tensor.shape),
+                       tuple(tensor.stride()), tensor.element_size())
+                audit[key] += 1
+                return packed
+            storage.pack_hook = record
+        return storage
     raise ValueError("activation_offload must be none or cpu")
+
+
+def activation_storage_stats(audit):
+    """Cumulative native pack payload per window, not live bytes or host RSS."""
+    sizes = [(math.prod(key[2]) * key[4] * count, key, count) for key, count in audit.items()]
+    return {"pack_calls": sum(audit.values()), "packed_tensor_bytes": sum(row[0] for row in sizes),
+            "largest_shapes": [{"bytes": size, "count": count, "device": key[0], "dtype": key[1],
+                                "shape": list(key[2]), "stride": list(key[3])}
+                               for size, key, count in sorted(sizes, reverse=True)[:8]],
+            "measurement": "TBPTT-window cumulative native CPU pack payload; not live memory or RSS"}
 
 
 def _memory_phase(callback, phase, **info):
@@ -217,6 +238,8 @@ class TTNTrainingWindow(torch.nn.Module):
         losses_in_window = []
         from .performance import DEFAULT_EXECUTION, annotation
         execution = getattr(self.model.ttn_system, "ttn_execution", DEFAULT_EXECUTION)
+        def boundary_backward(unused):
+            raise RuntimeError("TBPTT-boundary clean history must be detached before a future loss")
         for index in range(first, last):
             start, end = episode.ranges[index]
             context = session.begin_chunk(start, end)
@@ -240,14 +263,20 @@ class TTNTrainingWindow(torch.nn.Module):
             losses_in_window.append(loss)
             episode.total_loss += float(loss.detach())
             _memory_phase(episode.memory_callback, "noisy_end", chunk=index, start=start, end=end)
-            # The clean transaction is live; the generated sample itself is stop-gradient.
+            # Only clean updates with a later loss inside this window need a graph.
+            # Keep grad mode: native SANA selects different forward kernels under no_grad.
+            # Discard only this unused graph's saved tensors, then detach its published state.
+            future_credit = index + 1 < last
             _memory_phase(episode.memory_callback, "clean_begin", chunk=index, start=start, end=end)
-            with annotation(execution, "CleanForward"):
+            boundary = (nullcontext() if future_credit else torch.autograd.graph.saved_tensors_hooks(
+                lambda tensor: None, boundary_backward))
+            with boundary, annotation(execution, "CleanForward"):
                 _, episode.cache = session.clean_forward(clean_history, episode.y, context,
                                                           episode.cache, start, end, episode.mask, episode.data_info,
                                                           cached_chunks=episode.history["cached_chunks"])
+            if not future_credit: session.runtime.detach()
             episode.records.append(dict(session.runtime.last_stats, chunk=index, start=start, end=end,
-                history_source=episode.history["source"],
+                history_source=episode.history["source"], clean_future_credit=future_credit,
                 history_generation_steps=episode.history["steps"] if episode.history_noise is not None else 0,
                 clean_history_rms=float(clean_history.detach().float().square().mean().sqrt())))
             _memory_phase(episode.memory_callback, "clean_end", chunk=index, start=start, end=end)
@@ -299,6 +328,12 @@ def train_clip(model,
     loss_valid = valid.clone()
     loss_valid[:, 0] = False
     total = loss_valid.sum(-1).clamp_min(1)
+    offload_audit = Counter() if memory_callback is not None and activation_offload == "cpu" else None
+    if offload_audit is not None:
+        callback = memory_callback
+        def traced(phase, **info):
+            callback(phase, offload_saved_tensors=activation_storage_stats(offload_audit), **info)
+        memory_callback = traced
     session = TTNSession(model, camera_conditions, width, height, valid, extras, collect_local_stats=True)
     runtime = session.reset(b)
     optimizer.zero_grad(set_to_none=True)
@@ -323,6 +358,7 @@ def train_clip(model,
     if parallel: parallel.reshard()
     runtime.detach()  # initial observed prefill is a boundary before generated-chunk windows
     for first in range(0, len(episode.ranges), tbptt):
+        if offload_audit is not None: offload_audit.clear()
         last = min(first + tbptt, len(episode.ranges))
         sync = parallel.accumulation(last == len(episode.ranges)) if parallel else nullcontext()
         # FSDP swaps full parameter storage between chunk forwards. Cached AMP
@@ -334,7 +370,7 @@ def train_clip(model,
                              cache_enabled=False) if parallel is not None and parallel.mode == "fsdp2" else nullcontext()
         # DDP no_sync still encloses both forward and backward. CPU storage
         # preserves the full window's S/optional Persistent-meta graph.
-        with sync, amp, activation_storage(activation_offload, device=clean.device):
+        with sync, amp, activation_storage(activation_offload, device=clean.device, audit=offload_audit):
             loss = runner(episode, first, last, on_prediction=on_prediction)
             _memory_phase(memory_callback, "backward_begin", first=first, last=last)
             from .performance import DEFAULT_EXECUTION, annotation

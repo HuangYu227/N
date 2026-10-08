@@ -154,6 +154,76 @@ def test_cpu_activation_storage_skips_pinned_hooks_even_on_gpu_hosts(monkeypatch
         training.activation_storage("disk", device="cpu")
 
 
+def test_boundary_clean_graph_is_unneeded_and_drops_saved_tensors(monkeypatch, cached_sana):
+    from tools.ttn_compare_resume import identical
+    from worldttn.checkpoint import rng_state
+    monkeypatch.setattr(training, "_history_scheduler", EulerOracle)
+    baseline, optimized = model(cached_sana), model(cached_sana)
+    aopt, bopt = make_optimizer(baseline), make_optimizer(optimized)
+    original = training.TTNSession.clean_forward
+    clean_sizes = []
+    def pack_clean(tensor):
+        clean_sizes.append(tensor.numel()*tensor.element_size())
+        return tensor.detach()
+    def live_clean(self, clean, y, context, *args, **kwargs):
+        # Restore the old saved-tensor behavior while retaining the same forward/commit.
+        with torch.autograd.graph.saved_tensors_hooks(pack_clean, lambda tensor: tensor):
+            return original(self, clean, y, context, *args, **kwargs)
+    def measure(network, optimizer):
+        sizes = []
+        def pack(tensor):
+            sizes.append(tensor.numel()*tensor.element_size())
+            return tensor.detach()
+        with torch.autograd.graph.saved_tensors_hooks(pack, lambda value: value):
+            result = update(network, optimizer)
+        return result, sum(sizes)
+    with monkeypatch.context() as patch:
+        patch.setattr(training.TTNSession, "clean_forward", live_clean)
+        before, saved_before = measure(baseline, aopt)
+    saved_before += sum(clean_sizes)
+    expected_rng = rng_state()
+    clean_grad_modes = []
+    def record_mode(module, args, kwargs):
+        context = kwargs["ttn_chunk_context"]
+        if context.clean_mode and not context.prefill_mode: clean_grad_modes.append(torch.is_grad_enabled())
+    optimized.register_forward_pre_hook(record_mode, with_kwargs=True)
+    after, saved_after = measure(optimized, bopt)
+    assert saved_after < saved_before
+    assert before["loss"] == after["loss"] and before["outer_grad_norm"] == after["outer_grad_norm"]
+    for (name, p), (other, q) in zip(baseline.named_parameters(), optimized.named_parameters()):
+        assert name == other
+        torch.testing.assert_close(p, q, rtol=0, atol=0, msg=name)
+        if p.grad is None: assert q.grad is None
+        else: torch.testing.assert_close(p.grad, q.grad, rtol=0, atol=0, msg=name)
+    identical(aopt.state_dict(), bopt.state_dict(), "boundary clean optimizer")
+    identical(expected_rng, rng_state(), "boundary clean RNG")
+    for field in ("world_state", "transition_fast", "replay_values"):
+        torch.testing.assert_close(getattr(before["runtime"], field), getattr(after["runtime"], field), rtol=0, atol=0)
+    assert before["runtime"].sink_reference_sha256 == after["runtime"].sink_reference_sha256
+    assert before["runtime"].replay_reference_sha256 == after["runtime"].replay_reference_sha256
+    assert [row["clean_future_credit"] for row in after["chunks"]] == [True, True, True, False]*2
+    assert clean_grad_modes == [True]*8, "preserve native SANA's gradient-enabled forward dispatch"
+    assert not after["runtime"].world_state.requires_grad
+    with pytest.raises(RuntimeError, match="TBPTT-boundary"):
+        optimized.saved_features[4].square().sum().backward()
+
+
+def test_offload_audit_counts_native_payload_without_retaining_tensors(monkeypatch):
+    from collections import Counter
+    x = torch.arange(12., dtype=torch.float64).reshape(3, 4).t().requires_grad_()
+    original = torch.autograd.graph.save_on_cpu
+    monkeypatch.setattr(torch.autograd.graph, "save_on_cpu", lambda **kw: original(pin_memory=False))
+    audit = Counter()
+    with training.activation_storage("cpu", device="cuda:0", audit=audit):
+        x.square().sum().backward()
+    torch.testing.assert_close(x.grad, 2*x.detach(), rtol=0, atol=0)
+    report = training.activation_storage_stats(audit)
+    assert report["pack_calls"] == 1 and report["packed_tensor_bytes"] == 12*8
+    assert report["largest_shapes"][0]["shape"] == [4, 3]
+    assert report["largest_shapes"][0]["stride"] == [1, 4]
+    assert all(not isinstance(value, torch.Tensor) for key in audit for value in key)
+
+
 def test_full_training_recipe_validation():
     with pytest.raises(ValueError, match="persistent_update"):
         TTNConfig(stage="C", persistent_meta=True, persistent_update=False)
