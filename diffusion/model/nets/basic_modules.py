@@ -178,7 +178,15 @@ class GLUMBConv(nn.Module):
         # in forward(), outside this checkpoint and outside its recomputation.
         spatial = self._apply_spatial
         if getattr(self, "ttn_activation_checkpointing", False) and torch.is_grad_enabled():
-            spatial = lambda value: checkpoint(self._apply_spatial, value, use_reentrant=False)
+            stride = x.stride()  # Metadata only: do not retain the original CUDA input.
+            def recompute(value):
+                # Native pinned CPU packing may discard channels-last strides.
+                # Restore them so convolution recomputes the same forward path.
+                if value.stride() != stride:
+                    value = torch.empty_strided(value.shape, stride, dtype=value.dtype,
+                                                device=value.device).copy_(value)
+                return self._apply_spatial(value)
+            spatial = lambda value: checkpoint(recompute, value, use_reentrant=False)
         if BT <= max_bt:
             return spatial(x)
         return torch.cat([spatial(x[s : s + max_bt]) for s in range(0, BT, max_bt)], dim=0)

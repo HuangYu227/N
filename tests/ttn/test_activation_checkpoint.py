@@ -111,6 +111,20 @@ def test_text_checkpoint_preserves_padding_rng_and_outer_gradients(text_attentio
     assert torch.equal(mask, torch.tensor([[1, 1, 1, 0, 0]]))
 
 
+def test_spatial_recompute_preserves_input_stride_after_cpu_packing(cached_ffn):
+    module = cached_ffn(8, 24).double()
+    module.ttn_activation_checkpointing = True
+    strides = []
+    module.inverted_conv.register_forward_pre_hook(lambda layer, args: strides.append(args[0].stride()))
+    x = torch.randn(1, 12, 8, dtype=torch.float64, requires_grad=True)
+    # save_on_cpu(pin_memory=True) reconstructs packed tensors by shape. Model
+    # that layout change on CPU without requiring a CUDA/pinned allocator.
+    with torch.autograd.graph.saved_tensors_hooks(lambda value: value.detach().contiguous().clone(), lambda value: value):
+        output = module(x, HW=(3, 2, 2))
+    output.square().sum().backward()
+    assert len(strides) == 2 and strides[0] == strides[1]
+
+
 def test_combined_checkpoint_future_credit_updates_and_saved_payload(monkeypatch, cached_sana, cached_ffn, text_attention):
     from test_full_training import EulerOracle, update
     from worldttn import training
