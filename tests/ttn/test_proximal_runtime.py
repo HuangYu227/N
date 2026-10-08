@@ -49,9 +49,13 @@ def test_proximal_training_bounded_cache_and_future_credit(monkeypatch, cached_s
     assert m.blocks[3].attn.beta_proj.weight.grad.norm() > 0
     assert all(p.grad is None and not p.requires_grad for p in m.ttn_system.parameters())
     assert runtime.transition_fast.count_nonzero() == 0
-    for row in result["chunks"]:
+    for chunk, row in enumerate(result["chunks"], 1):
         for anchor in row["anchors"]:
             assert anchor["proximal"]["implementation"] == "live_proximal_s"
+            assert ("state_spectrum" in anchor) == (chunk in (1, 4, 5, 8))
+            if "state_spectrum" in anchor:
+                assert anchor["inner_update_applied"] is True
+                assert anchor["state_spectrum"]["committed"]["sigma_max"][0][0] >= 0
     assert runtime.verify_memory_prefix()
 
 
@@ -144,6 +148,21 @@ def test_quantized_output_effect_is_measured(cached_sana):
     assert effect["dtype"] == "torch.bfloat16"
     assert effect["delta_norm"] > 0 and effect["relative_delta"] > 0
     assert 0 < effect["changed_fraction"] <= 1
+
+
+def test_proximal_noise_telemetry_keeps_exact_sigma_and_sampled_index(cached_sana):
+    from test_anchor import context
+    from worldttn.session import record_noise
+    m = proximal_model(cached_sana)
+    _, ctx = context(m.ttn_system.config, f=4)
+    timestep = torch.full((1, 1, 4), 731.)
+    sampled = torch.full((1, 1, 4), 500)
+    sigma = torch.full((1, 1, 4), .73137)
+    record_noise(ctx, timestep, sigma, sampled)
+    row = ctx.memory_trajectory[-1]
+    assert row["noise_sigma_source"] == "scheduler"
+    assert row["noise_sigma"] == sigma.tolist() and row["sampled_timestep"] == sampled.tolist()
+    assert row["noise_timestep"] == timestep.tolist()
 
 
 @pytest.mark.parametrize("source,ttn_value,native_value", [("ttn-gt", 2., 1.), ("native-gt", 1., 2.)])

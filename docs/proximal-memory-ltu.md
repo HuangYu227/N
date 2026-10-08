@@ -1,6 +1,6 @@
 # Proximal memory：LTU 验收与训练顺序
 
-数学与来源见 [proximal-memory.md](proximal-memory.md)。以下是准备好的指令，本地编写文档不会提交任何服务器任务。本分支尚需发布到 GitHub 后才能 fetch。旧的 full-memory/dual-psi 作业不会自动改成新方案。
+数学与来源见 [proximal-memory.md](proximal-memory.md)。以下是准备好的指令，本地编写文档不会提交任何服务器任务。本分支已发布到 GitHub；按用户当前资源使用四卡。旧的 full-memory/dual-psi 作业不会自动改成新方案。
 
 ## 1. 发布后建立独立目录
 
@@ -21,16 +21,16 @@ df -h "$PROJECT_ROOT"
 squeue -u "$USER" -o '%.18i %.20j %.12T %.10M %.4D %R'
 ```
 
-已有同名目录时不要覆盖/删除；复用前核对其 commit。LTU 预期 Python3.11、Torch2.9.1+cu128。四卡改三卡必须是 fresh run，旧 world-size checkpoint 不可 exact resume 到另一拓扑。下面使用三卡验收，不固定节点，不绕开 Slurm 分配。
+已有同名目录时不要覆盖/删除；复用前核对其 commit。LTU 预期 Python3.11、Torch2.9.1+cu128。更改卡数必须是 fresh run，旧 world-size checkpoint 不可 exact resume 到另一拓扑。下面使用四卡验收，不固定节点，不绕开 Slurm 分配。
 
-## 2. 单卡算子与三卡 FSDP2 小模型门槛
+## 2. 单卡算子与四卡 FSDP2 小模型门槛
 
 ```bash
 export PROXIMAL_MEMORY_TESTS=1 FULL_MEMORY_TESTS=0 GDN_DISABLE_COMPILE=1
 OP_JOB=$(sbatch --parsable --nodes=1 --ntasks=1 --mem=32G --time=00:30:00 \
   tools/ttn_slurm_meta_tests.sbatch)
 OP_JOB=${OP_JOB%%;*}
-META_JOB=$(sbatch --parsable --nodes=3 --ntasks=3 --mem=32G --time=00:30:00 \
+META_JOB=$(sbatch --parsable --nodes=4 --ntasks=4 --mem=32G --time=00:30:00 \
   --kill-on-invalid-dep=yes --dependency="afterok:$OP_JOB" \
   tools/ttn_slurm_meta_tests.sbatch)
 META_JOB=${META_JOB%%;*}
@@ -38,7 +38,7 @@ printf 'OP_JOB=%s\nMETA_JOB=%s\n' "$OP_JOB" "$META_JOB"
 sacct -X -j "$OP_JOB,$META_JOB" --format=JobID,State,ExitCode,Elapsed
 ```
 
-单卡包括 FP64 oracle、meta 导数、真实 anchor/native camera、BF16 输出以及 offload 小模型。三卡包括 isolated-cache future credit、TBPTT截断、offload梯度、保存恢复后模型/Adam/RNG/游标/runtime。三卡测试模型很小，只检验分布式接线，不测完整模型容量。任一失败都先看首个失败，不把随后 NCCL 退出当成根因。
+单卡包括 FP64 oracle、meta 导数、真实 anchor/native camera、BF16 输出以及 offload 小模型。四卡包括 isolated-cache future credit、TBPTT截断、offload梯度、保存恢复后模型/Adam/RNG/游标/runtime。四卡测试模型很小，只检验分布式接线，不测完整模型容量。任一失败都先看首个失败，不把随后 NCCL 退出当成根因。
 
 ## 3. 完整 SANA，25 latent，2 steps
 
@@ -55,7 +55,7 @@ export DISTRIBUTED_TIMEOUT=1800 GDN_DISABLE_COMPILE=1
 unset ADAPTER RESUME UNFREEZE BATCH_FILE TTN_ENTRY_MODULE
 export OUTPUT="$PROJECT_ROOT/output/proximal-25-$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p "$OUTPUT"
-CHECK_JOB=$(sbatch --parsable --nodes=3 --ntasks=3 --partition=day --mem=256G \
+CHECK_JOB=$(sbatch --parsable --nodes=4 --ntasks=4 --partition=day --mem=256G \
   --time=02:00:00 --output="$OUTPUT/slurm-%j.out" tools/ttn_slurm_train.sbatch)
 CHECK_JOB=${CHECK_JOB%%;*}
 printf 'CHECK_JOB=%q\nCHECK_RUN=%q\n' "$CHECK_JOB" "$OUTPUT" > "$PROJECT_ROOT/output/proximal-check.env"
@@ -101,7 +101,7 @@ export CONFIG="$PROJECT_ROOT/configs/worldttn/proximal_memory.json"
 export MAX_STEPS=3 SAVE_EVERY=3
 export OUTPUT="$PROJECT_ROOT/output/proximal-121-$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p "$OUTPUT"
-LONG_JOB=$(sbatch --parsable --nodes=3 --ntasks=3 --partition=day --mem=256G \
+LONG_JOB=$(sbatch --parsable --nodes=4 --ntasks=4 --partition=day --mem=256G \
   --time=06:00:00 --output="$OUTPUT/slurm-%j.out" tools/ttn_slurm_train.sbatch)
 LONG_JOB=${LONG_JOB%%;*}
 printf 'LONG_JOB=%q\nLONG_RUN=%q\n' "$LONG_JOB" "$OUTPUT" > "$PROJECT_ROOT/output/proximal-long.env"
@@ -120,7 +120,7 @@ printf 'LONG_JOB=%q\nLONG_RUN=%q\n' "$LONG_JOB" "$OUTPUT" > "$PROJECT_ROOT/outpu
 ```bash
 cd "$PROJECT_ROOT"
 "$PYTHON" -m tools.ttn_slurm_chain fresh \
-  --world-size 3 --warmup-steps 0 --target-step 500 --segment-steps 1 \
+  --world-size 4 --warmup-steps 0 --target-step 500 --segment-steps 1 \
   --partition day --time-limit 06:00:00 --memory 256G \
   --config "$PROJECT_ROOT/configs/worldttn/proximal_memory.json" \
   --dataset-root "$DATASET_ROOT" --tbptt 4 --seed 3407 --backbone-lr 1e-6 \

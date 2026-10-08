@@ -124,7 +124,8 @@ def test_meta_fsdp2_cpu_offload_resume_preserves_adam_rng_and_cursor(tmp_path):
     torch.multiprocessing.spawn(_resume_worker, args=(2, _init_uri(), str(tmp_path), "fsdp2", True, "cpu", True), nprocs=2)
 
 
-def test_production_flow_records_exact_scheduler_sigma_separately_from_mapped_timestep():
+@pytest.mark.parametrize("proximal", [False, True])
+def test_production_flow_records_exact_scheduler_sigma_separately_from_mapped_timestep(proximal):
     from worldttn.training import SANAFlowLoss
     flow = object.__new__(SANAFlowLoss)
     captures = {}
@@ -134,7 +135,8 @@ def test_production_flow_records_exact_scheduler_sigma_separately_from_mapped_ti
         return {"loss": torch.ones(1)}
     flow.scheduler = SimpleNamespace(sigmas=sigma.numpy(), training_losses=training_losses)
     class Session:
-        model = SimpleNamespace(ttn_system=SimpleNamespace(config=SimpleNamespace(local_update=True, persistent_meta=True)))
+        model = SimpleNamespace(ttn_system=SimpleNamespace(config=SimpleNamespace(
+            local_update=not proximal, persistent_meta=not proximal, memory_update="proximal" if proximal else "delta")))
         def forward(self, *args, **kw):
             captures.update(kw)
             return args[0], None

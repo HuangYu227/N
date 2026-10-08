@@ -78,7 +78,7 @@ YUME 的推理重采样/时间回退需要额外 solver 工作，不能视作免
 
 ## 5. 指标与对照
 
-每个 clean chunk/anchor/head 保留原来的 S old/pred/current 尺度、K/V/Q RMS、β/W、写入方向；新增 lambda、条件数界、先验保留界、当前/历史 objective、更新比例、两者梯度范数/夹角。Noisy 首/中/末 solver 调用采样这些指标；flow-training调用记录一次。heldout-query 是单独 support-only 求解的诊断，不改变生产写入。
+每个 clean chunk/anchor/head 保留原来的 S old/pred/current 尺度、K/V/Q RMS、β/W、写入方向；新增 lambda、条件数界、先验保留界、当前/历史 objective、更新比例、两者梯度范数/夹角。训练在第1、5及每4个predicted chunk额外保存S谱（stable-rank、top1能量、top4奇异值）；阶段评估记录每个chunk的谱。Noisy 首/中/末 solver 调用采样这些指标；flow-training调用记录一次，分别记录原始sampled timestep、映射后的model timestep和scheduler实际sigma。无法取得scheduler sigma的测试替代路径明确标记为timestep/1000推导。heldout-query 是单独 support-only 求解的诊断，不改变生产写入。
 
 `effective_delta_norm` 是 FP32 投影贡献。`output_effect` 是同输入/camera/gate 下，S* 与 prior 两个 anchor 输出经过实际 dtype 后的 norm、相对变化和 changed_fraction。需两者一起判断是否有有效作用；不能只看非零梯度。Prefix SHA 在形成完整prefix后记录，episode结束审计。评估继续输出逐帧/逐chunk MSE、tail、S spectrum和teacher差异。
 

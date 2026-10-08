@@ -25,6 +25,7 @@ if [[ "${PROXIMAL_MEMORY_TESTS:-0}" == 1 ]]; then
   case "${SLURM_NTASKS:?}" in
     1) tests=(tests/ttn/test_proximal.py tests/ttn/test_memory_cache.py tests/ttn/test_proximal_runtime.py
               tests/ttn/test_proximal_evaluation.py tests/ttn/test_proximal_device.py tests/ttn/test_sana_camera_restore.py
+              tests/ttn/test_meta_training.py::test_production_flow_records_exact_scheduler_sigma_separately_from_mapped_timestep
               tests/ttn/test_activation_checkpoint.py) ;;
     2|3|4) tests=(tests/ttn/test_proximal_cuda.py) ;;
     *) echo 'Proximal acceptance requires one, two, three or four nodes/tasks' >&2; exit 2 ;;

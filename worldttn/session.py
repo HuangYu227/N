@@ -37,7 +37,10 @@ def record_noise(context, timestep, noise_sigma=None, sampled_timestep=None, *, 
         if context.collect_memory_stats:
             sigma = timestep.float()/1000 if noise_sigma is None else noise_sigma
             context.memory_trajectory.append({"call": call, "noise_timestep": timestep.detach().float().cpu().tolist(),
-                "noise_sigma": sigma.detach().float().cpu().tolist(), "anchors": {}})
+                "noise_sigma": sigma.detach().float().cpu().tolist(),
+                "noise_sigma_source": "scheduler" if noise_sigma is not None else "timestep/1000", "anchors": {}})
+            if sampled_timestep is not None:
+                context.memory_trajectory[-1]["sampled_timestep"] = sampled_timestep.detach().cpu().tolist()
     if context.replay_active and not context.clean_mode and not context.prefill_mode:
         call = context.replay_call_count
         context.replay_call_count += 1

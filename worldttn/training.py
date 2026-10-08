@@ -177,7 +177,8 @@ class SANAFlowLoss:
                  on_prediction=None):
         config = context.system.config  # Teacher replay intentionally has no TTN module.
         noise_info = {}
-        if context.collect_local_stats and (config.local_update or config.persistent_meta):
+        if context.collect_local_stats and (config.local_update or config.persistent_meta
+                or getattr(config, "memory_update", "delta") == "proximal"):
             noise_info = {"noise_sigma": torch.as_tensor(self.scheduler.sigmas, device=clean.device,
                                                         dtype=torch.float32)[t.long()], "sampled_timestep": t}
         def model_call(x, timestep, **unused):

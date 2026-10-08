@@ -398,12 +398,16 @@ class TTNRuntimeState:
                 stats.update(write_direction_stats(correction[:, i],
                     tuple((raw[:, i], aligned[:, i]) for raw, aligned in history), self.config.eps))
             history = ((correction, correction), *history[:3])
-        if self.diagnostics:
+        # Sample training spectra at the first/history-start chunk and every four chunks.
+        if self.diagnostics or (self.config.memory_update == "proximal" and not context.prefill_mode
+                and (self.commit_count in (1, self.config.memory_start_chunk) or self.commit_count % 4 == 0)):
             from .stability import state_dynamics
             for i, stats in enumerate(anchor_stats):
                 stats.update(state_dynamics(context.previous[:, i], context.predicted[:, i],
                                             new_state[:, i], self.config.eps),
-                             inner_update_applied=self.config.stage == "C" and self.config.persistent_update and self.ablation in ("full", "no-local") and not context.prefill_mode)
+                             inner_update_applied=self.config.memory_update == "proximal" or (
+                                 self.config.stage == "C" and self.config.persistent_update
+                                 and self.ablation in ("full", "no-local") and not context.prefill_mode))
         previous_pose = self.previous_committed_pose.clone()
         committed = [set(s) for s in self.committed_frame_ids]
         for b in range(new_state.shape[0]):
