@@ -111,7 +111,7 @@ def test_fsdp2_preserves_fp32_ttn_under_bf16_base_and_autocast(tmp_path):
         torch.testing.assert_close(ranks[0]["state"][name], ranks[1]["state"][name], atol=0, rtol=0)
 
 
-def _resume_worker(rank, size, init_uri, output, mode, joint=False, activation_offload="none", meta=False, device="cpu"):
+def _resume_worker(rank, size, init_uri, output, mode, joint=False, activation_offload="none", meta=False, device="cpu", tbptt=2):
     from worldttn.distributed import ParallelTraining, save_training_checkpoint, restore_training_checkpoint
     from worldttn.checkpoint import load_checkpoint
     import torch.distributed as dist
@@ -129,14 +129,14 @@ def _resume_worker(rank, size, init_uri, output, mode, joint=False, activation_o
         optimizer = make_optimizer(model)
         clean, noise, t, camera = [x.to(device) for x in _rank_inputs(rank)]
         text = torch.zeros(1, 1, 2, 8, device=device)
-        kw = dict(width=100, height=100, tbptt=2, activation_offload=activation_offload)
+        kw = dict(width=100, height=100, tbptt=tbptt, activation_offload=activation_offload)
         train_clip(model, clean, text, camera, optimizer, linear_flow_loss, t, noise,
                    parallel=engine, **kw)
         random.seed(200 + rank)
         torch.manual_seed(300 + rank)
         path = Path(output) / "last.pt"
         cursor = {"epoch": 2, "batch_in_epoch": 3}
-        save_training_checkpoint(path, engine, optimizer, 1, cursor, {"tbptt": 2, "seed": 3407})
+        save_training_checkpoint(path, engine, optimizer, 1, cursor, {"tbptt": tbptt, "seed": 3407})
         expected_random = (random.random(), torch.rand(3))
         second_noise = torch.randn_like(noise)
         train_clip(model, clean, text, camera, optimizer, linear_flow_loss, t, second_noise,
@@ -152,7 +152,7 @@ def _resume_worker(rank, size, init_uri, output, mode, joint=False, activation_o
         load_checkpoint(path, resumed)
         new_engine = ParallelTraining(resumed, linear_flow_loss, mode, activation_offload=activation_offload)
         new_optimizer = make_optimizer(resumed)
-        step, data = restore_training_checkpoint(path, new_engine, new_optimizer, {"tbptt": 2, "seed": 3407})
+        step, data = restore_training_checkpoint(path, new_engine, new_optimizer, {"tbptt": tbptt, "seed": 3407})
         assert step == 1 and data == cursor
         assert random.random() == expected_random[0]
         assert torch.equal(torch.rand(3), expected_random[1])
@@ -168,7 +168,7 @@ def _resume_worker(rank, size, init_uri, output, mode, joint=False, activation_o
                 for field, value in values.items():
                     torch.testing.assert_close(value, actual_optimizer["state"][key][field], atol=0, rtol=0)
         with pytest.raises(ValueError, match="training configuration"):
-            restore_training_checkpoint(path, new_engine, new_optimizer, {"tbptt": 4, "seed": 3407})
+            restore_training_checkpoint(path, new_engine, new_optimizer, {"tbptt": 2 if tbptt == 4 else 4, "seed": 3407})
         payload = torch.load(path, weights_only=False)
         assert payload["optimizer"] is None
         assert not any(hasattr(value, "full_tensor") for value in payload["adapter"].values())
@@ -186,6 +186,15 @@ def test_distributed_resume_reproduces_next_update_and_exports_plain_adapter(tmp
     assert hasattr(distributed, "save_training_checkpoint"), "distributed checkpoint support is missing"
     if mode == "fsdp2" and not hasattr(torch.cpu, "Stream"): pytest.skip("CPU FSDP2 not available")
     torch.multiprocessing.spawn(_resume_worker, args=(2, _init_uri(), str(tmp_path), mode), nprocs=2)
+
+
+@pytest.mark.skipif(not hasattr(torch.cpu, "Stream"), reason="CPU FSDP2 not available")
+def test_three_rank_fsdp2_meta_offload_tbptt4_exact_resume(tmp_path):
+    torch.multiprocessing.spawn(_resume_worker,
+        args=(3, _init_uri(), str(tmp_path), "fsdp2", True, "cpu", True, "cpu", 4), nprocs=3)
+    from worldttn.checkpoint_integrity import audit_checkpoint
+    report = audit_checkpoint(tmp_path / "last.pt", 1)
+    assert report["world_size"] == 3 and report["status"] == "verified"
 
 
 @pytest.mark.parametrize("k", [1, 2, 4])

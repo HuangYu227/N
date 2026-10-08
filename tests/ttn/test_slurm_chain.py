@@ -71,21 +71,25 @@ def plan(tmp_path):
                             "ACTIVATION_OFFLOAD": "cpu", "CROSS_ATTN_BACKEND": "math", "DATASET_ROOT": "shared/data"}}
 
 
-def complete(run, step):
+def complete(run, step, world=4):
     run = Path(run)
     (run / "train.jsonl").write_text(json.dumps({"step": step}) + "\n", encoding="utf-8")
     folder = run / f"last-resume-{step}"; folder.mkdir(exist_ok=True)
-    meta = {"format": "TTN-parallel-resume-v1", "mode": "fsdp2", "world_size": 4,
+    meta = {"format": "TTN-parallel-resume-v1", "mode": "fsdp2", "world_size": world,
             "resume_dir": folder.name, "checkpoint_id": str(step)}
     torch.save({"format": "TTN-SANA-WM-v0.1", "step": step, "distributed": meta}, run / "last.pt")
-    for rank in range(4):
+    for rank in range(world):
         torch.save({**meta, "step": step, "rank": rank, "rng": {}, "data": {}, "optimizer": {}},
                    folder / f"rank-{rank:05d}.pt")
 
 
-def test_submission_preserves_training_and_does_not_inherit_old_allocation(chain, plan, monkeypatch):
+@pytest.mark.parametrize("world", [None, 3])
+def test_submission_preserves_training_and_does_not_inherit_old_allocation(chain, plan, monkeypatch, world):
+    if world is not None: plan["world_size"] = world
+    expected_world = world or 4
     for key in ("SLURM_JOB_ID", "SLURM_NTASKS", "SBATCH_ARRAY_INX", "MASTER_ADDR", "MASTER_PORT",
-                "CUDA_VISIBLE_DEVICES", "RANK", "BATCH_FILE", "BASE_WEIGHTS", "CONFIG", "UNFREEZE", "DIAGNOSTIC_UNMASK_ALL_VALID"):
+                "CUDA_VISIBLE_DEVICES", "RANK", "BATCH_FILE", "BASE_WEIGHTS", "CONFIG", "UNFREEZE", "DIAGNOSTIC_UNMASK_ALL_VALID",
+                "TTN_ENTRY_MODULE", "META_TEST_OUTPUT"):
         monkeypatch.setenv(key, "stale")
     calls = []
     def run(cmd, **kw):
@@ -95,18 +99,20 @@ def test_submission_preserves_training_and_does_not_inherit_old_allocation(chain
     manifest = Path(plan["output"]) / "chain.json"
     assert chain.submit(plan, manifest, 6, "423072") == "98765"
     cmd, kw = calls[0]
-    for flag in ("--nodes=4", "--ntasks=4", "--ntasks-per-node=1", "--gres=gpu:1",
+    for flag in (f"--nodes={expected_world}", f"--ntasks={expected_world}", "--ntasks-per-node=1", "--gres=gpu:1",
                  "--mem=256G", "--time=01:00:00", "--dependency=afterok:423072", "--kill-on-invalid-dep=yes"):
         assert flag in cmd
     env = kw["env"]
     assert not any(name.startswith(("SLURM_", "SBATCH_")) for name in env)
-    for key in ("MASTER_ADDR", "MASTER_PORT", "CUDA_VISIBLE_DEVICES", "RANK", "BATCH_FILE", "BASE_WEIGHTS", "CONFIG", "UNFREEZE", "DIAGNOSTIC_UNMASK_ALL_VALID"):
+    for key in ("MASTER_ADDR", "MASTER_PORT", "CUDA_VISIBLE_DEVICES", "RANK", "BATCH_FILE", "BASE_WEIGHTS", "CONFIG", "UNFREEZE", "DIAGNOSTIC_UNMASK_ALL_VALID",
+                "TTN_ENTRY_MODULE", "META_TEST_OUTPUT"):
         assert key not in env
     assert env["ADAPTER"] == str(Path(plan["source"]) / "last.pt")
     assert env["MAX_STEPS"] == "16" and env["SAVE_EVERY"] == "28"
     for key, value in plan["environment"].items():
         assert env[key] == value
-    assert json.loads((Path(plan["output"]) / "jobs.jsonl").read_text())["stop_step"] == 16
+    record = json.loads((Path(plan["output"]) / "jobs.jsonl").read_text())
+    assert record["stop_step"] == 16 and record["world_size"] == expected_world
     env = chain.environment(plan, 26)
     assert env["MAX_STEPS"] == "27" and env["ADAPTER"] == str(Path(plan["output"]) / "last.pt")
 
@@ -131,14 +137,16 @@ def test_parent_dependency_handles_completed_jobs_after_controller_purges_them(c
 
 
 @pytest.mark.parametrize("outcome", ["success", "train-failure", "missing-checkpoint", "final"])
-def test_worker_submits_only_one_successor_after_successful_save(chain, plan, monkeypatch, outcome):
+@pytest.mark.parametrize("world", [3, 4])
+def test_worker_submits_only_one_successor_after_successful_save(chain, plan, monkeypatch, outcome, world):
+    plan["world_size"] = world
     start = 26 if outcome == "final" else 6
     source = plan["source"] if start == 6 else plan["output"]
-    complete(source, start)
+    complete(source, start, world)
     manifest = Path(plan["output"]) / "chain.json"
     manifest.write_text(json.dumps(plan))
     monkeypatch.setenv("SLURM_JOB_ID", "98765")
-    monkeypatch.setenv("SLURM_NTASKS", "4")
+    monkeypatch.setenv("SLURM_NTASKS", str(world))
     monkeypatch.setenv("SLURM_JOB_NODELIST", "new-nodes")
     monkeypatch.setenv("MASTER_ADDR", "stale-host")
     commands = []
@@ -150,7 +158,7 @@ def test_worker_submits_only_one_successor_after_successful_save(chain, plan, mo
             if outcome == "train-failure":
                 raise subprocess.CalledProcessError(1, cmd)
             if outcome != "missing-checkpoint":
-                complete(plan["output"], int(kw["env"]["MAX_STEPS"]))
+                complete(plan["output"], int(kw["env"]["MAX_STEPS"]), world)
             return SimpleNamespace(returncode=0)
         return SimpleNamespace(stdout="98766\n")
     monkeypatch.setattr(chain.subprocess, "run", run)
@@ -162,6 +170,7 @@ def test_worker_submits_only_one_successor_after_successful_save(chain, plan, mo
         chain.worker(manifest, start)
     assert len(commands) == (2 if outcome == "success" else 1)
     if outcome == "success":
+        assert f"--nodes={world}" in commands[1][0] and f"--ntasks={world}" in commands[1][0]
         assert "--dependency=afterok:98765" in commands[1][0]
         assert commands[1][1]["env"]["MAX_STEPS"] == "26"
         assert not any(k.startswith("SLURM_") for k in commands[1][1]["env"])
@@ -184,9 +193,60 @@ def test_submission_failure_does_not_record_a_nonexistent_job(chain, plan, monke
     assert not (Path(plan["output"]) / "jobs.jsonl").exists()
 
 
+@pytest.mark.parametrize("world", [1, 0, -3, True, "3", 3.5])
+def test_invalid_world_stops_before_submission_or_fresh_output(chain, plan, monkeypatch, world):
+    plan["world_size"] = world
+    monkeypatch.setattr(chain.subprocess, "run", lambda *a, **kw: pytest.fail("invalid plan submitted"))
+    with pytest.raises(ValueError, match="FSDP2"):
+        chain.submit(plan, Path(plan["output"]) / "chain.json", 6)
+    with pytest.raises(ValueError, match="FSDP2"):
+        chain.fresh_chain(SimpleNamespace(world_size=world))
+    assert not (Path(plan["output"]) / "jobs.jsonl").exists()
+
+
+@pytest.mark.parametrize("failure", ["allocation", "source-world", "saved-world", "missing-rank"])
+def test_three_rank_failure_never_submits_successor(chain, plan, monkeypatch, failure):
+    plan["world_size"] = 3
+    complete(plan["source"], 6, 4 if failure == "source-world" else 3)
+    manifest = Path(plan["output"]) / "chain.json"
+    manifest.write_text(json.dumps(plan))
+    monkeypatch.setenv("SLURM_JOB_ID", "98765")
+    monkeypatch.setenv("SLURM_NTASKS", "4" if failure == "allocation" else "3")
+    calls = []
+    def run(cmd, **kw):
+        assert cmd[0] == "bash", "failed checkpoint submitted a successor"
+        calls.append(cmd)
+        complete(plan["output"], 16, 4 if failure == "saved-world" else 3)
+        if failure == "missing-rank":
+            (Path(plan["output"]) / "last-resume-16/rank-00002.pt").unlink()
+    monkeypatch.setattr(chain.subprocess, "run", run)
+    with pytest.raises((ValueError, FileNotFoundError)):
+        chain.worker(manifest, 6)
+    assert len(calls) == (0 if failure in ("allocation", "source-world") else 1)
+    status = json.loads((Path(plan["output"]) / "chain-status-98765.json").read_text())
+    assert status["status"] == "failed"
+    assert not (Path(plan["output"]) / "jobs.jsonl").exists()
+
+
+@pytest.mark.parametrize("failure", ["override", "checkpoint-world"])
+def test_start_rejects_world_change_before_creating_output(chain, tmp_path, monkeypatch, failure):
+    source = tmp_path / "source"
+    source.mkdir()
+    complete(source, 6, 4 if failure == "checkpoint-world" else 3)
+    (source / "run_config.json").write_text(json.dumps({"parallel": "fsdp2", "world_size": 3,
+        "arguments": {"stage": "C", "train_scope": "dit", "max_steps": 6}}))
+    output = tmp_path / "new"
+    monkeypatch.setattr(chain.subprocess, "run", lambda *a, **kw: pytest.fail("incompatible resume submitted"))
+    with pytest.raises(ValueError, match="world"):
+        chain.start_chain(SimpleNamespace(from_run=str(source), after_job=None, target_step=500,
+            segment_steps=2, partition="day", output=str(output), world_size=4 if failure == "override" else 3))
+    assert not output.exists()
+
+
 @pytest.mark.parametrize("pending", [True, False])
 @pytest.mark.parametrize("unfreeze", [False, True])
-def test_start_inherits_saved_profile_and_uses_source_final_target(chain, tmp_path, monkeypatch, pending, unfreeze):
+@pytest.mark.parametrize("world", [3, 4])
+def test_start_inherits_saved_profile_and_uses_source_final_target(chain, tmp_path, monkeypatch, pending, unfreeze, world):
     project = tmp_path / "WorldTTN"
     (project / "tools").mkdir(parents=True)
     monkeypatch.setattr(chain, "__file__", str(project / "tools/ttn_slurm_chain.py"))
@@ -202,18 +262,20 @@ def test_start_inherits_saved_profile_and_uses_source_final_target(chain, tmp_pa
             "vae_cache_dir": "shared/cache", "base_weights": "shared/base.safetensors",
             "sana_config": "configs/sana.yaml", "batch_file": None,
             "text_encoder_device": "cpu", "cross_attn_backend": "math", "activation_offload": "cpu"}
-    (source / "run_config.json").write_text(json.dumps({"parallel": "fsdp2", "world_size": 4, "arguments": args,
+    (source / "run_config.json").write_text(json.dumps({"parallel": "fsdp2", "world_size": world, "arguments": args,
                                                       "training": {"train_scope": args["train_scope"]}}))
-    complete(source, 3 if pending else 6)
+    complete(source, 3 if pending else 6, world)
     monkeypatch.setattr(chain, "parent_dependency", lambda job: job if pending else None)
     submissions = []
     monkeypatch.setattr(chain, "submit", lambda *values: submissions.append(values))
     chain.start_chain(SimpleNamespace(from_run=str(source), after_job="423072", target_step=500,
-                                     segment_steps=10, partition="short", unfreeze=unfreeze))
+                                     segment_steps=10, partition="short", unfreeze=unfreeze,
+                                     world_size=None if pending else world))
     assert len(submissions) == 1
     plan, manifest, start, dependency = submissions[0]
     assert start == 6 and dependency == ("423072" if pending else None)
     assert plan["initial_step"] == 6 and plan["target_step"] == 500
+    assert plan["world_size"] == world
     assert manifest.is_file() and Path(plan["output"]).is_dir()
     for field, env_name in chain.PROFILE.items():
         if args.get(field) is not None:
@@ -223,7 +285,7 @@ def test_start_inherits_saved_profile_and_uses_source_final_target(chain, tmp_pa
     assert bool(plan.get("unfreeze")) == unfreeze
 
 
-@pytest.mark.parametrize("change", [{"world_size": 3}, {"parallel": "ddp"}, {"stage": "A"}, {"train_scope": "ttn"}])
+@pytest.mark.parametrize("change", [{"world_size": 1}, {"parallel": "ddp"}, {"stage": "A"}, {"train_scope": "ttn"}])
 def test_start_rejects_incompatible_resume_profile_before_submission(chain, tmp_path, change):
     original = {"max_steps": 6, "stage": "C", "train_scope": "dit"}
     run = {"parallel": "fsdp2", "world_size": 4, "arguments": original}
@@ -236,7 +298,8 @@ def test_start_rejects_incompatible_resume_profile_before_submission(chain, tmp_
 
 
 @pytest.mark.parametrize("hold", [False, True])
-def test_fresh_original_ucpe_plan_starts_without_old_weights_and_clamps_warmup_boundary(chain, tmp_path, monkeypatch, hold):
+@pytest.mark.parametrize("world", [3, 4])
+def test_fresh_original_ucpe_plan_starts_without_old_weights_and_clamps_warmup_boundary(chain, tmp_path, monkeypatch, hold, world):
     project = tmp_path/"WorldTTN"
     (project/"tools").mkdir(parents=True)
     config = project/"configs/worldttn/reference_sana_camera.json"
@@ -254,10 +317,11 @@ def test_fresh_original_ucpe_plan_starts_without_old_weights_and_clamps_warmup_b
     monkeypatch.setattr(chain, "submit", lambda *args: calls.append(args))
     chain.fresh_chain(SimpleNamespace(output=str(tmp_path/"new"), dataset_root=None, config=None,
                     warmup_steps=25, target_step=100, segment_steps=10, partition="short", seed=3407,
-                    tbptt=2, backbone_lr=1e-6, base_weights=None, warmup_only=hold))
+                    tbptt=2, backbone_lr=1e-6, base_weights=None, warmup_only=hold, world_size=world))
     assert len(calls) == 1
     plan, manifest, start = calls[0]
     assert start == 0 and plan["target_step"] == 25 and plan["environment"]["TRAIN_SCOPE"] == "ttn-new"
+    assert plan["world_size"] == world
     assert plan["environment"]["OPTIMIZER_POLICY"] == "origin"
     assert bool(plan.get("joint_target_step")) == (not hold)
     env = chain.environment(plan, 0)
@@ -278,7 +342,8 @@ def test_joint_transition_resets_optimizer_only_in_first_segment(chain, plan):
     assert env["ADAPTER"] == str(Path(plan["output"])/"last.pt")
 
 
-def test_zero_warmup_starts_joint_at_step_one_without_checkpoint_or_unfreeze(chain, tmp_path, monkeypatch):
+@pytest.mark.parametrize("world", [None, 3])
+def test_zero_warmup_starts_joint_at_step_one_without_checkpoint_or_unfreeze(chain, tmp_path, monkeypatch, world):
     project = tmp_path / "WorldTTN"
     (project / "tools").mkdir(parents=True)
     config = project / "configs/worldttn/reference_sana_camera.json"
@@ -293,9 +358,11 @@ def test_zero_warmup_starts_joint_at_step_one_without_checkpoint_or_unfreeze(cha
     args = SimpleNamespace(output=str(tmp_path / "new"), dataset_root=None, config=None,
         warmup_steps=0, target_step=500, segment_steps=10, partition="short", seed=3407,
         tbptt=2, backbone_lr=1e-6, base_weights=None, warmup_only=False, eval_every=25)
+    if world is not None: args.world_size = world
     chain.fresh_chain(args)
     plan = calls[0][0]
     assert plan["target_step"] == 500 and plan["environment"]["TRAIN_SCOPE"] == "dit"
+    assert plan["world_size"] == (world or 4)
     assert "joint_target_step" not in plan
     assert plan["evaluation"]["keep_model_steps"] == [25, 50, 100, 250, 500]
     env = chain.environment(plan, 0)
@@ -317,20 +384,21 @@ def test_evaluation_snapshot_retention_preserves_key_points_and_releases_other_m
 
 
 @pytest.mark.parametrize("fail", [False, True])
-def test_warmup_submits_joint_phase_only_after_successful_final_checkpoint(chain, plan, monkeypatch, fail):
+@pytest.mark.parametrize("world", [3, 4])
+def test_warmup_submits_joint_phase_only_after_successful_final_checkpoint(chain, plan, monkeypatch, fail, world):
     plan.update(fresh=True, initial_step=0, target_step=25, joint_target_step=100,
-                joint_output=str(Path(plan["output"])/"joint"))
+                joint_output=str(Path(plan["output"])/"joint"), world_size=world)
     plan["environment"]["TRAIN_SCOPE"] = "ttn-visual"
-    complete(plan["output"], 20)
+    complete(plan["output"], 20, world)
     manifest = Path(plan["output"])/"chain.json"
     manifest.write_text(json.dumps(plan))
     monkeypatch.setenv("SLURM_JOB_ID", "98765")
-    monkeypatch.setenv("SLURM_NTASKS", "4")
+    monkeypatch.setenv("SLURM_NTASKS", str(world))
     calls = []
     def train(cmd, **kw):
         assert kw["env"]["MAX_STEPS"] == "25" and kw["env"]["RESUME"] == "1"
         if fail: raise subprocess.CalledProcessError(1, cmd)
-        complete(plan["output"], 25)
+        complete(plan["output"], 25, world)
     monkeypatch.setattr(chain.subprocess, "run", train)
     monkeypatch.setattr(chain, "start_chain", lambda args: calls.append(args))
     if fail:
@@ -339,6 +407,7 @@ def test_warmup_submits_joint_phase_only_after_successful_final_checkpoint(chain
         chain.worker(manifest, 20)
         assert len(calls) == 1 and calls[0].unfreeze and calls[0].target_step == 100
         assert calls[0].from_run == plan["output"] and calls[0].after_job == "98765"
+        assert calls[0].world_size == world
     assert bool(calls) == (not fail)
 
 

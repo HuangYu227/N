@@ -41,12 +41,24 @@ def last_step(run):
     return step
 
 
-def require_checkpoint(run, expected):
+def training_world_size(value):
+    if type(value) is not int or value < 2:
+        raise ValueError("FSDP2 training requires an integer world size >= 2")
+    return value
+
+
+def verify_checkpoint_world(report, world):
+    if report.get("mode") != "fsdp2" or report.get("world_size") != world:
+        raise ValueError(f"checkpoint backend/world differs from planned fsdp2/{world}")
+
+
+def require_checkpoint(run, expected, world=None):
     from worldttn.checkpoint_integrity import audit_checkpoint
     if last_step(run) != expected or not (Path(run) / "last.pt").is_file():
         raise ValueError(f"{run}: expected a completed step-{expected} run and last.pt")
     report = audit_checkpoint(Path(run) / "last.pt", expected)
     verify_training_record(run, report)
+    if world is not None: verify_checkpoint_world(report, world)
     return report
 
 
@@ -92,6 +104,7 @@ def environment(plan, start):
             "STAGES", "FRAMES", "STEPS", "LATENT_HEIGHT", "LATENT_WIDTH", "DIAGNOSTIC_UNMASK_ALL_VALID",
             "CAMERA_ATTENTION", "CAMERA_ABLATION", "TRAINING_RUN", "FIXED_CASES", "EVAL_CASES",
             "TTN_PROFILE", "TTN_LAYOUT_AUDIT", "TTN_COMPARE_REFERENCE", "BENCHMARK_SAVE_CHECKPOINT",
+            "TTN_ENTRY_MODULE", "META_TEST_OUTPUT",
         ):
             env.pop(name, None)
     env.update(plan["environment"])
@@ -170,10 +183,11 @@ def submit_evaluation(plan, step, parent_job):
 
 
 def submit(plan, manifest, start, dependency=None):
+    world = training_world_size(plan.get("world_size", 4))
     stop = segment_stop(plan, start)
     command = ["sbatch", "--parsable", "--export=ALL", "--kill-on-invalid-dep=yes",
                "--job-name=ttn-formal", f"--partition={plan['partition']}",
-               "--nodes=4", "--ntasks=4", "--ntasks-per-node=1", "--gres=gpu:1",
+               f"--nodes={world}", f"--ntasks={world}", "--ntasks-per-node=1", "--gres=gpu:1",
                "--cpus-per-task=8", f"--mem={plan.get('memory', '256G')}", f"--time={plan.get('time_limit', '01:00:00')}",
                f"--chdir={plan['project']}", f"--output={plan['output']}/slurm-%j.out"]
     if dependency:
@@ -184,12 +198,12 @@ def submit(plan, manifest, start, dependency=None):
     job = result.stdout.strip().split(";")[0]
     if not job.isdecimal():
         raise RuntimeError(f"Unexpected sbatch response: {result.stdout!r}")
-    record = {"job": job, "dependency": dependency, "start_step": start, "stop_step": stop,
+    record = {"job": job, "dependency": dependency, "start_step": start, "stop_step": stop, "world_size": world,
               "stdout": str(Path(plan["output"]) / f"slurm-{job}.out"),
               "stderr": str(Path(plan["output"]) / f"slurm-{job}.out"), "workdir": plan["project"]}
     with (Path(plan["output"]) / "jobs.jsonl").open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(record) + "\n")
-    print(f"[TTN chain] job={job} steps={start + 1}..{stop} target={plan['target_step']}", flush=True)
+    print(f"[TTN chain] job={job} steps={start + 1}..{stop} target={plan['target_step']} world_size={world}", flush=True)
     return job
 
 
@@ -198,11 +212,15 @@ def start_chain(args):
     source = Path(args.from_run).resolve()
     run = json.loads((source / "run_config.json").read_text(encoding="utf-8"))
     original = run["arguments"]
+    world = training_world_size(run.get("world_size"))
+    requested_world = getattr(args, "world_size", None)
+    if requested_world is not None and training_world_size(requested_world) != world:
+        raise ValueError("exact resume requires the source world size; start a fresh run to change it")
     unfreeze = getattr(args, "unfreeze", False)
     expected_scopes = ("ttn-visual", "ttn-new") if unfreeze else ("dit",)
-    if ((run["parallel"], run["world_size"], original["stage"]) != ("fsdp2", 4, "C")
+    if ((run["parallel"], original["stage"]) != ("fsdp2", "C")
             or original["train_scope"] not in expected_scopes):
-        raise ValueError("Expected an existing 4-rank FSDP2 full Stage C/DiT training run")
+        raise ValueError("Expected an existing FSDP2 full Stage C/DiT training run")
     if unfreeze and run["training"].get("train_scope") not in ("ttn-visual", "ttn-new"):
         raise ValueError("unfreeze source must be a visual warmup run")
     dependency = parent_dependency(args.after_job) if args.after_job else None
@@ -215,6 +233,7 @@ def start_chain(args):
         from worldttn.checkpoint_integrity import audit_checkpoint
         checkpoint_report = audit_checkpoint(source / "last.pt")
         verify_training_record(source, checkpoint_report)
+        verify_checkpoint_world(checkpoint_report, world)
         initial = int(checkpoint_report["step"])
         observed = last_step(source)
         if observed is None or observed < initial:
@@ -241,7 +260,7 @@ def start_chain(args):
     output.mkdir(parents=True, exist_ok=False)
     plan = {"source": str(source), "project": str(project), "output": str(output), "environment": profile,
             "initial_step": initial, "target_step": args.target_step, "source_checkpoint": checkpoint_report,
-            "segment_steps": args.segment_steps, "partition": args.partition,
+            "segment_steps": args.segment_steps, "partition": args.partition, "world_size": world,
             "time_limit": getattr(args, "time_limit", "01:00:00"), "memory": getattr(args, "memory", "256G")}
     if unfreeze: plan["unfreeze"] = True
     evaluation = evaluation_settings(args, output)
@@ -254,6 +273,7 @@ def start_chain(args):
 
 def fresh_chain(args):
     """Start from SANA, warm up visual TTN, then deliberately rebuild joint training."""
+    world = training_world_size(getattr(args, "world_size", 4))
     project = Path(__file__).resolve().parents[1]
     root = Path(os.environ.get("ROOT", project.parent)).resolve()
     python = root / "envs/worldttn/bin/python"
@@ -287,7 +307,7 @@ def fresh_chain(args):
     if args.base_weights: profile["BASE_WEIGHTS"] = args.base_weights
     plan = {"source": "", "fresh": True, "project": str(project), "output": str(warmup),
             "environment": profile, "initial_step": 0, "target_step": args.warmup_steps or args.target_step,
-            "segment_steps": args.segment_steps, "partition": args.partition,
+            "segment_steps": args.segment_steps, "partition": args.partition, "world_size": world,
             "time_limit": getattr(args, "time_limit", "01:00:00"), "memory": getattr(args, "memory", "256G")}
     if args.warmup_steps and not args.warmup_only:
         plan.update(joint_output=str(output / "joint"), joint_target_step=args.target_step)
@@ -303,16 +323,19 @@ def fresh_chain(args):
 def _worker(plan, manifest, start, status):
     if start < plan["initial_step"] or start >= plan["target_step"]:
         raise ValueError("Invalid segment start")
+    world = training_world_size(plan.get("world_size", 4))
+    job = os.environ.get("SLURM_JOB_ID", "")
+    if not job.isdecimal() or os.environ.get("SLURM_NTASKS") != str(world):
+        raise ValueError(f"Chain worker requires a {world}-task sbatch allocation")
     source = Path(plan["source"] if start == plan["initial_step"] else plan["output"])
     if not (plan.get("fresh") and start == 0):
         if start == plan["initial_step"] and plan.get("source_checkpoint", {}).get("unsaved_steps"):
             from worldttn.checkpoint_integrity import audit_checkpoint
-            verify_training_record(source, audit_checkpoint(source / "last.pt", start))
+            report = audit_checkpoint(source / "last.pt", start)
+            verify_training_record(source, report)
+            verify_checkpoint_world(report, world)
         else:
-            require_checkpoint(source, start)
-    job = os.environ.get("SLURM_JOB_ID", "")
-    if not job.isdecimal() or os.environ.get("SLURM_NTASKS") != "4":
-        raise ValueError("Chain worker requires a four-task sbatch allocation")
+            require_checkpoint(source, start, world)
     env = environment(plan, start)
     # For training inside THIS allocation retain Slurm's allocation metadata.
     env.update({key: value for key, value in os.environ.items() if key.startswith("SLURM_")})
@@ -321,7 +344,7 @@ def _worker(plan, manifest, start, status):
                    env=env, cwd=plan["project"], check=True)
     stop = int(env["MAX_STEPS"])
     status["phase"] = "checkpoint-validation"
-    require_checkpoint(Path(plan["output"]), stop)
+    require_checkpoint(Path(plan["output"]), stop, world)
     evaluation = plan.get("evaluation")
     status["phase"] = "successor-submission"
     if evaluation and (stop % evaluation["every"] == 0 or stop == plan["target_step"] or
@@ -333,6 +356,7 @@ def _worker(plan, manifest, start, status):
         start_chain(SimpleNamespace(from_run=plan["output"], after_job=job, unfreeze=True,
                                    output=plan["joint_output"], target_step=plan["joint_target_step"],
                                    segment_steps=plan["segment_steps"], partition=plan["partition"], evaluation=evaluation,
+                                   world_size=world,
                                    time_limit=plan.get("time_limit", "01:00:00"), memory=plan.get("memory", "256G")))
     else:
         print(f"[TTN chain] completed target step {stop}", flush=True)
@@ -364,6 +388,7 @@ def main():
     modes = parser.add_subparsers(dest="mode", required=True)
     start = modes.add_parser("start", help="Submit the first segment; successors are submitted on success")
     start.add_argument("--from-run", required=True)
+    start.add_argument("--world-size", type=int, help="Inherit source world size; an override must match exact resume")
     start.add_argument("--after-job", help="Wait for this existing source job to finish successfully")
     start.add_argument("--target-step", type=int, default=500, help="Cumulative optimizer step, not per-job count")
     start.add_argument("--segment-steps", type=int, default=10)
@@ -371,6 +396,7 @@ def main():
     start.add_argument("--unfreeze", action="store_true", help="Source is C/sana-camera visual warmup; reset optimizer once")
     start.add_argument("--output", help="New joint output directory")
     fresh = modes.add_parser("fresh", help="Fresh C/SANA-camera joint DiT; optional corrected TTN-new frozen control")
+    fresh.add_argument("--world-size", type=int, default=4, help="One GPU per node/task; FSDP2 requires >=2 (default: 4)")
     fresh.add_argument("--warmup-steps", type=int, default=0, help="frozen TTN-new control; zero starts joint DiT immediately")
     fresh.add_argument("--target-step", type=int, default=500, help="Total adaptation + joint steps")
     fresh.add_argument("--segment-steps", type=int, default=10)
