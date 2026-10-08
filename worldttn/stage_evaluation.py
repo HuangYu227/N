@@ -35,7 +35,9 @@ def stage_evaluate_command(args):
     }
     from tools.ttn_eval_snapshot import expected_evaluation_children
     run = json.loads((Path(args.training_run) / "run_config.json").read_text(encoding="utf-8"))
-    if "no-local" in expected_evaluation_children(run):
+    training = run.get("training", {})
+    memory_config = training.get("meta_ttt", training.get("ttn", {}))
+    if memory_config.get("memory_update", "delta") != "proximal" and "no-local" in expected_evaluation_children(run):
         # Periodic contribution checks use the short prefix; long interventions
         # use the sequential mechanism array, keeping the short partition limit.
         for name in ("no-local", "no-persistent"):
@@ -65,6 +67,11 @@ def stage_evaluate_command(args):
             result["results"][name] = {"path": str(output / name / "summary.json"),
                 "metrics": summary.get("metrics"), "ttn_minus_sana": summary.get("ttn_minus_sana"),
                 "backend_comparison": summary.get("backend_comparison"),
+                "tla_memory": protocol.get("tla_memory"),
+                "rollout_sampler": protocol.get("rollout_sampler"),
+                "memory_audits": [{key: row[key] for key in ("case_id", "seed", "method",
+                    "memory_prefix_sha256", "memory_prefix_verified", "memory_storage_bytes") if key in row}
+                    for row in summary["episodes"] if "memory_prefix_sha256" in row],
                 "teacher_diagnoses": [{"original": r["diagnostic_summary"],
                     "matched": r["matched_backbone_softmax"]["diagnostic_summary"]} for r in summary["episodes"]] if name == "align" else None}
             publish()

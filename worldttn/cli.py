@@ -285,6 +285,7 @@ def rollout(model, config, batch, steps=4, cfg_scale=4.5, cached_blocks=-1, *, i
         if session.runtime.replay_observations:
             session.runtime.verify_replay_reference()
             session.runtime.replay_reference_verified = True
+        session.runtime.verify_memory_prefix()
     if not torch.equal(noise[:, :, :1], initial.float()): raise AssertionError("initial frame was modified")
     return noise, session.runtime if session is not None else None, records
 
@@ -345,6 +346,8 @@ def _training_identity(args, config, settings, k):
         identity.update(train_scope=args.train_scope, optimizer_foreach=False)
     if getattr(args, "optimizer_policy", None) == "origin": identity["optimizer_policy"] = "origin"
     ttn = settings.get("ttn", {})
+    if ttn.get("memory_update") == "proximal":
+        identity["ttn"] = TTNConfig(**ttn).to_dict()
     if ttn.get("local_update", False) or ttn.get("persistent_meta", False):
         identity["meta_ttt"] = {"version": "dual-psi-v1", "local_update": ttn.get("local_update", False),
                                 "persistent_meta": ttn.get("persistent_meta", False),
@@ -535,6 +538,14 @@ def train_command(args):
                 camera_cache=(f"last {history['cached_chunks']} chunks" if history['cached_chunks'] > 0
                               else "unbounded") + "; no native sink",
                 observed_reference="detached initial prefill; immutable within episode")
+        if model.ttn_system.config.memory_update == "proximal":
+            from .evaluation import memory_evaluation_protocol
+            run["history_protocol"].update(
+                persistent_gradient="S and retained K/V/W live inside TBPTT; detached at boundary",
+                local_lifecycle="ephemeral Direct-S solve per noisy call; clean solve commits once",
+                observed_reference="protected early clean observations, including generated frames; fixed values after capture",
+                legacy_psi="disabled; not an active learning branch",
+                tla_memory=memory_evaluation_protocol(model.ttn_system.config))
         if unfreeze:
             run["initialization"] = {"checkpoint": str(Path(args.adapter).resolve()), "step": step,
                                      "optimizer_reset": True, "rng_and_data_cursor_restored": True}

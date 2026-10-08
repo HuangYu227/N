@@ -21,8 +21,8 @@ from .training import chunk_ranges
 HISTORY_ACCESS = {
     "generated": "one observed frame; generated chunks update all history",
     "gt": "GT slice after current denoising; commits TTN + GDN/camera/FFN caches; output remains generated",
-    "ttn-gt": "GT clean pass supplies TTN S/psi; generated clean pass supplies native GDN/camera/FFN caches",
-    "native-gt": "generated clean pass supplies TTN S/psi; GT clean pass supplies native GDN/camera/FFN caches",
+    "ttn-gt": "GT clean pass supplies TTN S/psi and retained observations; generated pass supplies native GDN/camera/FFN caches",
+    "native-gt": "generated clean pass supplies TTN S/psi and retained observations; GT pass supplies native GDN/camera/FFN caches",
 }
 
 
@@ -33,6 +33,9 @@ def validate_inference_interventions(args, config):
     from .replay import replay_options_from_args, validate_replay
     from .performance import ExecutionOptions
     replay = replay_options_from_args(args, config)
+    if config.memory_update == "proximal":
+        if getattr(args, "ttn_ablation", "full") != "full" or sink.active or replay.active:
+            raise ValueError("proximal evaluation retains checkpoint memory math; legacy psi/Sink/replay overrides are incompatible")
     if replay.active:
         validate_replay(replay, config, getattr(args, "ttn_ablation", "full"),
             ExecutionOptions(getattr(args, "ttn_core_backend", "reference"),
@@ -66,6 +69,15 @@ def validate_inference_interventions(args, config):
     if sink.active and history != "generated":
         raise ValueError("sink experiments require generated history; run H1/H2 separately")
     return sink
+
+
+def memory_evaluation_protocol(config):
+    """Record checkpoint mathematics and cache budgets, including inactive defaults."""
+    return {"enabled": config.memory_update == "proximal",
+            "settings": {name: value for name, value in config.to_dict().items() if name.startswith("memory_")},
+            "update": "differentiable proximal solve" if config.memory_update == "proximal" else "legacy delta correction",
+            "history_budget_unit": "latent-frame token capacity per batch/head",
+            "eviction": "removes fitting observations; does not erase the recurrent S prior"}
 
 
 def latent_metrics(generated, reference, revisit_pairs, *, training_frames=None):
@@ -427,6 +439,7 @@ def evaluate_command(args):
                 "tla_sink": asdict(sink),
                 "tla_replay": asdict(replay),
                 "meta_ttt": {"local_update": ttn.local_update, "persistent_meta": ttn.persistent_meta},
+                "ttn_config": ttn.to_dict(), "tla_memory": memory_evaluation_protocol(ttn),
                 "state_diagnostics": diagnostics,
                 "history_access": HISTORY_ACCESS[history],
                 "train_scope": last_train.get("train_scope", run["arguments"].get("train_scope", "ttn")),
@@ -441,6 +454,8 @@ def evaluate_command(args):
                 "cfg_scale": args.cfg_scale, "unconditional_text": "encoded empty prompt via SANA _encode_prompts",
                 "cross_attn_backend": args.cross_attn_backend,
                 "cached_blocks": args.cached_blocks, "kv_save_stride": 1, "refiner": None,
+                "rollout_sampler": {"steps": args.steps, "cfg_scale": args.cfg_scale,
+                    "cached_blocks": args.cached_blocks, "flow_shift": config.scheduler.inference_flow_shift},
                 "training_history_protocol": run.get("history_protocol", {"clean_commits": "GT", "camera_cache": "all previous chunks within clip"}),
                 "rollout_history": f"{history} clean chunks; original SANA cache window; TTN S/psi persistent",
                 "flow_shift": config.scheduler.inference_flow_shift, "revisit_options": revisit_options,
@@ -523,6 +538,10 @@ def evaluate_command(args):
                 row.update(replay_reference_sha256=runtime.replay_reference_sha256,
                            replay_reference_verified=runtime.replay_reference_verified,
                            replay_storage_bytes=chunks[-1]["replay_storage_bytes"])
+            if runtime is not None and ttn.memory_update == "proximal":
+                row.update(memory_prefix_sha256=list(runtime.memory_prefix_hashes),
+                           memory_prefix_verified=True if runtime.verify_memory_prefix() else None,
+                           memory_storage_bytes=chunks[-1].get("memory_storage_bytes", 0))
             if diagnostics and args.frames >= 13:
                 row["prefix_13_metrics"] = latent_metrics(generated[:, :, :13], gt[:, :, :13],
                     [p for p in case["revisit_pairs"] if p["frame_b"] < 13], **metric_options)

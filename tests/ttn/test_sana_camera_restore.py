@@ -30,13 +30,15 @@ def native_camera_source(cached_sana):
 
 
 @pytest.mark.parametrize("save", [False, True])
-@pytest.mark.parametrize("meta", [False, True])
+@pytest.mark.parametrize("meta", [False, True, "proximal"])
 @pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable"))])
 def test_restored_camera_matches_original_output_cache_and_gradients(cached_sana, save, meta, device):
     torch.manual_seed(7)
     source = native_camera_source(cached_sana).to(device)
+    proximal = meta == "proximal"
     cfg = TTNConfig(heads=2, head_dim=8, generators=3, camera_attention="sana",
-                    stage="C" if meta else "A", local_update=meta, persistent_meta=meta)
+                    stage="C" if meta else "A", local_update=meta is True, persistent_meta=meta is True,
+                    persistent_update=not proximal, memory_update="proximal" if proximal else "delta")
     anchor = TTNAnchor(source, 0, cfg)
     runtime, ctx = context(cfg, f=4, device=device)
     state, psi = runtime.world_state.clone(), runtime.transition_fast.clone()

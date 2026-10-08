@@ -30,6 +30,14 @@ def validate_clean_output(output, reference):
 def record_noise(context, timestep, noise_sigma=None, sampled_timestep=None, *, total_calls=None):
     """Detached noisy-call metadata shared by training and the native sampler."""
     config = context.system.config
+    if config.memory_update == "proximal" and not context.clean_mode and not context.prefill_mode:
+        call = context.memory_call_count
+        context.memory_call_count += 1
+        context.collect_memory_stats = call in ({0, total_calls//2, total_calls-1} if total_calls is not None else {0})
+        if context.collect_memory_stats:
+            sigma = timestep.float()/1000 if noise_sigma is None else noise_sigma
+            context.memory_trajectory.append({"call": call, "noise_timestep": timestep.detach().float().cpu().tolist(),
+                "noise_sigma": sigma.detach().float().cpu().tolist(), "anchors": {}})
     if context.replay_active and not context.clean_mode and not context.prefill_mode:
         call = context.replay_call_count
         context.replay_call_count += 1
@@ -213,4 +221,6 @@ class TTNSession:
         # Detached factors are clean-only; outer predicted/state graphs remain live.
         context.psi_snapshot = c.psi_snapshot = None
         context.live_factors = c.live_factors = None
+        context.memory_caches = c.memory_caches = ()
+        c.memory_candidates.clear()
         return out, carried

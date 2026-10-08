@@ -21,6 +21,15 @@ hosts="$(scontrol show hostnames "${SLURM_JOB_NODELIST:?}")"
 export MASTER_ADDR="$("$PYTHON" -c 'import socket,sys; print(socket.gethostbyname(sys.argv[1]))' "${hosts%%$'\n'*}")"
 export MASTER_PORT="$((15000 + SLURM_JOB_ID % 40000))"
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}" NCCL_DEBUG=WARN NCCL_SOCKET_FAMILY=AF_INET
+if [[ "${PROXIMAL_MEMORY_TESTS:-0}" == 1 ]]; then
+  case "${SLURM_NTASKS:?}" in
+    1) tests=(tests/ttn/test_proximal.py tests/ttn/test_memory_cache.py tests/ttn/test_proximal_runtime.py
+              tests/ttn/test_proximal_evaluation.py tests/ttn/test_proximal_device.py tests/ttn/test_sana_camera_restore.py
+              tests/ttn/test_activation_checkpoint.py) ;;
+    2|3|4) tests=(tests/ttn/test_proximal_cuda.py) ;;
+    *) echo 'Proximal acceptance requires one, two, three or four nodes/tasks' >&2; exit 2 ;;
+  esac
+else
 case "${SLURM_NTASKS:?}" in
   1) tests=(tests/ttn/test_meta_core.py tests/ttn/test_sana_camera_restore.py tests/ttn/test_meta_sampler.py) ;;
   4) tests=(tests/ttn/test_meta_cuda.py) ;;
@@ -35,6 +44,7 @@ if [[ "${FULL_MEMORY_TESTS:-0}" == 1 ]]; then
            tests/ttn/test_training.py::test_save_on_cpu_reduces_live_cuda_saved_activations_without_changing_gradients
            -k 'not four_gpu')
   fi
+fi
 fi
 exec srun --mpi=none --kill-on-bad-exit=1 --ntasks="$SLURM_NTASKS" --ntasks-per-node=1 --gres=gpu:1 \
   --chdir="$PROJECT_ROOT" bash tools/ttn_slurm_worker.sh -q -s "${tests[@]}" "$@"

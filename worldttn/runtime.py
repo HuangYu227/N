@@ -7,7 +7,7 @@ from .core import ANCHORS, TTNConfig, Rank2Generators, CayleyFactors, DetachedCa
 from .performance import DEFAULT_EXECUTION, annotation, validate_execution
 from .stability import committed_anchor_stats, matrix_scale, write_direction_stats
 from .controller import TransitionController
-from . import sink, replay
+from . import sink, replay, memory_cache
 
 
 class TTNSystem(nn.Module):
@@ -20,7 +20,8 @@ class TTNSystem(nn.Module):
         if config.local_update:
             # Constant initialization consumes no RNG and preserves inherited seeds.
             self.local_eta_logits = nn.Parameter(torch.full((5,), math.log(math.expm1(.01))))
-        self.requires_grad_(config.stage != "A")
+        self.requires_grad_(config.stage != "A" and not (config.memory_update == "proximal"
+                                                        and config.memory_transport == "identity"))
 
 
 @dataclass
@@ -66,6 +67,14 @@ class TTNChunkContext:
     replay_trajectory: list = field(default_factory=list)
     replay_call_count: int = 0
     collect_replay_stats: bool = False
+    memory_caches: tuple = ()
+    memory_candidates: dict = field(default_factory=dict)
+    memory_active: bool = False
+    memory_rope: object = None
+    memory_stats: dict = field(default_factory=dict)
+    memory_trajectory: list = field(default_factory=list)
+    memory_call_count: int = 0
+    collect_memory_stats: bool = False
 
     def for_clean(self):
         return TTNChunkContext(self.predicted, self.previous, self.psi, self.cbase, self.system, self.frame_ids,
@@ -79,7 +88,9 @@ class TTNChunkContext:
                                sink_reference_sha256=self.sink_reference_sha256,
                                replay_options=self.replay_options, replay_observations=self.replay_observations,
                                replay_previous_values=self.replay_previous_values, replay_values=self.replay_values,
-                               replay_active=self.replay_active, replay_trajectory=self.replay_trajectory)
+                               replay_active=self.replay_active, replay_trajectory=self.replay_trajectory,
+                               memory_caches=self.memory_caches, memory_active=self.memory_active,
+                               memory_rope=self.memory_rope, memory_trajectory=self.memory_trajectory)
 
     def token_masks(self, n):
         f = self.frame_ids.shape[-1]
@@ -140,6 +151,8 @@ class TTNRuntimeState:
     replay_values: torch.Tensor | None = None
     replay_reference_sha256: str | None = None
     replay_reference_verified: bool | None = None
+    memory_caches: tuple = ()
+    memory_prefix_hashes: tuple = ()
 
     @classmethod
     def create(cls, config, batch_size, device, *, ablation="full", diagnostics=False, collect_local_stats=False,
@@ -152,6 +165,8 @@ class TTNRuntimeState:
             raise ValueError("run observed replay and read-time sink in separate experiments")
         if ablation not in ("full", "no-ttt", "identity", "no-local", "no-persistent"):
             raise ValueError("unknown TTN runtime ablation")
+        if config.memory_update == "proximal" and (ablation != "full" or sink_options.active or replay_options.active):
+            raise ValueError("proximal controls use explicit memory configuration, not legacy psi/Sink/replay overrides")
         if ablation in ("no-local", "no-persistent") and not (config.local_update or config.persistent_meta):
             raise ValueError("Local/Persistent contribution controls require Meta-TTT")
         if ablation != "full" and torch.is_grad_enabled():
@@ -187,6 +202,8 @@ class TTNRuntimeState:
         self.replay_observations = ()
         self.replay_values = None
         self.replay_reference_sha256 = self.replay_reference_verified = None
+        self.memory_caches = ()
+        self.memory_prefix_hashes = ()
 
     def begin_chunk(self, system, poses, intrinsics, frame_ids, valid_mask, width, height, prefill=False, *, rope=None):
         if system.config != self.config: raise ValueError("runtime/system configurations differ")
@@ -205,7 +222,7 @@ class TTNRuntimeState:
         options = getattr(system, "ttn_execution", DEFAULT_EXECUTION)
         sink.validate_sink(self.sink_options, self.config, self.ablation, options)
         replay.validate_replay(self.replay_options, self.config, self.ablation, options)
-        meta = self.config.local_update or self.config.persistent_meta
+        meta = self.config.local_update or self.config.persistent_meta or self.config.memory_update == "proximal"
         validate_execution(options, self.config.stage, self.ablation, self.diagnostics, meta=meta)
         reference = shift = None
         if self.sink_options.active and not prefill and self.commit_count >= self.sink_options.start_chunk:
@@ -224,7 +241,8 @@ class TTNRuntimeState:
         replay_values = self.replay_values
         history = self.write_history
         with annotation(options, "Predict"), torch.autocast(device_type=self.world_state.device.type, enabled=False):
-            if self.config.stage == "A" or prefill or self.ablation == "identity":
+            if (self.config.stage == "A" or prefill or self.ablation == "identity"
+                    or self.config.memory_update == "proximal" and self.config.memory_transport == "identity"):
                 cbase = torch.zeros_like(self.transition_fast)
                 predicted = self.world_state
             else:
@@ -260,7 +278,10 @@ class TTNRuntimeState:
                                replay_options=self.replay_options, replay_observations=self.replay_observations,
                                replay_previous_values=self.replay_values, replay_values=replay_values,
                                replay_active=self.replay_options.active and not prefill
-                                   and self.commit_count >= self.replay_options.start_chunk)
+                                   and self.commit_count >= self.replay_options.start_chunk,
+                               memory_caches=self.memory_caches, memory_rope=rope,
+                               memory_active=self.config.memory_update == "proximal" and not prefill
+                                   and self.commit_count >= self.config.memory_start_chunk)
 
     def prefill(self, context):
         if self.prefilled or self.commit_count: raise RuntimeError("initial image can only be prefilled once")
@@ -293,6 +314,24 @@ class TTNRuntimeState:
             states.append(s)
             gradients.append(g)
         new_state = torch.stack(states, 1)
+        retained, prefix_hashes = self.memory_caches, self.memory_prefix_hashes
+        if self.config.memory_update == "proximal" and self.config.memory_selection != "none":
+            if set(context.memory_candidates) != set(range(5)):
+                raise RuntimeError("all five memory caches must finish before committing")
+            retained = tuple(context.memory_candidates[i] for i in range(5))
+            for cache in retained:
+                memory_cache.validate_cache(cache)
+                if (cache.temporal_aligned or cache.observation.key.shape[:2] != new_state.shape[:1] + new_state.shape[2:3]
+                        or cache.observation.key.shape[-1] != new_state.shape[-1]
+                        or cache.observation.key.device != new_state.device
+                        or cache.observation.key.shape[2] > self.config.memory_capacity_frames * math.prod(cache.hw)):
+                    raise ValueError("invalid clean cache geometry/capacity; transaction not committed")
+            # Capture only after the protected prefix is fully observed; never hash each solver call.
+            if (not prefix_hashes
+                    and all((row >= self.config.memory_prefix_frames-1).any().item()
+                            for row in retained[0].observation.frame_ids)):
+                prefix_hashes = tuple(memory_cache.prefix_digest(cache, self.config.memory_prefix_frames)
+                                      for cache in retained)
         observations, replay_values = self.replay_observations, context.replay_values
         replay_hash = self.replay_reference_sha256
         if self.replay_options.active and self.replay_options.mode == "observed":
@@ -372,9 +411,33 @@ class TTNRuntimeState:
             if indices.numel():
                 previous_pose[b] = context.poses[b, indices[-1]].detach().float()
                 committed[b].update(context.frame_ids[b, indices].tolist())
+        last_stats = {
+            "read_frames": context.read_mask.sum(-1).tolist(),
+            "write_frames": context.write_mask.sum(-1).tolist(),
+            "state_norm": float(new_state.detach().norm()),
+            "state_rms": matrix_scale(new_state)["rms"],
+            "psi_norm": float(psi.detach().norm()),
+            "psi_update_norm": float((self.config.eta_psi * grad * scale).detach().norm())
+                if self.config.stage == "C" and self.config.persistent_update and self.ablation in ("full", "no-local") else 0.,
+            "prefill": context.prefill_mode,
+            "anchors": anchor_stats
+        }
+        if self.diagnostics or self.ablation != "full": last_stats["ablation"] = self.ablation
+        if self.replay_options.active:
+            last_stats["replay_storage_bytes"] = replay.storage_bytes(observations, replay_values)
+        if self.config.memory_update == "proximal":
+            if set(context.memory_stats) != set(range(5)):
+                raise RuntimeError("all five proximal diagnostics must finish before committing")
+            last_stats["memory_storage_bytes"] = sum(memory_cache.storage_bytes(cache) for cache in retained)
+            for i, stats in enumerate(anchor_stats):
+                stats["proximal"] = context.memory_stats[i]
+                stats["proximal_trajectory"] = [{key: value for key, value in call.items() if key != "anchors"} |
+                    call["anchors"][i] for call in context.memory_trajectory if i in call["anchors"]]
         # Assign only after every validation/computation succeeds. The context
         # keeps its old prediction/psi; the new psi is consumed next chunk.
         self.world_state = new_state
+        self.memory_caches = retained
+        self.memory_prefix_hashes = prefix_hashes
         self.sink_reference = reference
         self.sink_reference_sha256 = reference_hash
         self.replay_observations, self.replay_values = observations, replay_values
@@ -385,25 +448,20 @@ class TTNRuntimeState:
         self.committed_frame_ids = committed
         self.commit_count += 1
         self.revision += 1
-        self.last_stats = {
-            "read_frames": context.read_mask.sum(-1).tolist(),
-            "write_frames": context.write_mask.sum(-1).tolist(),
-            "state_norm": float(new_state.detach().norm()),
-            "state_rms": matrix_scale(new_state)["rms"],
-            "psi_norm": float(psi.detach().norm()),
-            "psi_update_norm": float((self.config.eta_psi * grad * scale).detach().norm())
-                if self.config.stage == "C" and self.ablation in ("full", "no-local") else 0.,
-            "prefill": context.prefill_mode,
-            "anchors": anchor_stats
-        }
-        if self.diagnostics or self.ablation != "full": self.last_stats["ablation"] = self.ablation
-        if self.replay_options.active:
-            self.last_stats["replay_storage_bytes"] = replay.storage_bytes(observations, replay_values)
+        self.last_stats = last_stats
 
     def detach(self):
         self.world_state = self.world_state.detach()
         self.transition_fast = self.transition_fast.detach()
         if self.replay_values is not None: self.replay_values = self.replay_values.detach()
+        self.memory_caches = tuple(memory_cache.detach_cache(cache) for cache in self.memory_caches)
+
+    def verify_memory_prefix(self):
+        if not self.memory_prefix_hashes: return None
+        actual = tuple(memory_cache.prefix_digest(cache, self.config.memory_prefix_frames) for cache in self.memory_caches)
+        if actual != self.memory_prefix_hashes:
+            raise RuntimeError("protected observation prefix changed during the episode")
+        return actual
 
     def verify_sink_reference(self):
         """Hash once at rollout end, never in each solver call."""

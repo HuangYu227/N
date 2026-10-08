@@ -15,6 +15,7 @@ import uuid
 def expected_evaluation_children(run):
     training = run.get("training", {})
     config = training.get("meta_ttt", training.get("ttn", {}))
+    if config.get("memory_update") == "proximal": return {"long", "short", "align"}
     return {"long", "short", "align"} | ({"no-local", "no-persistent"}
         if config.get("local_update", False) or config.get("persistent_meta", False) else set())
 

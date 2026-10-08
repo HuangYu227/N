@@ -68,6 +68,51 @@ def worker_setup(tmp_path):
     return bash, script, capture, writer, personal, env
 
 
+@pytest.mark.parametrize("tasks", [1, 3, 5])
+def test_proximal_meta_launcher_selects_tests_and_rejects_invalid_topology(worker_setup, tmp_path, tasks):
+    bash, worker, capture, writer, personal, env = worker_setup
+    project = tmp_path / "project"
+    (project / "tools").mkdir(parents=True)
+    for name in ("ttn_slurm_meta_tests.sbatch", "ttn_cache_env.sh"):
+        shutil.copyfile(worker.parent / name, project / "tools" / name)
+    python = personal / "envs/worldttn/bin/python"
+    python.parent.mkdir(parents=True)
+    python.write_text('#!/usr/bin/env bash\n[[ "$1" == -c ]] || exit 99\nprintf "10.0.0.1\\n"\n',
+                      encoding="utf-8", newline="\n")
+    python.chmod(0o755)
+    writer.write_text("import json,os,sys\nfrom pathlib import Path\n"
+        "Path(os.environ['CAPTURE']).write_text(json.dumps({'args':sys.argv[1:],"
+        "'master':os.environ['MASTER_ADDR'],'module':os.environ['TTN_ENTRY_MODULE']}))\n", encoding="utf-8")
+    mocks = tmp_path / "mocks"
+    mocks.mkdir()
+    for name, body in (
+        ("scontrol", 'printf "ltu-hpc-1\\n"'),
+        ("srun", 'exec "$REAL_PYTHON" "$CAPTURE_WRITER" "$@"'),
+    ):
+        path = mocks / name
+        path.write_text("#!/usr/bin/env bash\n" + body + "\n", encoding="utf-8", newline="\n")
+        path.chmod(0o755)
+    env.update(PROJECT_ROOT=project.as_posix(), PROXIMAL_MEMORY_TESTS="1", FULL_MEMORY_TESTS="1",
+               SLURM_NTASKS=str(tasks), SLURM_JOB_NODELIST="ltu-hpc-1")
+    env["PATH"] = str(mocks) + os.pathsep + env["PATH"]
+    result = subprocess.run([str(bash), str(project / "tools/ttn_slurm_meta_tests.sbatch")], env=env,
+                            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+    if tasks == 5:
+        assert result.returncode == 2 and "requires one, two, three or four" in result.stderr
+        assert not capture.exists()
+        return
+    assert result.returncode == 0, result.stderr
+    record = json.loads(capture.read_text())
+    assert record["master"] == "10.0.0.1" and record["module"] == "pytest"
+    assert f"--ntasks={tasks}" in record["args"] and "--kill-on-bad-exit=1" in record["args"]
+    tests = [arg for arg in record["args"] if arg.startswith("tests/")]
+    if tasks == 3:
+        assert tests == ["tests/ttn/test_proximal_cuda.py"]
+    else:
+        assert "tests/ttn/test_proximal_device.py" in tests and "tests/ttn/test_proximal_runtime.py" in tests
+        assert "tests/ttn/test_meta_cuda.py" not in tests
+
+
 @pytest.mark.parametrize("rank", [0, 1, 2])
 @pytest.mark.parametrize("exit_code", [0, 7])
 def test_worker_uses_fresh_local_compile_files_and_preserves_exit_status(worker_setup, rank, exit_code):

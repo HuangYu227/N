@@ -79,6 +79,11 @@ def _validate_candidates(context, runtime):
                 or state.dtype != torch.float32 or gradient.dtype != torch.float32
                 or not torch.isfinite(state).all() or not torch.isfinite(gradient).all()):
             raise ValueError("invalid candidate in clean history pass; transaction not committed")
+    if runtime.config.memory_update == "proximal" and runtime.config.memory_selection != "none":
+        from .memory_cache import validate_cache
+        if set(context.memory_candidates) != set(range(5)):
+            raise RuntimeError("all five retained caches must finish each clean history pass")
+        for cache in context.memory_candidates.values(): validate_cache(cache)
 
 
 def _validate_native_cache(updated, incoming):

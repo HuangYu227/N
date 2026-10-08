@@ -382,6 +382,7 @@ def train_clip(model,
         episode.cache = carry_cache(episode.cache, model.ttn_system.config.camera_attention)
     runtime.verify_sink_reference()
     runtime.verify_replay_reference()
+    runtime.verify_memory_prefix()
     params = [p for p in model.parameters() if p.requires_grad]
     grad_norm = parallel.clip_grad_norm(outer_clip) if parallel else torch.nn.utils.clip_grad_norm_(
         params, outer_clip, error_if_nonfinite=True)

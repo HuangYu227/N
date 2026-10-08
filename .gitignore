@@ -225,3 +225,9 @@ hf*/
 *.mdx
 docs/
 .superpowers/
+
+# Ship the numerical recipe and cluster acceptance commands with this feature.
+!/docs/
+/docs/*
+!/docs/proximal-memory.md
+!/docs/proximal-memory-ltu.md

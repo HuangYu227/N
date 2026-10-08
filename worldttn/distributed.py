@@ -28,10 +28,15 @@ def _expose_clean_state(module, args, kwargs, output):
     if context is None:
         context = next((arg for arg in args if isinstance(arg, TTNChunkContext)), None)
     state = gradient = None
+    memory = ()
     if context is not None and context.clean_mode:
         candidate = context.candidates.get(module.attn.index)
         if candidate is not None: state, gradient = candidate[:2]
-    return output, state, gradient
+        retained = context.memory_candidates.get(module.attn.index)
+        if retained is not None:
+            observation = retained.observation
+            memory = (observation.key, observation.value, observation.weight)
+    return (output, state, gradient, memory) if memory else (output, state, gradient)
 
 
 def _restore_block_output(module, args, output):

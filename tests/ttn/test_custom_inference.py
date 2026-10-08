@@ -92,7 +92,8 @@ def test_closed_orbit_translation_orientation_and_native_return(monkeypatch):
 
 
 @pytest.mark.parametrize("case_name", ["case.json", "case_orbit.json"])
-def test_custom_pair_reuses_inputs_and_noise_without_future_gt(monkeypatch, tmp_path, case_name):
+@pytest.mark.parametrize("proximal", [False, True])
+def test_custom_pair_reuses_inputs_and_noise_without_future_gt(monkeypatch, tmp_path, case_name, proximal):
     native_cpu_helpers(monkeypatch)
     from worldttn import cli, sana, checkpoint, performance
     from worldttn.core import TTNConfig
@@ -110,8 +111,10 @@ def test_custom_pair_reuses_inputs_and_noise_without_future_gt(monkeypatch, tmp_
     adapter = tmp_path / "checkpoint.pt"
     adapter.write_bytes(b"immutable")
     run = {"base": {"source": "original", "sha256": "base"}, "arguments": {"sana_config": None}}
+    ttn = (TTNConfig(stage="C", camera_attention="sana", memory_update="proximal", persistent_update=False)
+           if proximal else TTNConfig(stage="C", camera_attention="sana", local_update=True, persistent_meta=True))
     monkeypatch.setattr(custom, "load_evaluation_run", lambda args: (
-        run, config, TTNConfig(stage="C", camera_attention="sana", local_update=True, persistent_meta=True),
+        run, config, ttn,
         adapter, custom.file_sha256(adapter), {"step": 100, "weight_scope": "dit"}))
     monkeypatch.setattr(custom, "encode_first_frame", lambda *args: torch.zeros(1, 128, 1, 22, 40))
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
@@ -142,9 +145,11 @@ def test_custom_pair_reuses_inputs_and_noise_without_future_gt(monkeypatch, tmp_
         hashes.append(custom.tensor_sha256(initial_noise))
         result = initial_noise.clone()
         result[:, :, :1] = batch["initial_latent"]
-        chunks = [{"chunk": 0, "start": 0, "end": 4, "seconds": 0}]
+        chunks = [{"chunk": 0, "start": 0, "end": 4, "seconds": 0, "memory_storage_bytes": 123}]
         on_chunk(chunks[0])
-        return result, SimpleNamespace(commit_count=21) if model.adapted else None, chunks
+        runtime = SimpleNamespace(commit_count=21, memory_prefix_hashes=("prefix",),
+                                  verify_memory_prefix=lambda: ("prefix",)) if model.adapted else None
+        return result, runtime, chunks
     monkeypatch.setattr(cli, "rollout", rollout)
     monkeypatch.setattr(decoder, "main", lambda argv: decoded.append(argv))
     output = tmp_path / "custom"
@@ -159,6 +164,14 @@ def test_custom_pair_reuses_inputs_and_noise_without_future_gt(monkeypatch, tmp_
     assert [tensor.shape[2] for tensor in latents] == [61, 61]
     assert np.load(output / "camera_poses.npy").shape == (481, 4, 4)
     assert all((row["return_view"] is None) == (case_name == "case.json") for row in summary["episodes"])
+    if proximal:
+        assert summary["protocol"]["tla_memory"]["enabled"] is True
+        assert summary["protocol"]["tla_memory"]["settings"]["memory_update"] == "proximal"
+        assert summary["episodes"][1]["memory_prefix_sha256"] == ["prefix"]
+        assert summary["episodes"][1]["memory_prefix_verified"] is True
+        assert summary["episodes"][1]["memory_storage_bytes"] == 123
+        assert "memory_prefix_verified" not in summary["episodes"][0]
+        return
     # The intervention reuses the already encoded observation/text and original SANA rollout.
     monkeypatch.setattr(custom, "encode_first_frame", lambda *a: pytest.fail("shared first frame must not be re-encoded"))
     intervention = tmp_path / "sink"

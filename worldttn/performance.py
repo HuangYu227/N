@@ -43,14 +43,16 @@ def execution_report(model):
                       "dense_reused" if options.psi_backend == "reference" else "projected")
     cfg = getattr(getattr(model, "ttn_system", None), "config", None)
     if cfg is not None and (cfg.local_update or cfg.persistent_meta): implementation = "live_projected_meta"
+    if cfg is not None and cfg.memory_update == "proximal": implementation = "disabled_proximal_s"
     return {**asdict(options), "psi_implementation": implementation, "triton_available": False,
-            "activation_checkpointing": getattr(model, "ttn_activation_checkpointing", "none")}
+            "activation_checkpointing": getattr(model, "ttn_activation_checkpointing", "none"),
+            "state_update": "live_proximal_s" if cfg is not None and cfg.memory_update == "proximal" else "delta"}
 
 
 def configure_execution(model, options=None):
     options = options or DEFAULT_EXECUTION
     cfg = model.ttn_system.config
-    validate_execution(options, cfg.stage, meta=cfg.local_update or cfg.persistent_meta)
+    validate_execution(options, cfg.stage, meta=cfg.local_update or cfg.persistent_meta or cfg.memory_update == "proximal")
     model.ttn_system.ttn_execution = options
     for block in model.blocks:
         if hasattr(block.attn, "beta_proj") and hasattr(block.attn, "index"):
@@ -73,7 +75,7 @@ def configure_from_args(model, args):
                   getattr(args, "history_source", "generated") != "generated")
     cfg = model.ttn_system.config
     validate_execution(options, cfg.stage, getattr(args, "ttn_ablation", "full"), diagnostic,
-                       meta=cfg.local_update or cfg.persistent_meta)
+                       meta=cfg.local_update or cfg.persistent_meta or cfg.memory_update == "proximal")
     return configure_execution(model, options)
 
 

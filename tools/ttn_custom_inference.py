@@ -12,7 +12,7 @@ from PIL import Image
 import torch
 
 from worldttn.evaluation import (diagnostic_noise, file_sha256, load_evaluation_run, tensor_sha256,
-                                validate_inference_interventions)
+                                validate_inference_interventions, memory_evaluation_protocol)
 
 REPO = Path(__file__).resolve().parents[1]
 CONDITIONING_KEYS = ("initial_latent", "y", "mask", "uncondition", "camera_conditions", "chunk_plucker")
@@ -266,7 +266,8 @@ def main(argv=None):
                 "flow_shift": config.scheduler.inference_flow_shift, "cross_attn_backend": args.cross_attn_backend,
                 "camera_attention": "sana", "history_source": "generated", "ttn_ablation": "full",
                 "stage": ttn.stage, "tla_sink": asdict(sink), "tla_replay": asdict(replay), "state_diagnostics": args.state_diagnostics,
-                "ttn_config": ttn.to_dict(), "provenance": implementation_identity(),
+                "ttn_config": ttn.to_dict(), "tla_memory": memory_evaluation_protocol(ttn),
+                "provenance": implementation_identity(),
                 "compile": {key: os.environ.get(key, "0") for key in ("GDN_DISABLE_COMPILE", "GDN_DISABLE_COMPLEX_COMPILE")},
                 "input_bundle_sha256": file_sha256(args.output / "input-bundle.pt"),
                 "shared_baseline": str(args.reuse_baseline.resolve()) if args.reuse_baseline else None,
@@ -318,6 +319,10 @@ def main(argv=None):
                "sink_reference_verified": getattr(runtime, "sink_reference_verified", None)
                    if getattr(runtime, "sink_reference_sha256", None) is not None else None,
                "return_view": return_latent_metrics(generated, gpu_batch, case)}
+        if runtime is not None and ttn.memory_update == "proximal":
+            row.update(memory_prefix_sha256=list(runtime.memory_prefix_hashes),
+                       memory_prefix_verified=True if runtime.verify_memory_prefix() else None,
+                       memory_storage_bytes=chunks[-1].get("memory_storage_bytes", 0))
         torch.save({"latents": generated.cpu(), "method": method, "case_id": case["case_id"],
                     "seed": case["seed"], "chunks": [{key: c[key] for key in ("chunk", "start", "end")} for c in chunks]},
                    args.output / f"case-000-{method}.pt")

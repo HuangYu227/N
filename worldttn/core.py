@@ -39,8 +39,39 @@ class TTNConfig:
     replay_strength: float = 0.
     replay_budget: int = 128
     memory_start_chunk: int = 5
+    # Opt-in mathematical recipe; missing fields preserve legacy checkpoints.
+    memory_update: str = "delta"
+    memory_kappa: float = 16.
+    memory_history_weight: float = .25
+    memory_selection: str = "participative"
+    memory_capacity_frames: int = 16
+    memory_prefix_frames: int = 10
+    memory_recent_frames: int = 4
+    memory_position: str = "absolute"
+    memory_transport: str = "identity"
 
     def __post_init__(self):
+        if self.memory_update not in ("delta", "proximal"):
+            raise ValueError("memory_update must be delta or proximal")
+        if self.memory_selection not in ("none", "fifo", "participative"):
+            raise ValueError("invalid memory selection")
+        if self.memory_position not in ("absolute", "temporal-realign") or self.memory_transport not in ("identity", "cayley"):
+            raise ValueError("invalid memory coordinates/transport")
+        if any(isinstance(v, bool) or not isinstance(v, int) or v < 1 for v in
+               (self.memory_capacity_frames, self.memory_prefix_frames, self.memory_recent_frames)):
+            raise ValueError("memory frame budgets must be positive integers")
+        if self.memory_prefix_frames + self.memory_recent_frames >= self.memory_capacity_frames:
+            raise ValueError("memory capacity must leave room for selected history")
+        if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in
+               (self.memory_kappa, self.memory_history_weight)) or self.memory_kappa <= 0 or self.memory_history_weight < 0:
+            raise ValueError("invalid proximal regularization/history weight")
+        if self.memory_update == "proximal":
+            if self.stage != "C" or self.camera_attention != "sana":
+                raise ValueError("proximal memory requires Stage C with native SANA camera")
+            if self.local_update or self.persistent_meta or self.persistent_update or self.sink_gain or self.replay_strength:
+                raise ValueError("proximal memory replaces legacy psi/Sink/replay updates; disable them explicitly")
+            if self.memory_transport == "cayley" and self.memory_selection != "none":
+                raise ValueError("proximal Cayley control requires no retained history until value coordinates are validated")
         if self.stage not in ("A", "B", "C"):
             raise ValueError("stage must be A, B or C")
         if not isinstance(self.local_update, bool) or not isinstance(self.persistent_meta, bool):

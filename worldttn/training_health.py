@@ -15,7 +15,8 @@ def audit_training_parameters(model, optimizer):
     named = dict(model.named_parameters())
     required = {f"blocks.{i}.attn.{group}.weight" for i in ANCHORS
                 for group in ("qkv", "beta_proj", "proj", "output_gate")}
-    if stage != "A":
+    if stage != "A" and not (model.ttn_system.config.memory_update == "proximal"
+                            and model.ttn_system.config.memory_transport == "identity"):
         required.update(("ttn_system.generators.u", "ttn_system.generators.v"))
         required.update(f"ttn_system.controller.heads.{i}.weight" for i in range(5))
     if model.ttn_system.config.local_update: required.add("ttn_system.local_eta_logits")

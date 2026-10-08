@@ -11,7 +11,8 @@ from .stability import clean_anchor_stats, local_anchor_stats, matrix_scale, rot
 from .geometry import apply_complex_rope
 from .runtime import TTNSystem
 from .sink import sink_read_stats, sink_effective_stats, validate_sink
-from . import replay
+from . import replay, memory_cache
+from .proximal import proximal_correct
 
 
 class TTNAnchor(nn.Module):
@@ -93,7 +94,7 @@ class TTNAnchor(nn.Module):
         b, n, c = x.shape
         if diagnostic is not None: diagnostic("input", x)
         read, write = ctx.token_masks(n)
-        x = (torch.where(read[..., None], x, 0.) if cfg.local_update or cfg.persistent_meta
+        x = (torch.where(read[..., None], x, 0.) if cfg.local_update or cfg.persistent_meta or cfg.memory_update == "proximal"
              else x * read[..., None].to(x.dtype))
         q, k, v = self.visual_features(x, rotary_emb)
         if diagnostic is not None: diagnostic("visual_features", (q, k, v))
@@ -128,7 +129,55 @@ class TTNAnchor(nn.Module):
                          q=q, k=k, v=v, beta=beta, predicted=predicted, write=write)
             with annotation(execution, "CorrectRead"):
                 replay_result = None
-                if execution.core_backend == "reference":
+                proximal_stats = None
+                if cfg.memory_update == "proximal":
+                    if (execution.core_backend, execution.psi_backend) != ("reference", "reference"):
+                        raise ValueError("proximal memory requires reference/reference")
+                    histories = ()
+                    if ctx.memory_active and ctx.memory_caches:
+                        retained = ctx.memory_caches[self.index]
+                        if cfg.memory_position == "temporal-realign":
+                            retained = memory_cache.temporal_realign(retained, ctx.memory_rope, ctx.frame_ids,
+                                prefix_frames=cfg.memory_prefix_frames, recent_frames=cfg.memory_recent_frames)
+                        histories = memory_cache.sources(retained, prefix_frames=cfg.memory_prefix_frames,
+                                                        recent_frames=cfg.memory_recent_frames)
+                    collect = ctx.clean_mode or ctx.collect_memory_stats or diagnostic is not None
+                    state, w, proximal_stats = proximal_correct(predicted, k, v, beta, write,
+                        history=histories, history_weight=cfg.memory_history_weight, kappa=cfg.memory_kappa,
+                        eps=cfg.eps, collect_stats=collect)
+                    raw = q @ state
+                    if ctx.clean_mode and cfg.memory_selection != "none":
+                        if self.index in ctx.memory_candidates: raise RuntimeError("memory anchor staged twice")
+                        ctx.memory_candidates[self.index] = memory_cache.update_cache(
+                            ctx.memory_caches[self.index] if ctx.memory_caches else None,
+                            k, v, w, q, write, ctx.frame_ids, HW,
+                            capacity_frames=cfg.memory_capacity_frames, prefix_frames=cfg.memory_prefix_frames,
+                            recent_frames=cfg.memory_recent_frames, selection=cfg.memory_selection)
+                    if collect:
+                        proximal_stats.update(implementation="live_proximal_s", history_active=bool(histories),
+                            selection=cfg.memory_selection, position=cfg.memory_position,
+                            transport=cfg.memory_transport, kappa=cfg.memory_kappa,
+                            history_weight=cfg.memory_history_weight, persistent_commit=ctx.clean_mode,
+                            meta_gradient_enabled=state.requires_grad)
+                        # Query is held out of this diagnostic solve only, never of production Correct.
+                        if not ctx.clean_mode and not ctx.prefill_mode:
+                            support, query = ctx.support_query_masks(n, HW)
+                            with torch.no_grad():
+                                heldout, _, _ = proximal_correct(predicted, k, v, beta, support,
+                                    history=histories, history_weight=cfg.memory_history_weight,
+                                    kappa=cfg.memory_kappa, eps=cfg.eps)
+                                def query_loss(candidate):
+                                    weight = w * query[:, None]
+                                    count = weight.sum(-1)
+                                    loss = (weight[..., None]*(k@candidate-v).square()).sum((-2,-1))
+                                    return torch.where(count > 0, loss/count.clamp_min(cfg.eps), 0.)
+                                proximal_stats["heldout_query"] = {
+                                    "valid": query.any(-1).cpu().tolist(),
+                                    "before": [row if valid else None for row, valid in
+                                        zip(query_loss(predicted).cpu().tolist(), query.any(-1).tolist())],
+                                    "after_support_solve": [row if valid else None for row, valid in
+                                        zip(query_loss(heldout).cpu().tolist(), query.any(-1).tolist())]}
+                elif execution.core_backend == "reference":
                     if ctx.replay_active:
                         observation = ctx.replay_observations[self.index] if ctx.replay_observations else None
                         state, w, replay_result = replay.correct_with_replay(predicted, k, v, beta, write,
@@ -217,6 +266,9 @@ class TTNAnchor(nn.Module):
                 with annotation(execution, "Stats"):
                     stats = clean_anchor_stats(ctx.previous[:, self.index], ctx.predicted[:, self.index],
                                                state, q, k, v, beta, w, read, write, gradient, cfg)
+                    if cfg.memory_update == "proximal":
+                        stats["state_update"] = "live_proximal_s"
+                        stats["per_head"].pop("eta_s", None)  # No legacy scalar gradient step is applied.
                     if persistent_geometry is not None: stats["persistent_rotation_geometry"] = persistent_geometry
                 ctx.stage(self.index, state, gradient, stats)
         raw = raw.transpose(1, 2).reshape(b, n, c)
@@ -256,6 +308,13 @@ class TTNAnchor(nn.Module):
             raw = raw + camera_contribution
         if diagnostic is not None: diagnostic("fused_raw", raw)
         gate = F.silu(self.output_gate(x).float())
+        if proximal_stats is not None and (ctx.clean_mode or ctx.collect_memory_stats or diagnostic is not None):
+            with torch.no_grad():
+                delta_raw = (q @ (state-predicted)).transpose(1, 2).reshape(b, n, c)
+            sink_effective_stats(proximal_stats, delta_raw, gate, self.proj, read, self.heads)
+            proximal_stats["measurement"] = "Direct-S change from incoming prior; FP32 gate/proj before quantization"
+            if ctx.clean_mode: ctx.memory_stats[self.index] = proximal_stats
+            elif ctx.memory_trajectory: ctx.memory_trajectory[-1]["anchors"][self.index] = proximal_stats
         if replay_result is not None:
             replay_stats, replay_delta = replay_result
             with torch.no_grad():
@@ -278,6 +337,20 @@ class TTNAnchor(nn.Module):
         gated = (raw * gate).to(x.dtype)
         if diagnostic is not None: diagnostic("gated_raw", gated)
         out = self.proj(gated) * read[..., None].to(x.dtype)
+        if proximal_stats is not None:
+            with torch.no_grad():
+                # Hold input/camera/gate fixed; include the actual output dtype's rounding.
+                prior_gated = ((raw.detach()-delta_raw)*gate.detach()).to(x.dtype)
+                prior_out = F.linear(prior_gated, self.proj.weight.detach(),
+                    self.proj.bias.detach() if self.proj.bias is not None else None) * read[..., None]
+                delta_out = out.detach().float()-prior_out.float()
+                valid = read[..., None].expand_as(delta_out)
+                proximal_stats["output_effect"] = {
+                    "dtype": str(out.dtype), "delta_norm": delta_out.norm().item(),
+                    "relative_delta": (delta_out.norm()/prior_out.float().norm().clamp_min(cfg.eps)).item(),
+                    "changed_fraction": ((delta_out != 0) & valid).sum().item()/max(valid.sum().item(), 1),
+                    "measurement": "paired anchor outputs after quantization, same features/camera; no rollout quality claim"}
+            if diagnostic is not None: diagnostic("proximal_update", proximal_stats)
         if ctx.clean_mode: stats["anchor_output"] = matrix_scale(out)
         if cfg.camera_attention == "sana":
             cache[6] = x.new_tensor([0.])  # Native concat layout: camera K/V in slots 2/3.
@@ -346,6 +419,8 @@ def trainable_parameter_names(model, scope=None):
             if (scope == "dit" or is_ttn_parameter(name))
             and not (scope == "ttn-new" and not is_ttn_new_parameter(name))
             and not (scope == "ttn-visual" and is_ttn_camera_parameter(name))
+            and not (model.ttn_system.config.memory_update == "proximal"
+                     and model.ttn_system.config.memory_transport == "identity" and name.startswith("ttn_system."))
             and not (model.ttn_system.config.stage == "A" and name.startswith("ttn_system."))}
 
 
