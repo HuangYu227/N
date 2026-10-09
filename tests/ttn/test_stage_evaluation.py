@@ -66,18 +66,20 @@ def test_fixed_cases_are_prefixes_not_reselected_when_training_horizon_changes(t
 
 @pytest.mark.parametrize("failure", [False, True])
 @pytest.mark.parametrize("meta", [False, True])
-def test_periodic_evaluation_uses_private_subprocesses_and_publishes_progress(tmp_path, monkeypatch, failure, meta):
+@pytest.mark.parametrize("frames", [61, 121])
+def test_periodic_evaluation_uses_private_subprocesses_and_publishes_progress(tmp_path, monkeypatch, failure, meta, frames):
     snapshot = tmp_path / "immutable-snapshot"
     snapshot.mkdir()
     (snapshot / "run_config.json").write_text(json.dumps({"training": {"meta_ttt": {"local_update": meta, "persistent_meta": meta}}}))
-    args = SimpleNamespace(output=str(tmp_path / "eval"), training_run=str(snapshot), frames=61,
+    args = SimpleNamespace(output=str(tmp_path / "eval"), training_run=str(snapshot), frames=frames,
         fixed_cases=str(tmp_path / "cases.pt"), seed=3407, eval_cases=1, cross_attn_backend="math", device="cpu",
         steps=20, cfg_scale=4.5, cached_blocks=2)
     calls = []
     def run(command, **kw):
         calls.append(command)
         assert command[command.index("--training-run") + 1] == str(snapshot)
-        assert command[command.index("--noise-frames") + 1] == "61"
+        assert command[command.index("--noise-frames") + 1] == str(frames)
+        if len(calls) == 1: assert command[command.index("--frames") + 1] == str(frames)
         assert "--camera-attention" not in command and "--resume" not in command
         out = Path(command[command.index("--output") + 1])
         if failure and out.name == "short": raise subprocess.CalledProcessError(1, command)
@@ -99,3 +101,20 @@ def test_periodic_evaluation_uses_private_subprocesses_and_publishes_progress(tm
         for command in calls[3:]:
             assert command[command.index("--frames") + 1] == "13"
             assert command[command.index("--ttn-ablation") + 1] in ("no-local", "no-persistent")
+
+
+@pytest.mark.parametrize("frames,extra,expected", [
+    (61, [], "server entrypoints require CUDA"),
+    (121, [], "server entrypoints require CUDA"),
+    (58, [], "stage-evaluate requires"),
+    (120, [], "1+3n latent frames"),
+    (121, ["--adapter", "unused.pt"], "stage-evaluate requires"),
+    (121, ["--fixed-cases", ""], "stage-evaluate requires"),
+])
+def test_stage_cli_accepts_long_horizon_and_retains_protocol_guards(monkeypatch, capsys, frames, extra, expected):
+    from worldttn.cli import main
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    arguments = ["stage-evaluate", "--device", "cpu", "--training-run", "unused", "--steps", "20",
+                 "--frames", str(frames), "--fixed-cases", "unused.pt", *extra]
+    with pytest.raises(SystemExit): main(arguments)
+    assert expected in capsys.readouterr().err

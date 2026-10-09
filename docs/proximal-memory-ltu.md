@@ -117,6 +117,8 @@ printf 'LONG_JOB=%q\nLONG_RUN=%q\n' "$LONG_JOB" "$OUTPUT" > "$PROJECT_ROOT/outpu
 
 在固定snapshot上复用 `tools/ttn_slurm_eval.sbatch`。常规评估 `COMMAND=stage-evaluate FRAMES=121 STEPS=20 CFG_SCALE=4.5 CACHED_BLOCKS=2`，单卡、day分区，预留多case需要的时限。另用相同 `TRAINING_RUN`、`FIXED_CASES`、`SEED`，`COMMAND=evaluate STEPS=4 CFG_SCALE=1`，输出到独立目录作sampler匹配对照。
 
+阶段评估 CLI 与核心都接受 `1+3n >=61`，121帧 long 先生成固定案例，short/align 共用它的噪声前缀。已有61帧的 fixed-cases bundle 不能用于121帧；不要覆盖旧文件或静默重选案例。当前新链首次25step评估之前尚未创建案例时，由long创建121帧版本；其后的各次评估沿用同一文件。
+
 完整工程门槛通过后才运行下面的fresh长程候选；不要与旧的自动launch500链一起提交。`segment_steps=1`先避免新的慢step跨Slurm时限，测量后可按预算增加；每段仍会保存，最新两套完整bundle自动保留。
 
 ```bash

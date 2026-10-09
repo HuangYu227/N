@@ -976,8 +976,8 @@ def main(argv=None):
             parser.error("evaluate reads real zip data from --training-run; no --batch-file or --resume")
         if args.frames < 4 or args.frames % 3 != 1 or args.eval_cases < 1:
             parser.error("evaluate requires positive cases and 1+3n latent frames")
-    if args.command == "stage-evaluate" and (args.frames != 61 or not args.fixed_cases or args.adapter):
-        parser.error("stage-evaluate requires --frames 61 --fixed-cases and the snapshot's last.pt (no --adapter)")
+    if args.command == "stage-evaluate" and (args.frames < 61 or not args.fixed_cases or args.adapter):
+        parser.error("stage-evaluate requires 1+3n frames >=61, --fixed-cases and the snapshot's last.pt (no --adapter)")
     if args.command == "align-chunk":
         if not args.training_run or args.frames != 4 or args.eval_cases < 1:
             parser.error("align-chunk requires --training-run, --frames 4 and positive --eval-cases")
