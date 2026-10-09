@@ -165,3 +165,11 @@ job = submit(plan, manifest, 8, dependency=os.environ["PROBE_JOB"])
 这段仅用于已确认最后保存为step8、该链没有活动作业的恢复；执行前从 `jobs.jsonl` 与 `squeue` 排除重复提交。`afterok` 让通信检查失败时训练不启动；成功后从step9恢复原模型、Adam、RNG和游标，再沿用500step自动链与评估设置。真实模型的 bitwise 连续/恢复对照仍需要独立测量，通信检查不能代替它。
 
 当时可用59GiB，保存器最低预算约47.63GiB，余量很小。原目录继续保留最新两套bundle；25/50/100/250等长期模型点还会新增占用，不能据此保证500step磁盘够用。删除旧实验前另外核对依赖；此修复不删除权重或日志。
+
+## 7. 登录节点137与训练指标读取
+
+`137` 表示进程被SIGKILL终止，不能仅据此判定OOM或检查点损坏。完整校验已使用CPU mmap和1MiB流式SHA；不要关闭哈希绕过失败。改在单节点、单task、64G主机内存的CPU Slurm作业内调用 `require_checkpoint(run, 8, 4)`，无需GPU。64G是诊断申请，实际容量以Slurm State、MaxRSS和 `/usr/bin/time -v` 为证据。
+
+读取指标使用 `python -u -m tools.ttn_training_metrics "$FORMAL_RUN"`。它逐行读取源实验和正式目录的train.jsonl，即时打印step概览，只保留最新step的小型anchor/参数更新摘要；不加载权重、不累计全部记录。打印“开始读取”及具体路径，使解析失败或进程被终止也留下阶段证据。空日志明确失败，未完整写入行记录提示，缺失指标仍为null。
+
+同时收集指标和完整校验时，两次Python调用分别记录退出码；即便指标读取失败，也继续独立校验，再令batch作业返回非零。不能把输出文件存在或tee成功当作Python成功。`noisy DirectS输出Δ%` 包含当前与历史的总更新，不能当作history/sink独立贡献；内部residual与flow loss也不能代替rollout MSE。
