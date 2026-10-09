@@ -7,9 +7,12 @@ from contextlib import nullcontext
 from datetime import timedelta
 import os
 import ipaddress
+import json
+from pathlib import Path
 import socket
 import subprocess
 import sys
+import time
 import torch
 from torch import distributed as dist
 from .training import TTNTrainingWindow
@@ -113,13 +116,51 @@ def resolve_launch_environment(environ=None):
     if port is not None:
         try: port = int(port)
         except (TypeError, ValueError): raise ValueError("MASTER_PORT must be an integer") from None
-        if not 1 <= port <= 65535: raise ValueError("MASTER_PORT must be between 1 and 65535")
+        automatic = slurm and bool(env.get("TTN_RENDEZVOUS_FILE"))
+        if not (1 <= port <= 65535 or (port == 0 and automatic)):
+            raise ValueError("MASTER_PORT must be between 1 and 65535; automatic Slurm rendezvous alone permits zero")
     if slurm:
         env.update({name: str(value) for name, value in values.items()})
         env.update(MASTER_ADDR=master, MASTER_PORT=str(port))
     return {"launcher": "slurm" if slurm else "env", "rank": rank, "local_rank": local,
             "world_size": world, "node_rank": node_rank, "master_addr": master,
             "master_port": port, "job_id": job_id, "node_list": node_list}
+
+
+def _automatic_tcp_store(launch, path, timeout_seconds):
+    """Bind once, then publish the live server's port to this srun's peers."""
+    from .checkpoint_integrity import atomic_json
+    path = Path(path)
+    if launch["launcher"] != "slurm" or not path.is_absolute() or timeout_seconds <= 0:
+        raise ValueError("automatic rendezvous requires Slurm, an absolute shared path and positive timeout")
+    expected = {"master_addr": launch["master_addr"], "world_size": launch["world_size"],
+                "job_id": launch["job_id"]}
+    options = {"world_size": launch["world_size"], "timeout": timedelta(seconds=timeout_seconds),
+               "wait_for_workers": False, "use_libuv": os.environ.get("USE_LIBUV", "1") != "0"}
+    if launch["rank"] == 0:
+        if path.exists(): raise FileExistsError(f"rendezvous file must be fresh: {path}")
+        # TCPStore holds the socket; probing and closing a free port would race.
+        store = dist.TCPStore(launch["master_addr"], 0, is_master=True, **options)
+        atomic_json({**expected, "port": store.port}, path)
+        return store
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        try:
+            metadata = json.loads(path.read_text(encoding="utf-8"))
+            break
+        except FileNotFoundError:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0: raise TimeoutError(f"timed out waiting for rendezvous publication: {path}")
+            time.sleep(min(0.1, remaining))
+        except json.JSONDecodeError as error:
+            raise ValueError(f"invalid rendezvous publication: {path}") from error
+    if not isinstance(metadata, dict) or any(metadata.get(k) != v for k, v in expected.items()):
+        raise ValueError(f"rendezvous publication differs from this Slurm allocation: {path}")
+    port = metadata.get("port")
+    if type(port) is not int or not 1 <= port <= 65535:
+        raise ValueError(f"invalid rendezvous port in {path}")
+    options["timeout"] = timedelta(seconds=max(0.001, deadline - time.monotonic()))
+    return dist.TCPStore(launch["master_addr"], port, is_master=False, **options)
 
 
 def initialize(mode="auto", device="cuda", *, timeout_seconds=600):
@@ -144,13 +185,22 @@ def initialize(mode="auto", device="cuda", *, timeout_seconds=600):
         torch.cuda.set_device(index)
         device = torch.device("cuda", index)
     if world > 1 and not dist.is_initialized():
+        published = os.environ.get("TTN_RENDEZVOUS_FILE")
+        if launch["launcher"] == "slurm" and published:
+            store = _automatic_tcp_store(launch, published, timeout_seconds)
+            launch["master_port"] = store.port
+            os.environ["MASTER_PORT"] = str(store.port)
+            rendezvous = {"store": store}
+        else:
+            rendezvous = {"init_method": "env://"}
         if rank == 0:
             print(f"[TTN init] host={socket.gethostname()} rank=0 local_rank={launch['local_rank']} "
                   f"world_size={world} device={device} master={launch['master_addr']}:{launch['master_port']} "
                   f"timeout={timeout_seconds}s", flush=True)
         options = {"device_id": device} if device.type == "cuda" else {}
-        dist.init_process_group(backend="nccl" if device.type == "cuda" else "gloo", init_method="env://",
-                                rank=rank, world_size=world, timeout=timedelta(seconds=timeout_seconds), **options)
+        dist.init_process_group(backend="nccl" if device.type == "cuda" else "gloo",
+                                rank=rank, world_size=world, timeout=timedelta(seconds=timeout_seconds),
+                                **rendezvous, **options)
     if dist.is_initialized() and (dist.get_rank(), dist.get_world_size()) != (rank, world):
         raise ValueError("initialized process group disagrees with launcher rank/world size")
     return mode, device

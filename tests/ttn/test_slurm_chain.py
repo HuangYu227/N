@@ -87,7 +87,7 @@ def complete(run, step, world=4):
 def test_submission_preserves_training_and_does_not_inherit_old_allocation(chain, plan, monkeypatch, world):
     if world is not None: plan["world_size"] = world
     expected_world = world or 4
-    for key in ("SLURM_JOB_ID", "SLURM_NTASKS", "SBATCH_ARRAY_INX", "MASTER_ADDR", "MASTER_PORT",
+    for key in ("SLURM_JOB_ID", "SLURM_NTASKS", "SBATCH_ARRAY_INX", "MASTER_ADDR", "MASTER_PORT", "TTN_RENDEZVOUS_FILE",
                 "CUDA_VISIBLE_DEVICES", "RANK", "BATCH_FILE", "BASE_WEIGHTS", "CONFIG", "UNFREEZE", "DIAGNOSTIC_UNMASK_ALL_VALID",
                 "TTN_ENTRY_MODULE", "META_TEST_OUTPUT"):
         monkeypatch.setenv(key, "stale")
@@ -104,7 +104,7 @@ def test_submission_preserves_training_and_does_not_inherit_old_allocation(chain
         assert flag in cmd
     env = kw["env"]
     assert not any(name.startswith(("SLURM_", "SBATCH_")) for name in env)
-    for key in ("MASTER_ADDR", "MASTER_PORT", "CUDA_VISIBLE_DEVICES", "RANK", "BATCH_FILE", "BASE_WEIGHTS", "CONFIG", "UNFREEZE", "DIAGNOSTIC_UNMASK_ALL_VALID",
+    for key in ("MASTER_ADDR", "MASTER_PORT", "TTN_RENDEZVOUS_FILE", "CUDA_VISIBLE_DEVICES", "RANK", "BATCH_FILE", "BASE_WEIGHTS", "CONFIG", "UNFREEZE", "DIAGNOSTIC_UNMASK_ALL_VALID",
                 "TTN_ENTRY_MODULE", "META_TEST_OUTPUT"):
         assert key not in env
     assert env["ADAPTER"] == str(Path(plan["source"]) / "last.pt")

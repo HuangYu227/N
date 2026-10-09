@@ -134,3 +134,32 @@ cd "$PROJECT_ROOT"
 此处eval_cases=1用于与原固定case趋势衔接，不足以做泛化结论。正式科研结论需再加独立scene/seed并核对训练集重叠，报告MSE、视觉collapse位置、运动/回访、GPU-hours和latent exposure。
 
 长期保留模型25/50/100/250/最终500；每25step评估日志保留。非关键评估模型仅在评估成功且汇总一致后释放，被固定引用或失败的快照保留。代码不清理旧实验。磁盘要求以保存器当次打印的 `required_free_bytes` 为准，还要给两套bundle和长期关键点留空间；内存缓存不是持久磁盘文件。
+
+## 6. 通信端口占用与原目录恢复
+
+`423688` 在 `init_process_group` 之前遇到 `MASTER_PORT=38688 / EADDRINUSE`，没有开始 step9。训练启动器默认不再从 job ID 推算端口：rank0 的 TCPStore 直接绑定系统分配的端口并持有 socket，再原子发布到本次 allocation 唯一的共享文件。其他 rank 校验 job/address/world 后连接；不存在探测空端口后关闭再绑定的竞态。batch 的 `[TTN Slurm]` 会先显示 `MASTER_PORT=0`，实际端口见 `[TTN init]` 和 `distributed.json`。
+
+每段使用新的 `.rendezvous-JOB.XXXXXX/endpoint.json`，包括 requeue。这个小文件只记录通信地址，不是模型状态；恢复身份、数学和随机种子不变。显式 `MASTER_PORT` 仍走原 `env://`，占用时直接失败，不抢占其他进程。登录终端提交前 `unset MASTER_ADDR MASTER_PORT TTN_RENDEZVOUS_FILE`，让默认路径生效。
+
+更新代码前确认该目录的训练/评估均停止。只用 `git diff --quiet` 与 `git diff --cached --quiet` 检查 tracked 改动；不要因为 untracked Slurm 日志而删除文件。显式 fetch 分支，再 `git merge --ff-only`，不 reset 工作目录。
+
+先用既有 `tools/ttn_slurm_train.sbatch` 提交四卡 `COMMAND=distributed-check PARALLEL=fsdp2`（short，10分钟，每节点8G）；它不载入训练模型。成功时 `distributed.json` 必须记录四个不同节点、backend=nccl、all_reduce_sum=10。
+
+恢复复用原 `FORMAL_RUN/chain.json`，不要另建正式训练目录：
+
+```python
+from pathlib import Path
+import json, os
+from tools.ttn_slurm_chain import require_checkpoint, submit
+run = Path(os.environ["FORMAL_RUN"]).resolve()
+manifest = run / "chain.json"
+plan = json.loads(manifest.read_text())
+assert Path(plan["output"]).resolve() == run and plan["world_size"] == 4
+assert plan["target_step"] == 500
+require_checkpoint(run, 8, 4)  # 完整 SHA/model/分片及训练记录审计
+job = submit(plan, manifest, 8, dependency=os.environ["PROBE_JOB"])
+```
+
+这段仅用于已确认最后保存为step8、该链没有活动作业的恢复；执行前从 `jobs.jsonl` 与 `squeue` 排除重复提交。`afterok` 让通信检查失败时训练不启动；成功后从step9恢复原模型、Adam、RNG和游标，再沿用500step自动链与评估设置。真实模型的 bitwise 连续/恢复对照仍需要独立测量，通信检查不能代替它。
+
+当时可用59GiB，保存器最低预算约47.63GiB，余量很小。原目录继续保留最新两套bundle；25/50/100/250等长期模型点还会新增占用，不能据此保证500step磁盘够用。删除旧实验前另外核对依赖；此修复不删除权重或日志。

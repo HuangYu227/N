@@ -55,7 +55,10 @@ if [[ -z "${MASTER_ADDR:-}" ]]; then
   MASTER_ADDR="$("$PYTHON" -c 'import socket, sys; print(socket.gethostbyname(sys.argv[1]))' "$master_node")"
 fi
 export MASTER_ADDR
-export MASTER_PORT="${MASTER_PORT:-$((15000 + SLURM_JOB_ID % 40000))}"
+automatic_rendezvous=0
+if [[ -z "${MASTER_PORT:-}" ]]; then automatic_rendezvous=1; MASTER_PORT=0; fi
+export MASTER_PORT
+unset TTN_RENDEZVOUS_FILE
 # Each new allocation gets fresh global ranks from srun, not inherited launch variables.
 unset RANK LOCAL_RANK WORLD_SIZE NODE_RANK LOCAL_WORLD_SIZE
 export DISABLE_XFORMERS=1
@@ -77,6 +80,11 @@ default_timeout=600
 printf '[TTN Slurm] job=%s nodes=%s master_node=%s MASTER_ADDR=%s MASTER_PORT=%s command=%s parallel=%s\n' \
   "$SLURM_JOB_ID" "$node_list" "${master_node:-explicit}" "$MASTER_ADDR" "$MASTER_PORT" "$command" "$parallel"
 export OUTPUT="${OUTPUT:-$project_root/output/worldttn/slurm-${SLURM_JOB_ID}-${STAGE:-A}}"
+if [[ "$automatic_rendezvous" == 1 ]]; then
+  mkdir -p "$OUTPUT"
+  rendezvous_root="$(cd "$OUTPUT" && pwd)"
+  export TTN_RENDEZVOUS_FILE="$(mktemp -d "$rendezvous_root/.rendezvous-${SLURM_JOB_ID}.XXXXXX")/endpoint.json"
+fi
 args=("$command" --parallel "$parallel" --distributed-timeout "${DISTRIBUTED_TIMEOUT:-$default_timeout}"
       --seed "${SEED:-3407}" --output "$OUTPUT")
 case "$command" in

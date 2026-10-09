@@ -90,7 +90,7 @@ def test_partial_slurm_environment_and_batch_shell(monkeypatch):
 def install_environment(monkeypatch, values):
     for name in list(os.environ):
         if name.startswith("SLURM_") or name in ("RANK", "LOCAL_RANK", "WORLD_SIZE", "NODE_RANK",
-                                                 "LOCAL_WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT"):
+                                                 "LOCAL_WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT", "TTN_RENDEZVOUS_FILE"):
             monkeypatch.delenv(name)
     for name, value in values.items(): monkeypatch.setenv(name, value)
 
@@ -111,6 +111,25 @@ def test_slurm_initialize_binds_gpu_zero_before_nccl(monkeypatch):
     assert (options["rank"], options["world_size"]) == (2, 3)
     assert options["timeout"].total_seconds() == 123
     assert options["device_id"] == torch.device("cuda:0")
+
+
+def test_slurm_automatic_port_passes_live_store_and_reports_bound_port(monkeypatch, tmp_path):
+    from worldttn import distributed
+    path = str(tmp_path / "endpoint.json")
+    install_environment(monkeypatch, {**slurm_env(1), "MASTER_PORT": "0", "TTN_RENDEZVOUS_FILE": path})
+    calls = []
+    store = SimpleNamespace(port=45678)
+    def automatic(launch, published, timeout):
+        assert launch["master_port"] == 0 and published == path and timeout == 123
+        return store
+    monkeypatch.setattr(distributed, "_automatic_tcp_store", automatic, raising=False)
+    monkeypatch.setattr(distributed.dist, "is_initialized", lambda: False)
+    monkeypatch.setattr(distributed.dist, "init_process_group", lambda **kwargs: calls.append(kwargs))
+    mode, device = distributed.initialize("auto", "cpu", timeout_seconds=123)
+    assert mode == "ddp" and device.type == "cpu"
+    assert calls[0]["store"] is store and "init_method" not in calls[0]
+    assert os.environ["MASTER_PORT"] == "45678"
+    assert distributed.resolve_launch_environment()["master_port"] == 45678
 
 
 @pytest.mark.parametrize("count", [0, 2])
@@ -383,7 +402,7 @@ def test_sbatch_executes_one_srun_with_shared_master_and_preserves_gpu_mask(tmp_
     writer = tmp_path / "capture.py"
     writer.write_text("import json, os, sys\nfrom pathlib import Path\n"
                       "Path(os.environ['CAPTURE']).write_text(json.dumps({'args': sys.argv[1:], 'env': "
-                      "{k: os.environ.get(k) for k in ('MASTER_ADDR', 'MASTER_PORT', 'CUDA_VISIBLE_DEVICES', "
+                      "{k: os.environ.get(k) for k in ('MASTER_ADDR', 'MASTER_PORT', 'TTN_RENDEZVOUS_FILE', 'CUDA_VISIBLE_DEVICES', "
                       f"'NCCL_SOCKET_IFNAME', 'NCCL_SOCKET_FAMILY', 'OUTPUT', 'ROOT', 'PYTHON', {', '.join(repr(k) for k in cache_names)})}}}}))\n")
     mock_bin = tmp_path / "bin"
     mock_bin.mkdir()
@@ -409,6 +428,11 @@ def test_sbatch_executes_one_srun_with_shared_master_and_preserves_gpu_mask(tmp_
                SCRIPT=(root / "tools/ttn_slurm_train.sbatch").as_posix(),
                CUDA_VISIBLE_DEVICES="GPU-slurm-mask", NCCL_SOCKET_IFNAME="=eth-test", STAGE="C")
     env["PYTHON_MODE"] = python_mode
+    explicit_port = command == "distributed-check" and custom_root
+    relative_output = command == "distributed-smoke" and custom_root
+    if relative_output: env["OUTPUT"] = "output/relative-test"
+    env["TTN_RENDEZVOUS_FILE"] = "/stale/previous-allocation.json"
+    if explicit_port: env["MASTER_PORT"] = "32123"
     if python_mode == "base": env["PYTHON"] = "/data/group/zhaolab/project/miniconda/bin/python"
     if command == "train":
         env.update(DATASET_ROOT=(tmp_path / "shared data").as_posix(), ADAPTER=(tmp_path / "last.pt").as_posix(), RESUME="1")
@@ -457,7 +481,21 @@ def test_sbatch_executes_one_srun_with_shared_master_and_preserves_gpu_mask(tmp_
         assert "--cuda-trace" in args and args[args.index("--frames") + 1] == "13"
         assert args[args.index("--tbptt") + 1] == "1" and args[args.index("--stage") + 1] == "C"
     assert ("--diagnostic-unmask-all-valid" in args) == (command == "diagnose-update" and custom_root)
-    assert exported["MASTER_ADDR"] == "10.0.0.1" and exported["MASTER_PORT"] == "27345"
+    assert exported["MASTER_ADDR"] == "10.0.0.1"
+    if explicit_port:
+        assert exported["MASTER_PORT"] == "32123" and exported["TTN_RENDEZVOUS_FILE"] is None
+    else:
+        assert exported["MASTER_PORT"] == "0"
+        def native_path(value):
+            if sys.platform == "win32" and len(value) >= 3 and value[0] == "/" and value[2] == "/":
+                value = value[1] + ":" + value[2:]
+            return Path(value)
+        rendezvous = native_path(exported["TTN_RENDEZVOUS_FILE"])
+        assert rendezvous.is_absolute()
+        assert rendezvous.parent.is_dir() and rendezvous.name == "endpoint.json"
+        output = native_path(exported["OUTPUT"])
+        assert rendezvous.parent.parent == (output if output.is_absolute() else project / output)
+        assert rendezvous.parent.name.startswith(".rendezvous-12345.")
     assert "master_node=ltu-hpc-1" in result.stdout
     assert "--distribution=block" in args
     assert exported["NCCL_SOCKET_FAMILY"] == "AF_INET"
@@ -474,7 +512,7 @@ def test_sbatch_executes_one_srun_with_shared_master_and_preserves_gpu_mask(tmp_
     for name, suffix in zip(cache_names, suffixes):
         assert exported[name] == cache_root + "/.cache" + suffix, name
     assert "[TTN cache]" in result.stdout
-    assert exported["OUTPUT"].endswith("slurm-12345-C")
+    assert exported["OUTPUT"].endswith("relative-test" if relative_output else "slurm-12345-C")
     assert ("--resume" in args) == (command == "train" and not unfreeze)
     assert ("--unfreeze" in args) == unfreeze
     assert ("--dataset-root" in args) == (command == "train")
