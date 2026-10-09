@@ -66,11 +66,12 @@ def test_benchmark_profile_uses_saved_data_and_scope_without_shell_injection(tmp
     from tools.ttn_benchmark_snapshot import benchmark_environment
     (tmp_path / "run_config.json").write_text(json.dumps({"arguments": {
         "seed": 123, "dataset_root": "shared path/$(do-not-run)", "config": "reference.json", "unknown": "unsafe",
-        "ttn_core_backend": "reference", "ttn_psi_backend": "reference"}}))
+        "ttn_core_backend": "reference", "ttn_psi_backend": "reference", "activation_gpu_budget_gib": 4.0}}))
     torch.save({"train_scope": "dit"}, tmp_path / "last.pt")
     env = benchmark_environment(tmp_path)
     assert env["TRAIN_SCOPE"] == "dit" and env["SEED"] == "123" and "unknown" not in env
     assert "TTN_CORE_BACKEND" not in env and "TTN_PSI_BACKEND" not in env
+    assert "ACTIVATION_GPU_BUDGET_GIB" not in env
     assert shlex.split(shlex.quote(env["DATASET_ROOT"])) == ["shared path/$(do-not-run)"]
 
 

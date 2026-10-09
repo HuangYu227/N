@@ -173,3 +173,17 @@ job = submit(plan, manifest, 8, dependency=os.environ["PROBE_JOB"])
 读取指标使用 `python -u -m tools.ttn_training_metrics "$FORMAL_RUN"`。它逐行读取源实验和正式目录的train.jsonl，即时打印step概览，只保留最新step的小型anchor/参数更新摘要；不加载权重、不累计全部记录。打印“开始读取”及具体路径，使解析失败或进程被终止也留下阶段证据。空日志明确失败，未完整写入行记录提示，缺失指标仍为null。
 
 同时收集指标和完整校验时，两次Python调用分别记录退出码；即便指标读取失败，也继续独立校验，再令batch作业返回非零。不能把输出文件存在或tee成功当作Python成功。`noisy DirectS输出Δ%` 包含当前与历史的总更新，不能当作history/sink独立贡献；内部residual与flow loss也不能代替rollout MSE。
+
+## 8. GPU／CPU 混合保存：只改变张量存放位置
+
+`--activation-offload cpu --activation-gpu-budget-gib 4` 为每个 TBPTT window 设置最多4GiB的累计GPU保存预算；超出预算的张量继续走原生 pinned CPU packing。默认预算0保持原行为。Slurm对应变量是 `ACTIVATION_GPU_BUDGET_GIB=4`，`ttn_slurm_chain fresh/start` 接受同名CLI参数，后续作业通过chain.json继承预算。`start` 未指定时继承源任务预算，显式0恢复全CPU保存；现有chain需要更新 `chain.json["environment"]["ACTIVATION_GPU_BUDGET_GIB"]` 后再提交，不能只修改登录shell的变量。更新前核对该代码目录没有运行中的训练或评估，避免在同一任务执行途中改变代码或预算。
+
+GPU副本独立于FSDP的临时all-gather storage，并使用与原生pinned CPU副本相同的连续布局。不改变TTN公式、精度、训练长度、TBPTT、history protocol、随机数、optimizer或state/cache提交；复制时的detach只用于autograd的saved-tensor存储，原始S/inner-update计算图仍保留。预算与既有activation_offload一样属于存储设置，不进入算法resume identity；实际设置记录在run_config、execution和各rank训练日志中。
+
+4GiB是初始候选预算，不是已经实测的最佳值；之前三卡显存估计约29–31GiB，把额外保存量限制为4GiB是为了接近35GiB并留出反向和通信余量。预算限制累计张量payload，不能保证整个训练峰值不超过35GiB；CUDA allocator取整、NCCL、workspace、重计算及optimizer临时分配不在预算内。CPU pinned allocator保留的缓存也可能使RSS下降小于搬移量。不要在没有测量时降低Slurm主机内存申请。
+
+用 `python -u -m tools.ttn_training_metrics "$RUN"` 同时查看实际显存峰值、采样RSS和累计GPU/CPU复制量。`gpu_packed_tensor_bytes/cpu_packed_tensor_bytes`在每个TBPTT窗口重置，不能当作当前活跃内存；默认0的旧日志缺失字段继续记null。
+
+单卡门槛是 `tests/ttn/test_mixed_offload.py`：覆盖强制CPU溢出、独立副本、原权重storage释放、窗口释放、loss/grad/gradgrad、真实anchor和FFN/text checkpoint的更新对照。多卡入口新增独立的 `test_proximal_fsdp_mixed_offload_matches_cpu`，用4KiB预算强制同时走两条路径，对齐模型、梯度、Adam、RNG与runtime；与其他case使用不同srun进程。小模型通过后，完整三卡121latent的首个稳定optimizer step仍须核对真实峰值与RSS，不能用本地RTX4050结果替代A100容量实测。
+
+本次本地验证：Torch2.5.1+cu121／RTX4050的混合保存测试36 passed，包含25latent／TBPTT4的Proximal DirectS生成历史，完整对齐参数、梯度、Adam、RNG、S、缓存与窗口截断。Torch2.11 CPU下混合保存16 passed／20 CUDA skipped；原训练与重计算回归62 passed，CLI／Slurm接入214 passed，快照8 passed，流式指标4 passed。CPU分布式及Bash检查在获准的本地测试环境通过；LTU Torch2.9.1／多节点CUDA的新增对照及完整模型容量尚未执行。

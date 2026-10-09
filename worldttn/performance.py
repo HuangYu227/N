@@ -46,6 +46,8 @@ def execution_report(model):
     if cfg is not None and cfg.memory_update == "proximal": implementation = "disabled_proximal_s"
     return {**asdict(options), "psi_implementation": implementation, "triton_available": False,
             "activation_checkpointing": getattr(model, "ttn_activation_checkpointing", "none"),
+            "activation_offload": getattr(model, "ttn_activation_offload", "none"),
+            "activation_gpu_budget_gib": getattr(model, "ttn_activation_gpu_budget_gib", 0.0),
             "state_update": "live_proximal_s" if cfg is not None and cfg.memory_update == "proximal" else "delta"}
 
 

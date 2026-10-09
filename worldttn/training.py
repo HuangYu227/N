@@ -73,40 +73,69 @@ def generate_history_chunk(session, initial_noise, observed, y, context, cache, 
     return x
 
 
-def activation_storage(mode, *, device=None, audit=None):
-    """Copy saved tensors to host before FSDP resharding; never replay TTN forwards.
+def activation_storage(mode, *, device=None, audit=None, gpu_budget_gib=0.):
+    """Snapshot saved tensors before FSDP resharding; never replay TTN forwards.
 
     Native save_on_cpu copies values (including weight views) during forward,
     so backward does not retain/read freed FSDP all-gather storage. FSDP's own
     parameter hooks still unshard and reduce the actual parameter gradients.
+    A GPU budget keeps independent copies with the same contiguous layout as
+    native pinned CPU packing. Its cumulative cap resets each TBPTT window;
+    allocator, communication and backward workspace are outside this budget.
     """
+    if mode not in ("none", "cpu"): raise ValueError("activation_offload must be none or cpu")
+    if (isinstance(gpu_budget_gib, bool) or not isinstance(gpu_budget_gib, (int, float))
+            or not math.isfinite(gpu_budget_gib) or gpu_budget_gib < 0):
+        raise ValueError("activation GPU budget must be finite and nonnegative")
+    if gpu_budget_gib and mode != "cpu":
+        raise ValueError("activation GPU budget requires cpu offload")
     if mode == "none": return nullcontext()
     if mode == "cpu":
         # CPU tensors already live on the host. Pinned packing would only
         # change their strides and can change backward rounding on GPU hosts.
         if device is not None and torch.device(device).type == "cpu": return nullcontext()
         storage = torch.autograd.graph.save_on_cpu(pin_memory=True)
-        if audit is not None:
+        if audit is not None or gpu_budget_gib:
             pack = storage.pack_hook
+            budget = (int(gpu_budget_gib) * (1 << 30)
+                      + int((gpu_budget_gib % 1) * (1 << 30)))
+            spent = 0
             def record(tensor):
-                packed = pack(tensor)
-                key = (str(tensor.device), str(tensor.dtype), tuple(tensor.shape),
-                       tuple(tensor.stride()), tensor.element_size())
-                audit[key] += 1
+                nonlocal spent
+                size = tensor.numel() * tensor.element_size()
+                route = "cpu"
+                if (gpu_budget_gib and tensor.device.type == "cuda" and tensor.layout == torch.strided
+                        and size <= budget - spent):
+                    # Match native pinned CPU packing's layout; snapshot FSDP weight views before reshard.
+                    packed = (tensor.device, tensor.detach().clone(memory_format=torch.contiguous_format))
+                    spent += size
+                    route = "gpu"
+                else:
+                    packed = pack(tensor)
+                if audit is not None:
+                    key = (str(tensor.device), str(tensor.dtype), tuple(tensor.shape),
+                           tuple(tensor.stride()), tensor.element_size())
+                    if gpu_budget_gib: key += (route,)
+                    audit[key] += 1
                 return packed
             storage.pack_hook = record
         return storage
-    raise ValueError("activation_offload must be none or cpu")
 
 
 def activation_storage_stats(audit):
-    """Cumulative native pack payload per window, not live bytes or host RSS."""
+    """Cumulative saved-tensor copy payload per window, not live bytes or host RSS."""
     sizes = [(math.prod(key[2]) * key[4] * count, key, count) for key, count in audit.items()]
-    return {"pack_calls": sum(audit.values()), "packed_tensor_bytes": sum(row[0] for row in sizes),
+    gpu_sizes = [row for row in sizes if len(row[1]) > 5 and row[1][5] == "gpu"]
+    gpu_bytes = sum(row[0] for row in gpu_sizes)
+    total_bytes = sum(row[0] for row in sizes)
+    return {"pack_calls": sum(audit.values()), "packed_tensor_bytes": total_bytes,
+            "gpu_packed_tensor_bytes": gpu_bytes, "cpu_packed_tensor_bytes": total_bytes - gpu_bytes,
+            "gpu_pack_calls": sum(row[2] for row in gpu_sizes),
             "largest_shapes": [{"bytes": size, "count": count, "device": key[0], "dtype": key[1],
-                                "shape": list(key[2]), "stride": list(key[3])}
+                                "shape": list(key[2]), "stride": list(key[3]),
+                                "saved_on": key[5] if len(key) > 5 else "cpu"}
                                for size, key, count in sorted(sizes, reverse=True)[:8]],
-            "measurement": "TBPTT-window cumulative native CPU pack payload; not live memory or RSS"}
+            "measurement": "TBPTT-window cumulative saved-tensor copy payload; not live memory or RSS"}
 
 
 def _memory_phase(callback, phase, **info):
@@ -306,11 +335,12 @@ def train_clip(model,
                window_model=None,
                parallel=None,
                activation_offload="none",
+               activation_gpu_budget_gib=0.,
                memory_callback=None,
                audit_update=False,
                history_training=None):
     if tbptt not in (1, 2, 4): raise ValueError("reference TBPTT supports K=1,2,4")
-    if activation_offload not in ("none", "cpu"): raise ValueError("activation_offload must be none or cpu")
+    activation_storage(activation_offload, device="cpu", gpu_budget_gib=activation_gpu_budget_gib)
     b, _, frames, _, _ = clean.shape
     history = history_settings(history_training if history_training is not None
                                else getattr(model, "ttn_history_training", None))
@@ -371,7 +401,8 @@ def train_clip(model,
                              cache_enabled=False) if parallel is not None and parallel.mode == "fsdp2" else nullcontext()
         # DDP no_sync still encloses both forward and backward. CPU storage
         # preserves the full window's S/optional Persistent-meta graph.
-        with sync, amp, activation_storage(activation_offload, device=clean.device, audit=offload_audit):
+        with sync, amp, activation_storage(activation_offload, device=clean.device, audit=offload_audit,
+                                           gpu_budget_gib=activation_gpu_budget_gib):
             loss = runner(episode, first, last, on_prediction=on_prediction)
             _memory_phase(memory_callback, "backward_begin", first=first, last=last)
             from .performance import DEFAULT_EXECUTION, annotation

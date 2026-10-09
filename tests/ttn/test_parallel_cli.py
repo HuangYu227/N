@@ -119,12 +119,14 @@ def test_parallel_cli_help_does_not_import_cuda_sana():
     result = subprocess.run([sys.executable, "-m", "worldttn.cli", "--help"], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     for option in ("--parallel", "--dataset-root", "--text-encoder-device", "distributed-smoke",
-                   "distributed-check", "diagnose-update", "--cuda-trace", "--cross-attn-backend", "--distributed-timeout", "--activation-offload", "--memory-trace"):
+                   "distributed-check", "diagnose-update", "--cuda-trace", "--cross-attn-backend", "--distributed-timeout",
+                   "--activation-offload", "--activation-gpu-budget-gib", "--memory-trace"):
         assert option in result.stdout
 
 
 @pytest.mark.parametrize("fail", [False, True])
-def test_real_cli_update_uses_offload_and_reports_memory_phases(monkeypatch, capsys, fail):
+@pytest.mark.parametrize("gpu_budget", [0.0, 1.0])
+def test_real_cli_update_uses_offload_and_reports_memory_phases(monkeypatch, capsys, fail, gpu_budget):
     from types import ModuleType, SimpleNamespace
     from test_training import TinyWorldModel, inputs
     from worldttn import cli
@@ -142,7 +144,14 @@ def test_real_cli_update_uses_offload_and_reports_memory_phases(monkeypatch, cap
     def loss_fn(*args, **kwargs):
         if fail: raise torch.OutOfMemoryError("memory probe")
         return linear_flow_loss(*args, **kwargs)
-    engine = ParallelTraining(model, loss_fn, activation_offload="cpu", memory_trace=True)
+    engine = ParallelTraining(model, loss_fn, activation_offload="cpu",
+                              activation_gpu_budget_gib=gpu_budget, memory_trace=True)
+    train_clip = cli.train_clip
+    def capture(*args, **kwargs):
+        assert kwargs["activation_offload"] == "cpu"
+        assert kwargs["activation_gpu_budget_gib"] == gpu_budget
+        return train_clip(*args, **kwargs)
+    monkeypatch.setattr(cli, "train_clip", capture)
     batch = {"clean_latents": clean, "y": torch.zeros(1, 1, 2, 8), "camera_conditions": camera,
              "width": 100, "height": 100}
     if fail:
@@ -153,10 +162,13 @@ def test_real_cli_update_uses_offload_and_reports_memory_phases(monkeypatch, cap
     else:
         result = cli.train_update(model, SimpleNamespace(), batch, make_optimizer(model), 2, engine)
         assert result["activation_offload"] == "cpu"
+        assert result["activation_gpu_budget_gib"] == gpu_budget
         records = result["memory_phases"]
         assert records[0]["phase"] == "prefill_begin" and records[-1]["phase"] == "optimizer_end"
         assert len(capsys.readouterr().out.splitlines()) == len(records)
     assert all(record["rank"] == 0 and record["activation_offload"] == "cpu" for record in records)
+    assert all(record["activation_gpu_budget_gib"] == gpu_budget for record in records)
+    assert cli.execution_report(model)["activation_gpu_budget_gib"] == gpu_budget
 
 
 def test_offload_policy_validation_precedes_parallel_initialization():
@@ -166,6 +178,22 @@ def test_offload_policy_validation_precedes_parallel_initialization():
     with pytest.raises(ValueError, match="none or cpu"): activation_storage("disk")
     with pytest.raises(ValueError, match="at least two|initialized multi|requires.*group"):
         ParallelTraining(TinyWorldModel(), linear_flow_loss, "fsdp2", activation_offload="cpu")
+
+
+@pytest.mark.parametrize("budget,offload", [(-1, "cpu"), (float("nan"), "cpu"),
+                                          (float("inf"), "cpu"), (1, "none")])
+def test_activation_budget_validation_precedes_cuda_and_parallel_setup(budget, offload, capsys):
+    from worldttn import cli
+    from worldttn.distributed import ParallelTraining
+    from worldttn.training import linear_flow_loss
+    from test_training import TinyWorldModel
+    with pytest.raises(ValueError, match="budget|gpu_budget"):
+        ParallelTraining(TinyWorldModel(), linear_flow_loss, "fsdp2", activation_offload=offload,
+                         activation_gpu_budget_gib=budget)
+    with pytest.raises(SystemExit) as error:
+        cli.main(["train", "--activation-offload", offload, "--activation-gpu-budget-gib", str(budget)])
+    assert error.value.code == 2
+    assert "budget" in capsys.readouterr().err
 
 
 def test_resume_without_adapter_fails_before_cuda_or_teacher_initialization():

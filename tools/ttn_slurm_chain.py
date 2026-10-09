@@ -21,6 +21,7 @@ PROFILE = {
     "batch_file": "BATCH_FILE", "seed": "SEED", "tbptt": "TBPTT",
     "backbone_lr": "BACKBONE_LR", "text_encoder_device": "TEXT_ENCODER_DEVICE",
     "activation_offload": "ACTIVATION_OFFLOAD", "cross_attn_backend": "CROSS_ATTN_BACKEND",
+    "activation_gpu_budget_gib": "ACTIVATION_GPU_BUDGET_GIB",
     "ttn_core_backend": "TTN_CORE_BACKEND", "ttn_psi_backend": "TTN_PSI_BACKEND",
     "optimizer_policy": "OPTIMIZER_POLICY",
 }
@@ -212,6 +213,12 @@ def start_chain(args):
     source = Path(args.from_run).resolve()
     run = json.loads((source / "run_config.json").read_text(encoding="utf-8"))
     original = run["arguments"]
+    activation_budget = getattr(args, "activation_gpu_budget_gib", None)
+    if activation_budget is None: activation_budget = original.get("activation_gpu_budget_gib", 0.0)
+    if not math.isfinite(activation_budget) or activation_budget < 0:
+        raise ValueError("activation GPU budget must be finite and nonnegative")
+    if activation_budget and original.get("activation_offload", "cpu") != "cpu":
+        raise ValueError("activation GPU budget requires CPU activation offload")
     world = training_world_size(run.get("world_size"))
     requested_world = getattr(args, "world_size", None)
     if requested_world is not None and training_world_size(requested_world) != world:
@@ -250,6 +257,7 @@ def start_chain(args):
     if not python.is_file():
         raise ValueError(f"Existing prefix Python not found: {python}; no environment will be created")
     profile = {key: str(original[name]) for name, key in PROFILE.items() if original.get(name) is not None}
+    profile["ACTIVATION_GPU_BUDGET_GIB"] = str(activation_budget)
     profile.update(ROOT=str(root), PROJECT_ROOT=str(project), PYTHON=str(python), COMMAND="train",
                    PARALLEL="fsdp2", STAGE="C", TRAIN_SCOPE="dit", RESUME="1", MEMORY_TRACE="1",
                    CUDA_TRACE="0", CUDA_LAUNCH_BLOCKING="0", GDN_DISABLE_COMPILE="1",
@@ -274,6 +282,10 @@ def start_chain(args):
 def fresh_chain(args):
     """Start from SANA, warm up visual TTN, then deliberately rebuild joint training."""
     world = training_world_size(getattr(args, "world_size", 4))
+    activation_budget = getattr(args, "activation_gpu_budget_gib", None)
+    if activation_budget is None: activation_budget = 0.0
+    if not math.isfinite(activation_budget) or activation_budget < 0:
+        raise ValueError("activation GPU budget must be finite and nonnegative")
     project = Path(__file__).resolve().parents[1]
     root = Path(os.environ.get("ROOT", project.parent)).resolve()
     python = root / "envs/worldttn/bin/python"
@@ -302,6 +314,7 @@ def fresh_chain(args):
                "OPTIMIZER_POLICY": "origin",
                "SEED": str(args.seed), "TBPTT": str(args.tbptt), "BACKBONE_LR": str(args.backbone_lr),
                "ACTIVATION_OFFLOAD": "cpu", "TEXT_ENCODER_DEVICE": "cpu", "CROSS_ATTN_BACKEND": "math",
+               "ACTIVATION_GPU_BUDGET_GIB": str(activation_budget),
                "MEMORY_TRACE": "1", "CUDA_TRACE": "0", "CUDA_LAUNCH_BLOCKING": "0",
                "GDN_DISABLE_COMPILE": "1", "GDN_DISABLE_COMPLEX_COMPILE": "0", "DISTRIBUTED_TIMEOUT": "1800"}
     if args.base_weights: profile["BASE_WEIGHTS"] = args.base_weights
@@ -410,6 +423,8 @@ def main():
     fresh.add_argument("--tbptt", type=int, choices=(1, 2, 4), default=2)
     fresh.add_argument("--backbone-lr", type=float, default=1e-6)
     for command in (start, fresh):
+        command.add_argument("--activation-gpu-budget-gib", type=float,
+                             help="saved activation GPU budget in GiB; start inherits source, fresh defaults to zero")
         command.add_argument("--time-limit", default="01:00:00", help="Slurm wall time per training/evaluation allocation")
         command.add_argument("--memory", default="256G", help="Slurm host memory per training node")
         command.add_argument("--eval-every", type=int, default=25, help="immutable fixed-case evaluation cadence; zero disables")

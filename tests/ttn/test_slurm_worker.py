@@ -26,7 +26,7 @@ def worker_setup(tmp_path):
         "names = ('ROOT', 'HF_HOME', 'PIP_CACHE_DIR', 'TORCH_HOME', 'PYTHON', 'CUDA_VISIBLE_DEVICES', "
         "'TORCHINDUCTOR_CACHE_DIR', 'TRITON_CACHE_DIR', 'TORCH_EXTENSIONS_DIR', 'CUDA_CACHE_PATH', "
         "'TORCHINDUCTOR_COMPILE_THREADS', 'TMPDIR', 'TMP', 'TEMP', 'PYTHONPYCACHEPREFIX', "
-        "'GDN_DISABLE_COMPILE', 'GDN_DISABLE_COMPLEX_COMPILE', 'CUDA_LAUNCH_BLOCKING')\n"
+        "'GDN_DISABLE_COMPILE', 'GDN_DISABLE_COMPLEX_COMPILE', 'CUDA_LAUNCH_BLOCKING', 'ACTIVATION_GPU_BUDGET_GIB')\n"
         "record = {k: os.environ[k] for k in names}\n"
         "for k in ('TMPDIR', 'PYTHONPYCACHEPREFIX', 'TORCHINDUCTOR_CACHE_DIR', 'TRITON_CACHE_DIR', 'TORCH_EXTENSIONS_DIR', 'CUDA_CACHE_PATH'):\n"
         "    p = Path(record[k]); assert p.is_dir(); (p / 'generated.py').write_text('compile scratch')\n"
@@ -54,6 +54,7 @@ def worker_setup(tmp_path):
                TMPDIR="/shared/old/tmp", TMP="/shared/old/tmp", TEMP="/shared/old/tmp",
                PYTHONPYCACHEPREFIX="/shared/old/pycache")
     env.pop("TORCHINDUCTOR_COMPILE_THREADS", None)
+    env.pop("ACTIVATION_GPU_BUDGET_GIB", None)
     for name in ("GDN_DISABLE_COMPILE", "GDN_DISABLE_COMPLEX_COMPILE", "CUDA_LAUNCH_BLOCKING"):
         env.pop(name, None)
     # Use Git Bash's native path conversion so Windows Python can inspect the
@@ -118,14 +119,16 @@ def test_proximal_meta_launcher_selects_tests_and_rejects_invalid_topology(
         assert len(records) == 1
         tests = [arg for arg in records[0]["args"] if arg.startswith("tests/")]
         assert "tests/ttn/test_proximal_device.py" in tests and "tests/ttn/test_proximal_runtime.py" in tests
+        assert "tests/ttn/test_mixed_offload.py" in tests
         assert "tests/ttn/test_meta_cuda.py" not in tests
         return
     expected = [
         "tests/ttn/test_proximal_cuda.py::test_proximal_fsdp_cache_only_future_credit[live-cache]",
         "tests/ttn/test_proximal_cuda.py::test_proximal_fsdp_cache_only_future_credit[detached-cache-control]",
         "tests/ttn/test_proximal_cuda.py::test_proximal_fsdp_offload_and_exact_resume",
+        "tests/ttn/test_proximal_cuda.py::test_proximal_fsdp_mixed_offload_matches_cpu",
     ]
-    assert len(records) == (2 if fail_second else 3), "failed cases must stop the remaining acceptance steps"
+    assert len(records) == (2 if fail_second else 4), "failed cases must stop the remaining acceptance steps"
     assert len({record["output"] for record in records}) == len(records)
     assert [int(record["port"]) for record in records] == list(
         range(int(records[0]["port"]), int(records[0]["port"])+len(records)))
@@ -153,6 +156,8 @@ def test_worker_uses_fresh_local_compile_files_and_preserves_exit_status(worker_
     for name in ("ROOT", "HF_HOME", "PIP_CACHE_DIR", "TORCH_HOME", "PYTHON", "CUDA_VISIBLE_DEVICES"):
         assert exported[name] == env[name]
     assert exported["TORCHINDUCTOR_COMPILE_THREADS"] == "1"
+    assert exported["ACTIVATION_GPU_BUDGET_GIB"] == "0"
+    assert "ACTIVATION_GPU_BUDGET_GIB=0" in result.stdout
     for name in ("GDN_DISABLE_COMPILE", "GDN_DISABLE_COMPLEX_COMPILE", "CUDA_LAUNCH_BLOCKING"):
         assert exported[name] == "0" and f"{name}=0" in result.stdout
     assert exported["TMP"] == exported["TEMP"] == exported["TMPDIR"]
@@ -171,12 +176,14 @@ def test_worker_passes_compile_and_synchronous_debug_policy_before_python(worker
     bash, script, capture, writer, personal, env = worker_setup
     env.update(GDN_DISABLE_COMPILE="1" if mode == "eager" else "0",
                GDN_DISABLE_COMPLEX_COMPILE="1" if mode == "complex-eager" else "0",
-               CUDA_LAUNCH_BLOCKING="1")
+               CUDA_LAUNCH_BLOCKING="1", ACTIVATION_GPU_BUDGET_GIB="2.5")
     result = subprocess.run([str(bash), str(script), "distributed-smoke", "--stages", "A"],
                             env=env, capture_output=True, text=True,
                             encoding="utf-8", errors="replace", timeout=30)
     assert result.returncode == 0, result.stderr
     exported = json.loads(capture.read_text())["env"]
+    assert exported["ACTIVATION_GPU_BUDGET_GIB"] == "2.5"
+    assert "ACTIVATION_GPU_BUDGET_GIB=2.5" in result.stdout
     for name in ("GDN_DISABLE_COMPILE", "GDN_DISABLE_COMPLEX_COMPILE", "CUDA_LAUNCH_BLOCKING"):
         assert exported[name] == env[name] and f"{name}={env[name]}" in result.stdout
 

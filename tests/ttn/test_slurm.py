@@ -441,6 +441,8 @@ def test_sbatch_executes_one_srun_with_shared_master_and_preserves_gpu_mask(tmp_
     env.pop("PARALLEL", None)
     env.pop("CROSS_ATTN_BACKEND", None)
     env.pop("DIAGNOSTIC_UNMASK_ALL_VALID", None)
+    env.pop("ACTIVATION_GPU_BUDGET_GIB", None)
+    if custom_root: env["ACTIVATION_GPU_BUDGET_GIB"] = "2.5"
     if command == "diagnose-update":
         env["CUDA_TRACE"] = "1"
         env["CROSS_ATTN_BACKEND"] = "flash" if custom_root else "math"
@@ -469,9 +471,11 @@ def test_sbatch_executes_one_srun_with_shared_master_and_preserves_gpu_mask(tmp_
     assert f"parallel={expected_parallel}" in result.stdout
     if command in ("train", "distributed-smoke", "diagnose-update"):
         assert args[args.index("--activation-offload") + 1] == "cpu" and "--memory-trace" in args
+        assert args[args.index("--activation-gpu-budget-gib") + 1] == env.get("ACTIVATION_GPU_BUDGET_GIB", "0")
         assert args[args.index("--cross-attn-backend") + 1] == env.get("CROSS_ATTN_BACKEND", "auto")
     else:
         assert "--activation-offload" not in args and "--memory-trace" not in args
+        assert "--activation-gpu-budget-gib" not in args
     if command == "train":
         assert args[args.index("--train-scope") + 1] == env["TRAIN_SCOPE"]
         assert args[args.index("--backbone-lr") + 1] == "2e-6"

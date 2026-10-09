@@ -22,7 +22,7 @@ def benchmark_environment(snapshot):
     args = json.loads((snapshot / "run_config.json").read_text(encoding="utf-8"))["arguments"]
     payload = torch.load(snapshot / "last.pt", map_location="cpu", weights_only=False, mmap=True)
     # These are the benchmark's independent variable, not the saved training problem.
-    execution = {"ttn_core_backend", "ttn_psi_backend"}
+    execution = {"ttn_core_backend", "ttn_psi_backend", "activation_gpu_budget_gib"}
     profile = {env: str(args[name]) for name, env in PROFILE.items()
                if name not in execution and args.get(name) is not None}
     profile["TRAIN_SCOPE"] = payload.get("train_scope", "ttn")

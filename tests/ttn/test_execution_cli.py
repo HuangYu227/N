@@ -145,6 +145,8 @@ def test_training_identity_records_backend_for_formal_and_benchmark_runs():
                            ttn_core_backend="reuse", ttn_psi_backend="projected")
     identity = _training_identity(args, SimpleNamespace(scheduler=CPUFlowConfig()), {}, 2)
     assert identity["execution"] == {"core_backend": "reuse", "psi_backend": "projected"}
+    args.activation_offload, args.activation_gpu_budget_gib = "cpu", 2.5
+    assert _training_identity(args, SimpleNamespace(scheduler=CPUFlowConfig()), {}, 2) == identity
 
 
 @pytest.mark.parametrize("kind", ["throughput", "profile", "layouts"])

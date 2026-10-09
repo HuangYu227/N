@@ -89,7 +89,7 @@ def test_submission_preserves_training_and_does_not_inherit_old_allocation(chain
     expected_world = world or 4
     for key in ("SLURM_JOB_ID", "SLURM_NTASKS", "SBATCH_ARRAY_INX", "MASTER_ADDR", "MASTER_PORT", "TTN_RENDEZVOUS_FILE",
                 "CUDA_VISIBLE_DEVICES", "RANK", "BATCH_FILE", "BASE_WEIGHTS", "CONFIG", "UNFREEZE", "DIAGNOSTIC_UNMASK_ALL_VALID",
-                "TTN_ENTRY_MODULE", "META_TEST_OUTPUT"):
+                "TTN_ENTRY_MODULE", "META_TEST_OUTPUT", "ACTIVATION_GPU_BUDGET_GIB"):
         monkeypatch.setenv(key, "stale")
     calls = []
     def run(cmd, **kw):
@@ -105,7 +105,7 @@ def test_submission_preserves_training_and_does_not_inherit_old_allocation(chain
     env = kw["env"]
     assert not any(name.startswith(("SLURM_", "SBATCH_")) for name in env)
     for key in ("MASTER_ADDR", "MASTER_PORT", "TTN_RENDEZVOUS_FILE", "CUDA_VISIBLE_DEVICES", "RANK", "BATCH_FILE", "BASE_WEIGHTS", "CONFIG", "UNFREEZE", "DIAGNOSTIC_UNMASK_ALL_VALID",
-                "TTN_ENTRY_MODULE", "META_TEST_OUTPUT"):
+                "TTN_ENTRY_MODULE", "META_TEST_OUTPUT", "ACTIVATION_GPU_BUDGET_GIB"):
         assert key not in env
     assert env["ADAPTER"] == str(Path(plan["source"]) / "last.pt")
     assert env["MAX_STEPS"] == "16" and env["SAVE_EVERY"] == "28"
@@ -261,16 +261,18 @@ def test_start_inherits_saved_profile_and_uses_source_final_target(chain, tmp_pa
             "dataset_root": "shared/example", "data_dir": "shared/raw",
             "vae_cache_dir": "shared/cache", "base_weights": "shared/base.safetensors",
             "sana_config": "configs/sana.yaml", "batch_file": None,
-            "text_encoder_device": "cpu", "cross_attn_backend": "math", "activation_offload": "cpu"}
+            "text_encoder_device": "cpu", "cross_attn_backend": "math", "activation_offload": "cpu",
+            "activation_gpu_budget_gib": 1.5}
     (source / "run_config.json").write_text(json.dumps({"parallel": "fsdp2", "world_size": world, "arguments": args,
                                                       "training": {"train_scope": args["train_scope"]}}))
     complete(source, 3 if pending else 6, world)
     monkeypatch.setattr(chain, "parent_dependency", lambda job: job if pending else None)
     submissions = []
     monkeypatch.setattr(chain, "submit", lambda *values: submissions.append(values))
+    requested_budget = (2.5 if pending else 0.0) if world == 3 else None
     chain.start_chain(SimpleNamespace(from_run=str(source), after_job="423072", target_step=500,
                                      segment_steps=10, partition="short", unfreeze=unfreeze,
-                                     world_size=None if pending else world))
+                                     world_size=None if pending else world, activation_gpu_budget_gib=requested_budget))
     assert len(submissions) == 1
     plan, manifest, start, dependency = submissions[0]
     assert start == 6 and dependency == ("423072" if pending else None)
@@ -278,8 +280,12 @@ def test_start_inherits_saved_profile_and_uses_source_final_target(chain, tmp_pa
     assert plan["world_size"] == world
     assert manifest.is_file() and Path(plan["output"]).is_dir()
     for field, env_name in chain.PROFILE.items():
-        if args.get(field) is not None:
+        if args.get(field) is not None and field != "activation_gpu_budget_gib":
             assert plan["environment"][env_name] == str(args[field])
+    budget = args["activation_gpu_budget_gib"] if requested_budget is None else requested_budget
+    assert plan["environment"]["ACTIVATION_GPU_BUDGET_GIB"] == str(budget)
+    assert json.loads(manifest.read_text())["environment"]["ACTIVATION_GPU_BUDGET_GIB"] == str(budget)
+    assert chain.environment(plan, 16)["ACTIVATION_GPU_BUDGET_GIB"] == str(budget)
     assert plan["environment"]["PYTHON"] == str(python)
     assert "BATCH_FILE" not in plan["environment"]
     assert bool(plan.get("unfreeze")) == unfreeze
@@ -317,12 +323,14 @@ def test_fresh_original_ucpe_plan_starts_without_old_weights_and_clamps_warmup_b
     monkeypatch.setattr(chain, "submit", lambda *args: calls.append(args))
     chain.fresh_chain(SimpleNamespace(output=str(tmp_path/"new"), dataset_root=None, config=None,
                     warmup_steps=25, target_step=100, segment_steps=10, partition="short", seed=3407,
-                    tbptt=2, backbone_lr=1e-6, base_weights=None, warmup_only=hold, world_size=world))
+                    tbptt=2, backbone_lr=1e-6, base_weights=None, warmup_only=hold, world_size=world,
+                    activation_gpu_budget_gib=2.5 if world == 3 else None))
     assert len(calls) == 1
     plan, manifest, start = calls[0]
     assert start == 0 and plan["target_step"] == 25 and plan["environment"]["TRAIN_SCOPE"] == "ttn-new"
     assert plan["world_size"] == world
     assert plan["environment"]["OPTIMIZER_POLICY"] == "origin"
+    assert plan["environment"]["ACTIVATION_GPU_BUDGET_GIB"] == ("2.5" if world == 3 else "0.0")
     assert bool(plan.get("joint_target_step")) == (not hold)
     env = chain.environment(plan, 0)
     assert "ADAPTER" not in env and "UNFREEZE" not in env and env["RESUME"] == "0"
@@ -330,6 +338,18 @@ def test_fresh_original_ucpe_plan_starts_without_old_weights_and_clamps_warmup_b
     assert env["MAX_STEPS"] == "25" and env["RESUME"] == "1" and "UNFREEZE" not in env
     assert env["ADAPTER"] == str(Path(plan["output"])/"last.pt")
     assert manifest.is_file()
+
+
+@pytest.mark.parametrize("budget,offload", [(-1, "cpu"), (float("nan"), "cpu"),
+                                          (float("inf"), "cpu"), (1, "none")])
+def test_chain_rejects_invalid_activation_budget_before_submission(chain, tmp_path, monkeypatch, budget, offload):
+    (tmp_path / "run_config.json").write_text(json.dumps({"arguments": {"activation_offload": offload}}))
+    monkeypatch.setattr(chain, "submit", lambda *a: pytest.fail("invalid budget submitted"))
+    with pytest.raises(ValueError, match="budget"):
+        chain.start_chain(SimpleNamespace(from_run=str(tmp_path), activation_gpu_budget_gib=budget))
+    if offload == "cpu":
+        with pytest.raises(ValueError, match="budget"):
+            chain.fresh_chain(SimpleNamespace(activation_gpu_budget_gib=budget))
 
 
 def test_joint_transition_resets_optimizer_only_in_first_segment(chain, plan):

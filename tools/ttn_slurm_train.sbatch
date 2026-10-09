@@ -114,7 +114,8 @@ case "$command" in
   *) echo "Unsupported COMMAND: $command" >&2; exit 2 ;;
 esac
 if [[ "$command" == train || "$command" == distributed-smoke || "$command" == diagnose-update ]]; then
-  args+=(--activation-offload "${ACTIVATION_OFFLOAD:-cpu}" --cross-attn-backend "${CROSS_ATTN_BACKEND:-auto}")
+  args+=(--activation-offload "${ACTIVATION_OFFLOAD:-cpu}" --activation-gpu-budget-gib "${ACTIVATION_GPU_BUDGET_GIB:-0}"
+         --cross-attn-backend "${CROSS_ATTN_BACKEND:-auto}")
   [[ "${MEMORY_TRACE:-1}" == 0 ]] || args+=(--memory-trace)
   [[ "${CUDA_TRACE:-0}" == 0 ]] || args+=(--cuda-trace)
 fi

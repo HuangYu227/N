@@ -15,7 +15,7 @@ import sys
 import time
 import torch
 from torch import distributed as dist
-from .training import TTNTrainingWindow
+from .training import TTNTrainingWindow, activation_storage
 from .parallel_checkpoint import save_training_checkpoint, restore_training_checkpoint
 from .runtime import TTNChunkContext
 from .anchor import TTNAnchor
@@ -255,12 +255,16 @@ def check_distributed(device):
 
 
 class ParallelTraining:
-    def __init__(self, model, loss_fn, mode="single", *, activation_offload="none", memory_trace=False):
-        if activation_offload not in ("none", "cpu"): raise ValueError("activation_offload must be none or cpu")
+    def __init__(self, model, loss_fn, mode="single", *, activation_offload="none",
+                 activation_gpu_budget_gib=0.0, memory_trace=False):
+        activation_storage(activation_offload, device="cpu", gpu_budget_gib=activation_gpu_budget_gib)
         self.model = model
         self.loss_fn = loss_fn
         self.mode = mode
         self.activation_offload = activation_offload
+        self.activation_gpu_budget_gib = activation_gpu_budget_gib
+        model.ttn_activation_offload = activation_offload
+        model.ttn_activation_gpu_budget_gib = activation_gpu_budget_gib
         self.memory_trace = memory_trace
         self.rank, self.world = rank_world()
         self.window = TTNTrainingWindow(model, loss_fn)

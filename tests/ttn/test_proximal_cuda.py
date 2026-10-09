@@ -63,6 +63,7 @@ def _train(model, optimizer, engine, inputs, offload="cpu", callback=None):
     return training.train_clip(model, clean, torch.zeros(1, 1, 2, 8, device="cuda"),
         camera, optimizer, training.linear_flow_loss, timestep, noise, width=100,
         height=100, tbptt=4, activation_offload=offload, parallel=engine,
+        activation_gpu_budget_gib=engine.activation_gpu_budget_gib,
         memory_callback=progress,
         history_training={"source": "generated", "steps": 4, "cached_chunks": 2})
 
@@ -211,3 +212,34 @@ def test_proximal_fsdp_offload_and_exact_resume(allocation, cached_sana):
     assert payload["distributed"]["world_size"] == allocation["world_size"]
     assert payload["optimizer"] is None
     assert all("world_state" not in name and "memory_cache" not in name for name in payload["adapter"])
+
+
+def test_proximal_fsdp_mixed_offload_matches_cpu(allocation, cached_sana):
+    """Changing saved-tensor placement must preserve FSDP updates and history credit."""
+    inputs = _inputs(allocation["rank"])
+    expected = None
+    for budget in (0., 4096 / 2**30):
+        model = proximal_model(cached_sana).cuda()
+        engine = ParallelTraining(model, training.linear_flow_loss, "fsdp2", activation_offload="cpu",
+                                  activation_gpu_budget_gib=budget)
+        optimizer = make_optimizer(model)
+        if expected is None:
+            initial_rng = copy.deepcopy(rng_state())
+        else:
+            restore_rng(initial_rng)
+        phases = []
+        result = _train(model, optimizer, engine, inputs,
+                        callback=lambda phase, **info: phases.append((phase, info)))
+        snapshot = {"loss": result["loss"], "norm": result["outer_grad_norm"],
+                    "model": _snapshot(model), "grads": _snapshot(model, gradients=True),
+                    "optimizer": copy.deepcopy(_pack(optimizer.state_dict())),
+                    "runtime": _runtime_snapshot(result["runtime"]), "rng": copy.deepcopy(rng_state())}
+        if expected is None:
+            expected = snapshot
+        else:
+            identical(expected, snapshot, "mixed offload FSDP")
+            packed = [info["offload_saved_tensors"] for phase, info in phases if phase == "backward_begin"]
+            assert len(packed) == 2
+            assert all(0 < row["gpu_packed_tensor_bytes"] <= 4096 and row["cpu_packed_tensor_bytes"] > 0
+                       for row in packed)
+        del model, engine, optimizer, result

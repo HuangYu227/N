@@ -10,7 +10,7 @@ from dataclasses import replace, asdict
 import torch
 from .core import TTNConfig, BASE_ID, ANCHORS
 from .checkpoint import make_optimizer, save_checkpoint, load_checkpoint, read_checkpoint, apply_checkpoint_weights
-from .training import train_clip, SANAFlowLoss, chunk_ranges, history_settings
+from .training import train_clip, SANAFlowLoss, chunk_ranges, history_settings, activation_storage
 from .session import TTNSession
 from .performance import ExecutionOptions, configure_from_args, execution_report, precision_audit
 
@@ -114,7 +114,8 @@ def build(args, stage=None, sana_path=None):
     return model, config, settings
 
 
-def train_update(model, config, batch, optimizer, k, parallel=None, *, activation_offload="none", memory_trace=False):
+def train_update(model, config, batch, optimizer, k, parallel=None, *, activation_offload="none",
+                 activation_gpu_budget_gib=0.0, memory_trace=False):
     from .cuda_debug import cuda_diagnostics
     from train_video_scripts.train_sana_wm_stage1 import _build_timesteps, _build_time_sampler
     clean = batch["clean_latents"].float()
@@ -129,10 +130,14 @@ def train_update(model, config, batch, optimizer, k, parallel=None, *, activatio
     extras = {"chunk_plucker": batch["chunk_plucker"]} if "chunk_plucker" in batch else {}
     if parallel is not None:
         activation_offload, memory_trace = parallel.activation_offload, parallel.memory_trace
+        activation_gpu_budget_gib = getattr(parallel, "activation_gpu_budget_gib", 0.0)
+    model.ttn_activation_offload = activation_offload
+    model.ttn_activation_gpu_budget_gib = activation_gpu_budget_gib
     memory_records = []
     def trace(phase, **info):
         from .distributed import rank_world
-        record = {"phase": phase, "rank": rank_world()[0], "activation_offload": activation_offload, **info}
+        record = {"phase": phase, "rank": rank_world()[0], "activation_offload": activation_offload,
+                  "activation_gpu_budget_gib": activation_gpu_budget_gib, **info}
         if parallel is not None and phase in ("prefill_begin", "backward_end", "optimizer_end", "oom"):
             record["storage"] = parallel.storage_record(optimizer)
         if clean.device.type == "cuda":
@@ -158,11 +163,13 @@ def train_update(model, config, batch, optimizer, k, parallel=None, *, activatio
                                 data_info=batch.get("data_info"), extras=extras,
                                 valid_mask=batch.get("frame_valid_mask"), tbptt=k, parallel=parallel,
                                 activation_offload=activation_offload,
+                                activation_gpu_budget_gib=activation_gpu_budget_gib,
                                 memory_callback=trace if memory_trace else None)
     except torch.OutOfMemoryError:
         trace("oom", failed_after=memory_records[-1]["phase"] if memory_records else "unknown")
         raise
-    result.update(activation_offload=activation_offload, memory_phases=memory_records)
+    result.update(activation_offload=activation_offload, activation_gpu_budget_gib=activation_gpu_budget_gib,
+                  memory_phases=memory_records)
     return result
 
 
@@ -321,6 +328,7 @@ def _dataset_batch(raw, config, args, tokenizer=None, encoder=None, encoder_devi
 
 
 def _training_identity(args, config, settings, k):
+    # Activation placement/budget changes storage only, so exact resume keeps its existing identity.
     def section(name):
         value = getattr(config, name, None)
         return asdict(value) if value is not None else None
@@ -366,6 +374,7 @@ def _training_record(model, result, timing, parallel):
     local = {"rank": parallel.rank, "loss": result["loss"], "outer_grad_norm": result["outer_grad_norm"],
              "commits": result["runtime"].commit_count, "predictions": result["runtime"].predict_count,
              "chunks": result["chunks"], "activation_offload": result.get("activation_offload", "none"),
+             "activation_gpu_budget_gib": result.get("activation_gpu_budget_gib", getattr(parallel, "activation_gpu_budget_gib", 0.0)),
              "prefill": result.get("prefill"),
              "memory_phases": result.get("memory_phases", []), **timing}
     local["storage"] = result.get("storage")
@@ -454,6 +463,7 @@ def train_command(args):
     if payload: apply_checkpoint_weights(model, payload)
     parallel = ParallelTraining(model, SANAFlowLoss(config), mode,
                                 activation_offload=getattr(args, "activation_offload", "none"),
+                                activation_gpu_budget_gib=getattr(args, "activation_gpu_budget_gib", 0.0),
                                 memory_trace=getattr(args, "memory_trace", False))
     # FSDP2 optimizer must be constructed AFTER parameters become DTensors.
     optimizer = make_optimizer(model, settings.get("learning_rate", 1e-5),
@@ -683,7 +693,9 @@ def smoke_command(args):
             config, args.device, args.frames, args.latent_height, args.latent_width)
         result, train_timing = timed_cuda(
             lambda: train_update(model, config, batch, optimizer, args.tbptt or settings.get("tbptt", 2),
-                                 activation_offload=args.activation_offload, memory_trace=args.memory_trace))
+                                 activation_offload=args.activation_offload,
+                                 activation_gpu_budget_gib=getattr(args, "activation_gpu_budget_gib", 0.0),
+                                 memory_trace=args.memory_trace))
         gradients = {
             name: float(p.grad.float().norm())
             for name, p in model.named_parameters() if p.requires_grad and p.grad is not None
@@ -711,6 +723,7 @@ def smoke_command(args):
                 "grad_norms": gradients,
                 "chunks": result["chunks"],
                 "activation_offload": result["activation_offload"],
+                "activation_gpu_budget_gib": result["activation_gpu_budget_gib"],
                 "memory_phases": result["memory_phases"],
                 **train_timing
             },
@@ -750,7 +763,9 @@ def distributed_smoke_command(args):
         model, config, settings = build(args, stage)
         if previous: load_checkpoint(previous, model)
         parallel = ParallelTraining(model, SANAFlowLoss(config), args.parallel,
-                                    activation_offload=args.activation_offload, memory_trace=args.memory_trace)
+                                    activation_offload=args.activation_offload,
+                                    activation_gpu_budget_gib=getattr(args, "activation_gpu_budget_gib", 0.0),
+                                    memory_trace=args.memory_trace)
         optimizer = make_optimizer(model, settings.get("learning_rate", 1e-5))
         seed_everything(args.seed + rank)
         batch = load_bundle(args.batch_file.replace("{rank}", str(rank)), args.device) if args.batch_file else (
@@ -819,7 +834,9 @@ def diagnose_update_command(args):
     seed_everything(args.seed)
     model, config, settings = build(args)
     parallel = ParallelTraining(model, SANAFlowLoss(config), args.parallel,
-                                activation_offload=args.activation_offload, memory_trace=args.memory_trace)
+                                activation_offload=args.activation_offload,
+                                activation_gpu_budget_gib=getattr(args, "activation_gpu_budget_gib", 0.0),
+                                memory_trace=args.memory_trace)
     optimizer = make_optimizer(model, settings.get("learning_rate", 1e-5))
     seed_everything(args.seed + rank)  # Match distributed-smoke rank0 on the single-card test.
     batch = load_bundle(args.batch_file.replace("{rank}", str(rank)), args.device) if args.batch_file else (
@@ -884,6 +901,8 @@ def main(argv=None):
                         help="evaluate: add same-weight TTN reference rollout and direct latent/S/psi differences")
     parser.add_argument("--activation-offload", choices=("none", "cpu"), default="none",
                         help="store backward saved tensors in pinned host RAM; single/DDP/FSDP2, no forward replay")
+    parser.add_argument("--activation-gpu-budget-gib", type=float, default=0.0,
+                        help="retain up to this many GiB of saved activations on GPU with CPU offload (default: 0)")
     parser.add_argument("--memory-trace", action="store_true",
                         help="print per-rank prefill/noisy/clean/backward/optimizer memory diagnostics")
     parser.add_argument("--cuda-trace", action="store_true",
@@ -937,6 +956,7 @@ def main(argv=None):
     add_replay_arguments(parser)
     args = parser.parse_args(argv)
     try:
+        activation_storage(args.activation_offload, device="cpu", gpu_budget_gib=args.activation_gpu_budget_gib)
         sink = sink_options_from_args(args)
         replay = replay_options_from_args(args)
     except ValueError as error:

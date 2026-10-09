@@ -55,3 +55,16 @@ def test_empty_input_emits_progress_and_fails_instead_of_claiming_success(tmp_pa
         metrics.report(tmp_path)
     out = capsys.readouterr().out
     assert "开始读取训练指标" in out and "读取完成" not in out
+
+
+def test_mixed_offload_metrics_distinguish_copy_payload_from_rss(tmp_path, capsys):
+    (tmp_path / "chain.json").write_text(json.dumps({"source": str(tmp_path)}))
+    row = record(1)
+    row["ranks"][0]["activation_gpu_budget_gib"] = 4
+    row["ranks"][0]["memory_phases"][0]["offload_saved_tensors"] = {
+        "gpu_packed_tensor_bytes": 2**29, "cpu_packed_tensor_bytes": 10*2**30}
+    (tmp_path / "train.jsonl").write_text(json.dumps(row) + "\n")
+    metrics.report(tmp_path)
+    out = capsys.readouterr().out
+    assert "累计量，不是RSS" in out and "4 | 0.5 | 10" in out
+    assert "1 | 1 | 2 | 3 | 1 | 2 | 0.5" in out

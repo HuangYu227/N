@@ -90,6 +90,11 @@ def report(run):
                 gib(maximum([c.get("memory_storage_bytes") for c in chunks]))])
             print("  chunks/commits：", [(r["rank"], len(r.get("chunks", [])), r.get("commits")) for r in ranks],
                   "记录全部有限：", all(math.isfinite(x) for x in numbers(row)), flush=True)
+            if any("offload_saved_tensors" in p for p in phases):
+                print("  GPU保存预算GiB | 窗口累计GPU复制最大GiB | 窗口累计CPU复制最大GiB（累计量，不是RSS）：", flush=True)
+                line([maximum([r.get("activation_gpu_budget_gib") for r in ranks]),
+                      gib(maximum([p.get("offload_saved_tensors", {}).get("gpu_packed_tensor_bytes") for p in phases])),
+                      gib(maximum([p.get("offload_saved_tensors", {}).get("cpu_packed_tensor_bytes") for p in phases]))])
             if latest is None or row["step"] >= latest["step"]:
                 cfg = row.get("config", {})
                 # Keep only small summaries; a complete step can be a large JSON object.
