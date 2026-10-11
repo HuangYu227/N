@@ -345,6 +345,7 @@ class SanaVideoMSCamCtrlBlock(nn.Module):
             "ttn_chunk_context": kwargs.get("ttn_chunk_context"),
             "camera_embedding": kwargs.get("camera_embedding", None),
             "frame_valid_mask": frame_valid_mask,
+            "ttn_live_cache": kwargs.get("ttn_live_cache", False),
         }
         cam_branch_drop_prob = kwargs.get("cam_branch_drop_prob", None)
         if cam_branch_drop_prob is not None:
@@ -401,13 +402,15 @@ class SanaVideoMSCamCtrlBlock(nn.Module):
         if self.cross_attn_image_embeds:
             x = x + self.cross_attn(x, y, mask=mask, image_embeds=kwargs.get("image_embeds", None))
         else:
-            x = x + self.cross_attn(x, y, mask=mask)
+            text_options = {"prepared_kv": kwargs["ttn_text_kv"]} if "ttn_text_kv" in kwargs else {}
+            x = x + self.cross_attn(x, y, mask=mask, **text_options)
         if frame_token_mask is not None:
             x = x * frame_token_mask
 
         mlp_kwargs = {
             "HW": THW,
             "frame_valid_mask": frame_valid_mask,
+            "ttn_live_cache": kwargs.get("ttn_live_cache", False),
         }
         if chunk_index is not None:
             mlp_kwargs["chunk_index"] = chunk_index[:]  # NOTE: important, copy the list
@@ -445,6 +448,19 @@ class SanaVideoMSCamCtrlBlock(nn.Module):
         return x
 
     def forward(self, x, y, t, mask=None, THW=None, rotary_emb=None, block_mask=None, chunk_index=None, **kwargs):
+        context = kwargs.get("ttn_chunk_context")
+        isolated_first = (context is not None and context.system.config.memory_granularity == "frame"
+                          and THW[0] == 4 and bool((context.frame_ids[:, 0] == 0).all()))
+        if context is not None and (context.sequence_mode or isolated_first):
+            from worldttn.sequence import sequence_block
+            options = dict(kwargs)
+            options.pop("ttn_chunk_context")
+            return sequence_block(self, x, y, t, mask, THW, rotary_emb, context=context,
+                recompute=context.sequence_mode and getattr(self, "ttn_sequence_checkpoint", True),
+                block_mask=block_mask, **options)
+        return self._forward_chunk(x, y, t, mask, THW, rotary_emb, block_mask, chunk_index, **kwargs)
+
+    def _forward_chunk(self, x, y, t, mask=None, THW=None, rotary_emb=None, block_mask=None, chunk_index=None, **kwargs):
         if len(t.shape) > 2:
             return self.forward_frame_aware(
                 x,
@@ -493,6 +509,7 @@ class SanaVideoMSCamCtrlBlock(nn.Module):
             "prope_fns": kwargs.get("prope_fns", None),
             "ttn_chunk_context": kwargs.get("ttn_chunk_context"),
             "frame_valid_mask": frame_valid_mask,
+            "ttn_live_cache": kwargs.get("ttn_live_cache", False),
         }
         cam_branch_drop_prob = kwargs.get("cam_branch_drop_prob", None)
         if cam_branch_drop_prob is not None:
@@ -546,7 +563,8 @@ class SanaVideoMSCamCtrlBlock(nn.Module):
         if self.cross_attn_image_embeds:
             x = x + self.cross_attn(x, y, mask=mask, image_embeds=kwargs.get("image_embeds", None))
         else:
-            x = x + self.cross_attn(x, y, mask=mask)
+            text_options = {"prepared_kv": kwargs["ttn_text_kv"]} if "ttn_text_kv" in kwargs else {}
+            x = x + self.cross_attn(x, y, mask=mask, **text_options)
         if frame_token_mask is not None:
             x = x * frame_token_mask
 
@@ -555,6 +573,7 @@ class SanaVideoMSCamCtrlBlock(nn.Module):
         mlp_kwargs = {
             "HW": THW,
             "frame_valid_mask": frame_valid_mask,
+            "ttn_live_cache": kwargs.get("ttn_live_cache", False),
         }
         if chunk_index is not None:
             mlp_kwargs["chunk_index"] = chunk_index[:]  # NOTE: important, copy the list
@@ -1135,7 +1154,7 @@ class SanaMSVideoCamCtrl(Sana):
         else:
             block_mask = None
 
-        if kwargs.get("camera_conditions") is not None:
+        if kwargs.get("camera_conditions") is not None and not getattr(kwargs.get("ttn_chunk_context"), "sequence_mode", False):
             # Pre-compute UCPE projection functions to share across blocks
             # (both surviving camctrl variants are UCPE-style).
             if self.attn_type in ["flash", "FlexLinearAttention", "flex"]:
@@ -1859,7 +1878,7 @@ class SanaMSVideoCamCtrlStreaming(SanaMSVideoCamCtrl):
         else:
             block_mask = None
 
-        if kwargs.get("camera_conditions") is not None:
+        if kwargs.get("camera_conditions") is not None and not getattr(kwargs.get("ttn_chunk_context"), "sequence_mode", False):
             # Pre-compute UCPE projection functions to share across blocks
             # (all surviving camctrl variants are UCPE-style).
             if self.attn_type in ["flash", "FlexLinearAttention", "flex"]:

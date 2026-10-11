@@ -141,6 +141,8 @@ def comparison_labels(protocol, left_method="sana"):
     sink = protocol.get("tla_sink", {})
     if sink.get("mode", "off") != "off" and sink.get("gain", 0) > 0:
         label += f" | {sink['mode']} g={sink['gain']:g} | {sink['position']}"
+    if protocol.get("spectral_readout"):
+        label += f" | {protocol['spectral_readout']}"
     return baseline, label
 
 
@@ -210,7 +212,8 @@ def main(argv=None):
             times.append(time.perf_counter() - started)
             if video.shape[0] != (latent.shape[2] - 1) * stride + 1:
                 raise ValueError("decoded raw frame count differs from the VAE stride")
-            with iio.get_writer(args.output / f"{method}.mp4", fps=fps, codec="libx264", macro_block_size=1) as writer:
+            with iio.get_writer(args.output / f"{method}.mp4", fps=fps, codec="libx264", macro_block_size=1,
+                                ffmpeg_params=["-threads", "2", "-filter_threads", "1"]) as writer:
                 for frame in video:
                     writer.append_data(frame)
             videos.append(video)
@@ -219,7 +222,8 @@ def main(argv=None):
         font = ImageFont.truetype("DejaVuSans.ttf", 24)
     except OSError:
         font = ImageFont.load_default()
-    with iio.get_writer(args.output / "comparison.mp4", fps=fps, codec="libx264", macro_block_size=1) as writer:
+    with iio.get_writer(args.output / "comparison.mp4", fps=fps, codec="libx264", macro_block_size=1,
+                        ffmpeg_params=["-threads", "2", "-filter_threads", "1"]) as writer:
         for index, (left, right) in enumerate(zip(*videos)):
             writer.append_data(comparison_frame(left, right, index, stride, summary["protocol"]["step"], font, labels=labels))
     encoded = {f"{method}.mp4": verify_video(args.output / f"{method}.mp4", len(video), video.shape[1:3], fps)

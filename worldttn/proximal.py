@@ -24,7 +24,7 @@ def _source(key, value, weight):
 
 
 def proximal_correct(prior, k, v, beta, mask, *, history=(), history_weight=.25,
-                     kappa=16., eps=1e-6, collect_stats=False):
+                     kappa=16., eps=1e-6, collect_stats=False, _history_statistics=()):
     """Solve one joint regression; do not append Correct or commit noisy results.
 
     Current observations have source weight one. Each head divides the total
@@ -59,8 +59,10 @@ def proximal_correct(prior, k, v, beta, mask, *, history=(), history_weight=.25,
             raise ValueError("proximal active beta must be finite and nonnegative")
         w = write_weights(beta, mask, eps)
         current = _source(k, v, w)
+        if _history_statistics and len(_history_statistics) != len(history):
+            raise ValueError("cached statistics must correspond to the history sources")
         histories = []
-        for item in history:
+        for index, item in enumerate(history):
             if (item.key.ndim != 4 or item.key.shape[:2] != prior.shape[:2]
                     or item.key.shape[-1] != prior.shape[-1] or item.value.shape != item.key.shape
                     or item.weight.shape != item.key.shape[:-1]):
@@ -68,7 +70,17 @@ def proximal_correct(prior, k, v, beta, mask, *, history=(), history_weight=.25,
             tensors = item.key, item.value, item.weight
             if any(t.device != prior.device or not t.is_floating_point() for t in tensors):
                 raise ValueError("proximal history must be floating tensors on the state device")
-            histories.append(_source(*(t.to(dtype) for t in tensors)))
+            cached = _history_statistics[index] if _history_statistics else None
+            if cached is not None:
+                if (len(cached) != 6 or cached[0].shape != item.key.shape
+                        or cached[1].shape != item.value.shape or cached[2].shape != item.weight.shape
+                        or cached[3].shape != prior.shape[:2]
+                        or cached[4].shape != prior.shape or cached[5].shape != prior.shape
+                        or any(t.device != prior.device for t in cached)
+                        or any(t.dtype != dtype for i, t in enumerate(cached) if i != 3)
+                        or cached[3].dtype != torch.bool):
+                    raise ValueError("cached history statistics shape/device/dtype mismatch")
+            histories.append(cached if cached is not None else _source(*(t.to(dtype) for t in tensors)))
         count = sum((item[3].to(dtype) for item in histories), torch.zeros_like(current[3], dtype=dtype))
         history_scale = history_weight / count.clamp_min(1)
         gram, rhs = current[-2:]

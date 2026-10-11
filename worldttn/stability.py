@@ -190,7 +190,7 @@ def committed_anchor_stats(stats, old_psi, new_psi, grad, scale, cbase, block, p
 
 
 def stability_rows(record):
-    """Flatten rank-0's gathered step record without new distributed collectives."""
+    """Flatten gathered rank records without new distributed collectives."""
     for rank in record["ranks"]:
         chunks = ([rank["prefill"]] if rank.get("prefill") else []) + rank["chunks"]
         for chunk in chunks:
@@ -198,7 +198,8 @@ def stability_rows(record):
                 yield {"step": record["step"], "stage": record["stage"], "train_scope": record["train_scope"],
                        "implementation_id": record.get("implementation_id"),
                        "rank": rank["rank"], "chunk": chunk["chunk"], "start": chunk["start"], "end": chunk["end"],
-                       "camera_attention": record["config"]["camera_attention"], **anchor}
+                       "camera_attention": record["config"]["camera_attention"],
+                       "history_source": chunk.get("history_source", "clean"), **anchor}
 
 
 def progress_line(record, target):
@@ -209,7 +210,8 @@ def progress_line(record, target):
               if any(x is not None for b in r.get("per_head", {}).get("innovation_relative", []) for x in b)]
     largest = max(values) if values else None
     peak = max(r.get("peak_allocated_bytes", 0) for r in record["ranks"]) / 2**30
-    suffix = "" if largest is None else f" | max clean innovation/V={largest[0]:.3g}@{largest[1]}"
+    history = "noisy" if record.get("config", {}).get("memory_granularity") == "frame" else "clean"
+    suffix = "" if largest is None else f" | max {history} innovation/V={largest[0]:.3g}@{largest[1]}"
     return (f"[TTN progress] step {record['step']}/{target} | scope={record['train_scope']} | "
             f"loss={record['loss']:.6f} | grad={record['outer_grad_norm']:.4g} | "
             f"train={record['seconds']:.1f}s | peak={peak:.2f}GiB{suffix}")

@@ -9,6 +9,9 @@ def implementation_identity():
     root = Path(__file__).resolve().parents[1]
     files = ("worldttn/cli.py", "worldttn/anchor.py", "worldttn/core.py", "worldttn/controller.py", "worldttn/runtime.py",
              "worldttn/sink.py", "worldttn/replay.py", "worldttn/proximal.py", "worldttn/memory_cache.py",
+             "worldttn/frame_memory.py", "worldttn/sequence.py", "worldttn/sequence_training.py", "worldttn/diagnostics.py",
+             "diffusion/model/ops/fused_streaming.py", "diffusion/model/ops/fused_gdn_chunkwise_stateful_raw.py",
+             "diffusion/model/ops/fused_gdn_chunkwise_bwd.py",
              "worldttn/history.py", "tools/ttn_custom_inference.py", "tools/ttn_decode_comparison.py",
              "tools/ttn_submit_sink.py", "tools/ttn_submit_mechanism.py",
              "worldttn/performance.py", "worldttn/compiled.py", "worldttn/benchmark.py",

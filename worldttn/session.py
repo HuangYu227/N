@@ -107,6 +107,8 @@ class TTNSession:
         self.replay_options = replay_options
 
     def reset(self, batch_size):
+        spectral = getattr(self.model, "_ttn_spectral_readout", None)
+        if spectral is not None: spectral.reset()
         self.camera_cache_lengths = {index: [] for index in ANCHORS}
         self.runtime = TTNRuntimeState.create(self.model.ttn_system.config, batch_size, self.camera.device,
                                              ablation=self.ablation, diagnostics=self.diagnostics,
@@ -179,6 +181,8 @@ class TTNSession:
                               save=True)
         validate_clean_output(out, initial)
         self.runtime.prefill(c)
+        spectral = getattr(self.model, "_ttn_spectral_readout", None)
+        if spectral is not None: spectral.capture(self.runtime)
         return c
 
     def carry_clean_cache(self, current, previous, *, cached_chunks=-1):

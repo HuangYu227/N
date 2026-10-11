@@ -205,3 +205,20 @@ def test_custom_pair_reuses_inputs_and_noise_without_future_gt(monkeypatch, tmp_
         custom.main(["--training-run", str(tmp_path), "--output", str(smoke_output),
                      "--case", str(smoke_path), "--steps", "4", "--state-diagnostics",
                      "--tla-sink", "protected", "--check-sink-smoke"])
+    # Conditioning is weight-independent; never reuse the old TTN rollout with new weights.
+    adapter.write_bytes(b"new-step175-weights")
+    monkeypatch.setattr(custom, "load_evaluation_run", lambda args: (
+        run, config, ttn, adapter, custom.file_sha256(adapter), {"step": 175, "weight_scope": "dit"}))
+    newer = tmp_path / "newer"
+    custom.main(["--training-run", str(tmp_path), "--output", str(newer),
+                 "--case", str(case_path), "--reuse-conditioning", str(output)])
+    newer_summary = json.loads((newer / "summary.json").read_text())
+    assert newer_summary["protocol"]["step"] == 175 and built[-1]["install_adapter"]
+    assert newer_summary["protocol"]["checkpoint_sha256"] != summary["protocol"]["checkpoint_sha256"]
+    assert newer_summary["protocol"]["input_bundle_sha256"] == summary["protocol"]["input_bundle_sha256"]
+    assert newer_summary["episodes"][0] == summary["episodes"][0]
+    summary["protocol"]["config"]["text_encoder"]["text_encoder_name"] = "different-encoder"
+    (output / "summary.json").write_text(json.dumps(summary))
+    with pytest.raises(ValueError, match="text_encoder differs"):
+        custom.main(["--training-run", str(tmp_path), "--output", str(tmp_path / "reject"),
+                     "--case", str(case_path), "--reuse-conditioning", str(output)])

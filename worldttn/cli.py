@@ -81,10 +81,21 @@ def synthetic_bundle(config, device, frames=13, height=22, width=40):
 def build(args, stage=None, sana_path=None):
     from .sana import load_sana_config, build_sana, configure_cross_attention, configure_activation_checkpointing
     ttn, settings = read_reference(args.config, stage or args.stage)
+    protocol = settings.get("training_protocol", "clean-tbptt")
+    if protocol not in ("clean-tbptt", "frame-noisy-fullgrad-v1"):
+        raise ValueError("unknown TTN training protocol")
+    if protocol == "frame-noisy-fullgrad-v1" and (ttn.memory_granularity != "frame"
+            or settings.get("tbptt") != 0 or "history_training" in settings
+            or getattr(args, "tbptt", None) not in (None, 0)):
+        raise ValueError("frame fullgrad requires frame memory, tbptt=0 and no history_training")
     source = sana_path or args.sana_config or settings["sana_config"]
     source = Path(source)
     if not source.is_absolute(): source = ROOT / source
     config = load_sana_config(source)
+    if protocol == "frame-noisy-fullgrad-v1":
+        if any(getattr(config.model, key, False) for key in
+               ("use_delta_actions", "use_delta_pose_additive", "use_delta_translation")):
+            raise ValueError("frame fullgrad does not support delta-action camera conditioning")
     if "training_latent_frames" in settings:
         frames = settings["training_latent_frames"]
         if isinstance(frames, bool) or not isinstance(frames, int) or frames < 4 or frames % 3 != 1:
@@ -103,6 +114,7 @@ def build(args, stage=None, sana_path=None):
     options = {"dtype": torch.float32} if getattr(args, "train_scope", "ttn") in ("ttn-visual", "ttn-new", "dit") else {}
     model = build_sana(config, ttn, args.base_weights, device=args.device, **options)
     model.ttn_history_training = history_settings(settings.get("history_training"))
+    model.ttn_training_protocol = protocol
     model.ttn_training_latent_frames = settings.get("training_latent_frames")
     memory_policy = configure_activation_checkpointing(model, settings.get("activation_checkpointing", "none"))
     configure_from_args(model, args)
@@ -138,13 +150,18 @@ def train_update(model, config, batch, optimizer, k, parallel=None, *, activatio
         from .distributed import rank_world
         record = {"phase": phase, "rank": rank_world()[0], "activation_offload": activation_offload,
                   "activation_gpu_budget_gib": activation_gpu_budget_gib, **info}
-        if parallel is not None and phase in ("prefill_begin", "backward_end", "optimizer_end", "oom"):
+        if parallel is not None and phase in ("prefill_begin", "sequence_begin", "backward_end", "optimizer_end", "oom"):
             record["storage"] = parallel.storage_record(optimizer)
         if clean.device.type == "cuda":
             record.update(allocated_bytes=torch.cuda.memory_allocated(clean.device),
                           reserved_bytes=torch.cuda.memory_reserved(clean.device),
                           peak_allocated_bytes=torch.cuda.max_memory_allocated(clean.device),
                           peak_reserved_bytes=torch.cuda.max_memory_reserved(clean.device))
+            if hasattr(torch.cuda, "host_memory_stats"):
+                pinned = torch.cuda.host_memory_stats()
+                record["pinned_host_bytes"] = {key: pinned[key] for key in (
+                    "allocated_bytes.current", "allocated_bytes.peak",
+                    "reserved_bytes.current", "reserved_bytes.peak")}
         try:
             for line in Path("/proc/self/status").read_text().splitlines():
                 if line.startswith("VmRSS:"):
@@ -362,7 +379,10 @@ def _training_identity(args, config, settings, k):
                                 "local_objective": "weighted_v_energy_support", "persistent_objective": "raw_weighted_innovation",
                                 "support": "absolute_frame_xy_checkerboard", "local_eta_init": .01, "local_delta": 1.,
                                 "noise_gate": False}
-    if "history_training" in settings or "training_latent_frames" in settings:
+    if settings.get("training_protocol") == "frame-noisy-fullgrad-v1":
+        identity.update(training_protocol="frame-noisy-fullgrad-v1",
+                        training_latent_frames=settings["training_latent_frames"], tbptt=0)
+    elif "history_training" in settings or "training_latent_frames" in settings:
         identity["history_training"] = history_settings(settings.get("history_training"))
         identity["training_latent_frames"] = settings.get("training_latent_frames")
         identity["memory_training"] = {key: getattr(TTNConfig(**ttn), key) for key in
@@ -381,7 +401,7 @@ def _training_record(model, result, timing, parallel):
     if "anchor_gradients" in result: local["anchor_gradients"] = result["anchor_gradients"]
     from .distributed import gather_records
     if "parameter_update" in result: local["parameter_update"] = result["parameter_update"]
-    for key in ("optimizer_updates", "exposure"):
+    for key in ("optimizer_updates", "exposure", "training_protocol"):
         if key in result: local[key] = result[key]
     ranks = gather_records(local)
     return {"loss": sum(record["loss"] for record in ranks) / parallel.world,
@@ -444,7 +464,7 @@ def train_command(args):
         configure_train_scope(model, args.train_scope)
     mode = getattr(args, "parallel", "single")
     rank, world = rank_world()
-    k = args.tbptt or settings.get("tbptt", 2)
+    k = (args.tbptt if args.tbptt is not None else settings.get("tbptt", 2))
     payload = read_checkpoint(args.adapter, model, resume=args.resume) if args.adapter else None
     resolve_optimizer_policy(args, payload)
     identity = _training_identity(args, config, settings, k)
@@ -556,6 +576,15 @@ def train_command(args):
                 observed_reference="protected early clean observations, including generated frames; fixed values after capture",
                 legacy_psi="disabled; not an active learning branch",
                 tla_memory=memory_evaluation_protocol(model.ttn_system.config))
+        if getattr(model, "ttn_training_protocol", "clean-tbptt") == "frame-noisy-fullgrad-v1":
+            run["history_protocol"] = {"training_protocol": model.ttn_training_protocol,
+                "prefill": "observed frame isolated in every layer; live gradient",
+                "clean_commits": "none during training; completed chunks only during inference",
+                "persistent_gradient": "full noisy sequence including native caches; no temporal detach",
+                "camera_cache": "last two native groups; selected entries retain gradients",
+                "local_lifecycle": "one Direct-S solve per frame using all spatial tokens",
+                "legacy_psi": "disabled", "generation_group_frames": 3,
+                "forward_schedule": "one model forward including isolated prefill; one backward"}
         if unfreeze:
             run["initialization"] = {"checkpoint": str(Path(args.adapter).resolve()), "step": step,
                                      "optimizer_reset": True, "rng_and_data_cursor_restored": True}
@@ -692,7 +721,7 @@ def smoke_command(args):
         batch = load_bundle(args.batch_file, args.device) if args.batch_file else synthetic_bundle(
             config, args.device, args.frames, args.latent_height, args.latent_width)
         result, train_timing = timed_cuda(
-            lambda: train_update(model, config, batch, optimizer, args.tbptt or settings.get("tbptt", 2),
+            lambda: train_update(model, config, batch, optimizer, (args.tbptt if args.tbptt is not None else settings.get("tbptt", 2)),
                                  activation_offload=args.activation_offload,
                                  activation_gpu_budget_gib=getattr(args, "activation_gpu_budget_gib", 0.0),
                                  memory_trace=args.memory_trace))
@@ -771,12 +800,12 @@ def distributed_smoke_command(args):
         batch = load_bundle(args.batch_file.replace("{rank}", str(rank)), args.device) if args.batch_file else (
             synthetic_bundle(config, args.device, args.frames, args.latent_height, args.latent_width))
         if batch["clean_latents"].shape[0] != 1: raise ValueError("smoke training uses one clip per rank")
-        k = args.tbptt or settings.get("tbptt", 2)
+        k = (args.tbptt if args.tbptt is not None else settings.get("tbptt", 2))
         result, timing = timed_cuda(lambda: train_update(model, config, batch, optimizer, k, parallel))
         expected = len(chunk_ranges(batch["clean_latents"].shape[2])) + 1
-        if result["runtime"].commit_count != expected or result["runtime"].predict_count != expected:
+        if k != 0 and (result["runtime"].commit_count != expected or result["runtime"].predict_count != expected):
             raise AssertionError("training state counters disagree")
-        if any(len(ids) != batch["clean_latents"].shape[2] for ids in result["runtime"].committed_frame_ids):
+        if k != 0 and any(len(ids) != batch["clean_latents"].shape[2] for ids in result["runtime"].committed_frame_ids):
             raise AssertionError("training duplicate/missing writes")
         gradients = [p.grad.to_local() if hasattr(p.grad, "to_local") else p.grad
                      for p in model.parameters() if p.requires_grad and p.grad is not None]
@@ -842,11 +871,11 @@ def diagnose_update_command(args):
     batch = load_bundle(args.batch_file.replace("{rank}", str(rank)), args.device) if args.batch_file else (
         synthetic_bundle(config, args.device, args.frames, args.latent_height, args.latent_width))
     if batch["clean_latents"].shape[0] != 1: raise ValueError("diagnosis uses one clip per rank")
-    k = args.tbptt or settings.get("tbptt", 2)
+    k = (args.tbptt if args.tbptt is not None else settings.get("tbptt", 2))
     result, timing = timed_cuda(lambda: train_update(model, config, batch, optimizer, k, parallel))
     expected = len(chunk_ranges(batch["clean_latents"].shape[2])) + 1
     runtime = result["runtime"]
-    if runtime.commit_count != expected or runtime.predict_count != expected:
+    if k != 0 and (runtime.commit_count != expected or runtime.predict_count != expected):
         raise AssertionError("training state counters disagree")
     gradients = [p.grad for p in model.parameters() if p.requires_grad and p.grad is not None]
     if not gradients or not all(bool(torch.isfinite(g).all()) for g in gradients):
@@ -899,8 +928,8 @@ def main(argv=None):
                         help="explicitly save resume bundles in benchmark/profiler/layout runs (default: no checkpoint IO)")
     parser.add_argument("--ttn-compare-reference", action="store_true",
                         help="evaluate: add same-weight TTN reference rollout and direct latent/S/psi differences")
-    parser.add_argument("--activation-offload", choices=("none", "cpu"), default="none",
-                        help="store backward saved tensors in pinned host RAM; single/DDP/FSDP2, no forward replay")
+    parser.add_argument("--activation-offload", choices=("none", "cpu", "cpu-pageable"), default="none",
+                        help="store backward saved tensors in pinned or pageable host RAM; single/DDP/FSDP2, no forward replay")
     parser.add_argument("--activation-gpu-budget-gib", type=float, default=0.0,
                         help="retain up to this many GiB of saved activations on GPU with CPU offload (default: 0)")
     parser.add_argument("--memory-trace", action="store_true",
@@ -942,7 +971,8 @@ def main(argv=None):
                         help="train: initialize DiT from C/sana-camera ttn-new or legacy visual warmup; reset optimizer, restore progress")
     parser.add_argument("--max-steps", type=int, default=1)
     parser.add_argument("--save-every", type=int, default=50)
-    parser.add_argument("--tbptt", type=int, choices=(1, 2, 4))
+    parser.add_argument("--tbptt", type=int, choices=(0, 1, 2, 4),
+                        help="0 is reserved for frame-noisy-fullgrad-v1; no temporal truncation")
     parser.add_argument("--steps", type=int, help="default 4 for smoke; evaluate requires an explicit quality schedule")
     parser.add_argument("--cfg-scale", type=float, default=4.5)
     parser.add_argument("--cached-blocks", type=int, default=-1)

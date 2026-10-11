@@ -231,3 +231,8 @@ docs/
 /docs/*
 !/docs/proximal-memory.md
 !/docs/proximal-memory-ltu.md
+!/docs/frame-fullgrad.md
+!/docs/frame-fullgrad-repair-plan.md
+.test-tmp/
+.test-tmp-*/
+.pytest-tmp/

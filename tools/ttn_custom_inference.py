@@ -194,6 +194,9 @@ def main(argv=None):
     parser.add_argument("--cross-attn-backend", choices=("math", "auto"), default="math")
     parser.add_argument("--reuse-baseline", type=Path,
                         help="completed paired custom run; reuse its observation/text/geometry and SANA rollout")
+    parser.add_argument("--reuse-conditioning", type=Path,
+                        help="reuse only weight-independent conditioning and pretrained SANA; TTN is generated anew")
+    parser.add_argument("--spectral-readout", choices=("baseline", "low-zero", "low-reference", "full-reference"))
     parser.add_argument("--state-diagnostics", action="store_true", help="detached state/sink telemetry")
     parser.add_argument("--check-sink-smoke", action="store_true",
                         help="after video encoding, require the step100 five-chunk sink acceptance checks")
@@ -224,6 +227,17 @@ def main(argv=None):
     from train_video_scripts.train_sana_wm_stage1 import _encode_prompts
 
     shared_summary = None
+    if args.reuse_conditioning:
+        if args.reuse_baseline:
+            raise ValueError("select one conditioning reuse source")
+        source_protocol = json.loads((args.reuse_conditioning / "summary.json").read_text())["protocol"]
+        for name in ("vae", "text_encoder"):
+            if source_protocol["config"][name] != json.loads(json.dumps(asdict(getattr(config, name)))):
+                raise ValueError(f"conditioning reuse {name} differs")
+        batch, shared_summary = load_shared_inputs(args.reuse_conditioning, case, prompt,
+            source_protocol["checkpoint_sha256"], args, config.scheduler.inference_flow_shift)
+        if any(row["base_sha256"] != run["base"]["sha256"] for row in shared_summary["episodes"]):
+            raise ValueError("reused SANA base weights differ")
     if args.reuse_baseline:
         batch, shared_summary = load_shared_inputs(args.reuse_baseline, case, prompt, digest, args,
                                                   config.scheduler.inference_flow_shift)
@@ -242,16 +256,17 @@ def main(argv=None):
         batch.update(width=case["target_size_hw"][1], height=case["target_size_hw"][0],
                      data_info={"img_hw": torch.tensor([case["target_size_hw"]], dtype=torch.float32)})
     else:
+        shared_directory = args.reuse_baseline or args.reuse_conditioning
         for name in ("first_frame_used.png", "case-000-sana.pt"):
-            if (args.reuse_baseline / name).is_file():
-                link_or_copy(args.reuse_baseline / name, args.output / name)
+            if (shared_directory / name).is_file():
+                link_or_copy(shared_directory / name, args.output / name)
     shape = (1, config.vae.vae_latent_dim, case["latent_frames"], *batch["initial_latent"].shape[-2:])
     noise = diagnostic_noise(shape, "cuda", case["seed"]).cpu()
     inputs = {key: tensor_sha256(batch[key]) for key in CONDITIONING_KEYS}
     if shared_summary is None:
         torch.save(batch, args.output / "input-bundle.pt")
     else:
-        link_or_copy(args.reuse_baseline / "input-bundle.pt", args.output / "input-bundle.pt")
+        link_or_copy((args.reuse_baseline or args.reuse_conditioning) / "input-bundle.pt", args.output / "input-bundle.pt")
         baseline_noise = shared_summary["episodes"][0]["initial_noise_sha256"]
         if tensor_sha256(noise) != baseline_noise:
             raise ValueError("shared baseline initial noise differs")
@@ -268,9 +283,13 @@ def main(argv=None):
                 "stage": ttn.stage, "tla_sink": asdict(sink), "tla_replay": asdict(replay), "state_diagnostics": args.state_diagnostics,
                 "ttn_config": ttn.to_dict(), "tla_memory": memory_evaluation_protocol(ttn),
                 "provenance": implementation_identity(),
+                "inference_overlay_manifest_sha256": file_sha256(REPO / "files.json")
+                    if args.spectral_readout and (REPO / "files.json").is_file() else None,
                 "compile": {key: os.environ.get(key, "0") for key in ("GDN_DISABLE_COMPILE", "GDN_DISABLE_COMPLEX_COMPILE")},
                 "input_bundle_sha256": file_sha256(args.output / "input-bundle.pt"),
                 "shared_baseline": str(args.reuse_baseline.resolve()) if args.reuse_baseline else None,
+                "shared_conditioning": str(args.reuse_conditioning.resolve()) if args.reuse_conditioning else None,
+                "spectral_readout": args.spectral_readout,
                 "refiner": None, "execution": "reference/reference", "no_training_dataset_read": True,
                 "case": case, "prompt": prompt, "metric_space": "none: no ground-truth future",
                 "config": {"model": asdict(config.model), "text_encoder": asdict(config.text_encoder),
@@ -295,6 +314,11 @@ def main(argv=None):
             load_checkpoint(adapter, model)
         configure_cross_attention(model, args.cross_attn_backend)
         model.eval().requires_grad_(False)
+        spectral = None
+        if method == "ttn" and args.spectral_readout:
+            from worldttn.spectral_readout import SpectralReadout, install_spectral_readout
+            spectral = SpectralReadout(args.spectral_readout, diagnostics=args.output / "spectral.jsonl")
+            with torch.no_grad(): install_spectral_readout(model, spectral)
         gpu_batch = to_device(batch, "cuda")
         gpu_noise = noise.to("cuda")
         def progress(row):
@@ -319,6 +343,16 @@ def main(argv=None):
                "sink_reference_verified": getattr(runtime, "sink_reference_verified", None)
                    if getattr(runtime, "sink_reference_sha256", None) is not None else None,
                "return_view": return_latent_metrics(generated, gpu_batch, case)}
+        if spectral is not None:
+            from worldttn.spectral_readout import latent_diagnostics
+            row["spectral_readout"] = spectral.verify()
+            row["latent_diagnostics"] = latent_diagnostics(generated.cpu())
+            if os.name == "posix":
+                import resource
+                row["timing"]["host_peak_rss_bytes"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss*1024
+                row["timing"]["host_peak_scope"] = "worker process from loading through end of sampling"
+            print("[TTN spectral verified] " + json.dumps({key: row["spectral_readout"][key]
+                for key in ("mode", "reference_verified", "nonzero_quantized_anchors")}), flush=True)
         if runtime is not None and ttn.memory_update == "proximal":
             row.update(memory_prefix_sha256=list(runtime.memory_prefix_hashes),
                        memory_prefix_verified=True if runtime.verify_memory_prefix() else None,

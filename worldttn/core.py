@@ -49,8 +49,20 @@ class TTNConfig:
     memory_recent_frames: int = 4
     memory_position: str = "absolute"
     memory_transport: str = "identity"
+    memory_granularity: str = "chunk"
+    memory_frame_kappa: float = 49.
+    memory_start_frame: int = 13
 
     def __post_init__(self):
+        if self.memory_granularity not in ("chunk", "frame"):
+            raise ValueError("memory_granularity must be chunk or frame")
+        if (isinstance(self.memory_frame_kappa, bool) or not isinstance(self.memory_frame_kappa, (int, float))
+                or not math.isfinite(self.memory_frame_kappa) or self.memory_frame_kappa <= 0
+                or type(self.memory_start_frame) is not int or self.memory_start_frame < 1):
+            raise ValueError("invalid frame memory regularization/start")
+        if self.memory_granularity == "frame" and (self.memory_update != "proximal"
+                or self.memory_transport != "identity" or self.memory_position != "absolute"):
+            raise ValueError("frame memory requires proximal updates in absolute, identity coordinates")
         if self.memory_update not in ("delta", "proximal"):
             raise ValueError("memory_update must be delta or proximal")
         if self.memory_selection not in ("none", "fifo", "participative"):
@@ -101,7 +113,12 @@ class TTNConfig:
             raise ValueError("invalid correction/adaptation hyperparameters")
 
     def to_dict(self):
-        return asdict(self)
+        result = asdict(self)
+        # Keep legacy checkpoint and exact-resume identities unchanged.
+        if self.memory_granularity == "chunk":
+            for key in ("memory_granularity", "memory_frame_kappa", "memory_start_frame"):
+                result.pop(key)
+        return result
 
 
 class Rank2Generators(nn.Module):

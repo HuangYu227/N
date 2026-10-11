@@ -75,7 +75,9 @@ def memory_evaluation_protocol(config):
     """Record checkpoint mathematics and cache budgets, including inactive defaults."""
     return {"enabled": config.memory_update == "proximal",
             "settings": {name: value for name, value in config.to_dict().items() if name.startswith("memory_")},
-            "update": "differentiable proximal solve" if config.memory_update == "proximal" else "legacy delta correction",
+            "update": ("one differentiable joint spatial solve per latent frame" if config.memory_granularity == "frame"
+                       else "differentiable proximal solve" if config.memory_update == "proximal" else "legacy delta correction"),
+            "observed_frame_isolation": config.memory_granularity == "frame",
             "history_budget_unit": "latent-frame token capacity per batch/head",
             "eviction": "removes fitting observations; does not erase the recurrent S prior"}
 

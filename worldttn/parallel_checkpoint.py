@@ -1,5 +1,6 @@
 """Plain offline weight exports plus rank-local optimizer shards and RNG for exact resume."""
 from pathlib import Path
+from datetime import timedelta
 import json
 import time
 import uuid
@@ -41,15 +42,27 @@ def _unpack(value, parameter):
 
 def _phase(parallel, path, label, action, step=None):
     """Propagate local errors BEFORE any subsequent tensor collective."""
+    # Disk verification can outlast NCCL's timeout; coordinate it on the CPU.
+    group = None
+    if parallel.world > 1:
+        if getattr(parallel, "checkpoint_cpu_group", None) is None:
+            parallel.checkpoint_cpu_group = dist.new_group(backend="gloo", timeout=timedelta(seconds=3600))
+        group = parallel.checkpoint_cpu_group
+    timed = parallel.rank == 0 and label in {"shard-write", "model-publish", "resume-integrity"}
+    started = time.monotonic()
+    if timed: print("[TTN checkpoint phase] " + json.dumps({"phase": label, "status": "begin", "step": step}), flush=True)
     try:
         result = {"rank": parallel.rank, "value": action(), "error": None}
     except Exception as error:
         record_failure(Path(path).parent, label, error, rank=parallel.rank, step=step)
         result = {"rank": parallel.rank, "error": f"{type(error).__name__}: {error}"}
     results = [None] * parallel.world
-    if parallel.world > 1: dist.all_gather_object(results, result)
+    if parallel.world > 1: dist.all_gather_object(results, result, group=group)
     else: results[0] = result
     errors = [f"rank {r['rank']}: {r['error']}" for r in results if r["error"]]
+    if timed:
+        print("[TTN checkpoint phase] " + json.dumps({"phase": label, "status": "failed" if errors else "completed",
+              "step": step, "seconds": time.monotonic() - started, "control_backend": "gloo" if group is not None else "local"}), flush=True)
     if errors: raise RuntimeError(f"checkpoint {label} failed; " + "; ".join(errors))
     return [r["value"] for r in results]
 
@@ -149,7 +162,10 @@ def save_training_checkpoint(path, parallel, optimizer, step, data_state=None, t
             print("[TTN checkpoint] " + json.dumps({**report, "path": str(path), "budget": budget}), flush=True)
             # Publication is already successful: a cleanup failure must not invalidate it.
             try:
-                print("[TTN retention] " + json.dumps(prune_bundles(path, apply=True)), flush=True)
+                started = time.monotonic()
+                print("[TTN retention begin] " + json.dumps({"step": step}), flush=True)
+                print("[TTN retention] " + json.dumps({**prune_bundles(path, apply=True),
+                      "seconds": time.monotonic() - started}), flush=True)
             except Exception as error:
                 print(f"[TTN retention] skipped after successful save: {error}", flush=True)
             return report

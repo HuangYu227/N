@@ -391,7 +391,8 @@ class CachedGLUMBConvTemp(GLUMBConvTemp):
                 padded_size = x_t_conv_in.shape[2] - x_reshaped.shape[2]
 
             if save_kv_cache:  # Save current chunk's cache for next chunk
-                kv_cache[-1] = x_reshaped[:, :, -padding_size:, :].detach().clone()
+                kv_cache[-1] = (x_t_conv_in[:, :, -padding_size:, :].clone()
+                    if kwargs.get("ttn_live_cache", False) else x_reshaped[:, :, -padding_size:, :].detach().clone())
 
         t_conv_out = self.t_conv(x_t_conv_in)[:, :, padded_size:]
         x_out = x_reshaped + t_conv_out

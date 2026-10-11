@@ -82,8 +82,21 @@ def build_sana(config, ttn_config, base_weights=None, device="cuda", dtype=torch
 
 def configure_activation_checkpointing(model, policy="none"):
     """Recompute pure FFN/text operations; never replay a block or transaction."""
-    if policy not in ("none", "ffn-cross-attn"):
-        raise ValueError("activation_checkpointing must be none or ffn-cross-attn")
+    if policy not in ("none", "ffn-cross-attn", "sequence-block"):
+        raise ValueError("activation_checkpointing must be none, ffn-cross-attn or sequence-block")
+    for block in getattr(model, "blocks", ()):
+        block.ttn_sequence_checkpoint = policy == "sequence-block"
+    if policy == "sequence-block":
+        if model.ttn_system.config.memory_granularity != "frame":
+            raise ValueError("sequence-block requires frame memory")
+        for module in model.modules():
+            if hasattr(module, "ttn_activation_checkpointing"):
+                module.ttn_activation_checkpointing = False
+        model.ttn_activation_checkpointing = policy
+        model.activation_checkpoint_report = {"policy": policy, "use_reentrant": False,
+            "stateful_recomputation": False, "functional_state_recomputation": True,
+            "boundaries": "native DiT block; TLA anchor spans of <=8 groups; inner three-frame group; no detach"}
+        return model.activation_checkpoint_report
     targets = []
     if policy != "none":
         from diffusion.model.nets.basic_modules import CachedGLUMBConvTemp

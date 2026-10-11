@@ -3,7 +3,7 @@
 DeepForcing's summed query/key selection is applied to TLA observations, not to
 visual Softmax. Eviction removes fitting constraints, not their legacy inside S.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import math
 
@@ -19,6 +19,8 @@ class MemoryCache:
     query: torch.Tensor
     hw: tuple[int, int]
     temporal_aligned: bool = False
+    # Live episode-local prefix source: (prefix length, K/V/W/active/G/B).
+    prefix_statistics: tuple | None = None
 
 
 def _options(capacity_frames, prefix_frames, recent_frames, selection):
@@ -195,6 +197,10 @@ def update_cache(previous, k, v, w, q, write, frame_ids, hw, *, capacity_frames=
             row = tuple(x.index_select(1 if i in (0, 1, 2, 5) else 0, keep) for i, x in enumerate(row))
         rows.append(row)
     result = _pack(rows, shape)
+    if (previous is not None and previous.prefix_statistics is not None
+            and previous.prefix_statistics[0] == prefix_frames
+            and not ((frames < prefix_frames) & write.bool()).any()):
+        result = replace(result, prefix_statistics=previous.prefix_statistics)
     validate_cache(result)
     return result
 
@@ -215,15 +221,21 @@ def detach_cache(cache):
     o = cache.observation
     return MemoryCache(Observation(*(x.detach() for x in
         (o.key, o.value, o.weight, o.token_indices, o.frame_ids))), cache.query.detach(), cache.hw,
-        cache.temporal_aligned)
+        cache.temporal_aligned,
+        (cache.prefix_statistics[0], tuple(x.detach() for x in cache.prefix_statistics[1]))
+        if cache.prefix_statistics is not None else None)
 
 
 def storage_bytes(cache):
     if cache is None:
         return 0
     o = cache.observation
-    return sum(x.numel()*x.element_size() for x in
-               (o.key, o.value, o.weight, o.token_indices, o.frame_ids, cache.query))
+    tensors = (o.key, o.value, o.weight, o.token_indices, o.frame_ids, cache.query)
+    if cache.prefix_statistics is not None:
+        tensors += cache.prefix_statistics[1]
+    # Count shared underlying payload once, including live prefix statistics.
+    storage = { (x.device, x.untyped_storage().data_ptr()): x.untyped_storage().nbytes() for x in tensors }
+    return sum(storage.values())
 
 
 def prefix_digest(cache, prefix_frames=10):

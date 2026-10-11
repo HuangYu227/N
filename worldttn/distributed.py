@@ -267,7 +267,11 @@ class ParallelTraining:
         model.ttn_activation_gpu_budget_gib = activation_gpu_budget_gib
         self.memory_trace = memory_trace
         self.rank, self.world = rank_world()
-        self.window = TTNTrainingWindow(model, loss_fn)
+        if getattr(model, "ttn_training_protocol", "clean-tbptt") == "frame-noisy-fullgrad-v1":
+            from .sequence_training import TTNSequenceTraining
+            self.window = TTNSequenceTraining(model, loss_fn)
+        else:
+            self.window = TTNTrainingWindow(model, loss_fn)
         if mode == "ddp":
             if self.world < 2: raise ValueError("DDP requires an initialized multi-process group")
             from torch.nn.parallel import DistributedDataParallel

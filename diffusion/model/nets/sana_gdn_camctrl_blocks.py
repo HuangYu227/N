@@ -736,6 +736,7 @@ class CachedChunkCausalGDNUCPESinglePathLiteLA(ChunkCausalGDNUCPESinglePathLiteL
                 kv_cache,
                 save_kv_cache,
                 precomputed_gates,
+                live_cache=kwargs.get("ttn_live_cache", False),
             )
             cam_contrib = self.out_proj_cam(cam_raw)
 
@@ -753,6 +754,7 @@ class CachedChunkCausalGDNUCPESinglePathLiteLA(ChunkCausalGDNUCPESinglePathLiteL
         kv_cache: list,
         save_kv_cache: bool,
         precomputed_gates: tuple | None,
+        live_cache: bool = False,
     ) -> torch.Tensor:
         """Camera branch with cached delta-rule state."""
         B, N, _ = x.shape
@@ -769,6 +771,7 @@ class CachedChunkCausalGDNUCPESinglePathLiteLA(ChunkCausalGDNUCPESinglePathLiteL
             rotary_emb,
             kv_cache[_SLOT_CAM_AUX],
             save_kv_cache,
+            live_cache=live_cache,
         )
         if save_kv_cache:
             kv_cache[_SLOT_CAM_AUX] = cam_conv_cache
@@ -798,7 +801,7 @@ class CachedChunkCausalGDNUCPESinglePathLiteLA(ChunkCausalGDNUCPESinglePathLiteL
             S,
         )
         if save_kv_cache:
-            kv_cache[_SLOT_CAM] = cam_S_kv_final.detach().clone()
+            kv_cache[_SLOT_CAM] = cam_S_kv_final if live_cache else cam_S_kv_final.detach().clone()
 
         if getattr(self, "fp32_attention", True) and dtype_orig != torch.float32:
             out = out.to(dtype_orig)
@@ -916,8 +919,9 @@ class CachedSoftmaxUCPESinglePathLiteLA(_SoftmaxUCPESinglePathLiteLA):
         cached_cam_k = kv_cache[_SLOT_CAM]
         cached_cam_v = kv_cache[_SLOT_CAM_AUX]
         if save_kv_cache:
-            kv_cache[_SLOT_CAM] = k_sdpa.detach().clone()
-            kv_cache[_SLOT_CAM_AUX] = v_sdpa.detach().clone()
+            live = kwargs.get("ttn_live_cache", False)
+            kv_cache[_SLOT_CAM] = k_sdpa if live else k_sdpa.detach().clone()
+            kv_cache[_SLOT_CAM_AUX] = v_sdpa if live else v_sdpa.detach().clone()
         if cached_cam_k is not None:
             k_sdpa = torch.cat([cached_cam_k.to(k_sdpa.dtype), k_sdpa], dim=2)
             v_sdpa = torch.cat([cached_cam_v.to(v_sdpa.dtype), v_sdpa], dim=2)

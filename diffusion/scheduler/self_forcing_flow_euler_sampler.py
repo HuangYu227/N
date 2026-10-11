@@ -603,7 +603,8 @@ class SelfForcingFlowEulerCamCtrl(SelfForcingFlowEuler):
                 if do_classifier_free_guidance:
                     timestep_tensor_model = torch.cat([timestep_tensor_model, timestep_tensor_model], dim=0)
 
-                if ttn_context is not None and (ttn_context.sink_reference is not None or
+                spectral = getattr(self.model, "_ttn_spectral_readout", None)
+                if ttn_context is not None and (spectral is not None or ttn_context.sink_reference is not None or
                         (ttn_context.collect_local_stats and (ttn_context.system.config.local_update or
                                                             ttn_context.system.config.persistent_meta))):
                     from worldttn.session import record_noise
@@ -612,6 +613,8 @@ class SelfForcingFlowEulerCamCtrl(SelfForcingFlowEuler):
                     sigma_model = sigma_frames[:, None, :]
                     if do_classifier_free_guidance: sigma_model = torch.cat([sigma_model, sigma_model], dim=0)
                     record_noise(ttn_context, timestep_tensor_model, sigma_model, total_calls=len(timesteps))
+                    if spectral is not None:
+                        spectral.begin_call(ttn_context, sigma_model, i, len(timesteps))
 
                 noise_pred, _ = self.model(
                     latent_model_input,

@@ -96,22 +96,28 @@ class MultiHeadCrossAttention(nn.Module):
             raise ValueError("reset text SDPA backend to auto before enabling xFormers")
         self.use_xformers = bool(enabled and _xformers_available)
 
-    def forward(self, x, cond, mask=None):
-        if getattr(self, "ttn_activation_checkpointing", False) and torch.is_grad_enabled():
-            return checkpoint_preserving_strides(self._forward, x, cond, mask)
-        return self._forward(x, cond, mask)
+    def prepare_kv(self, cond, batch_size):
+        """Live text projections, reused only within one block forward."""
+        first_dim = 1 if self.use_xformers else batch_size
+        k, v = self.kv_linear(cond).view(first_dim, -1, 2, self.d_model).unbind(2)
+        return (self.k_norm(k).view(first_dim, -1, self.num_heads, self.head_dim),
+                v.view(first_dim, -1, self.num_heads, self.head_dim))
 
-    def _forward(self, x, cond, mask=None):
+    def forward(self, x, cond, mask=None, *, prepared_kv=None):
+        k, v = (None, None) if prepared_kv is None else prepared_kv
+        if getattr(self, "ttn_activation_checkpointing", False) and torch.is_grad_enabled():
+            return checkpoint_preserving_strides(self._forward, x, cond, mask, k, v)
+        return self._forward(x, cond, mask, k, v)
+
+    def _forward(self, x, cond, mask=None, k=None, v=None):
         # query: img tokens; key/value: condition; mask: if padding tokens
         B, N, C = x.shape
         first_dim = 1 if self.use_xformers else B
 
         q = self.q_linear(x)
-        kv = self.kv_linear(cond).view(first_dim, -1, 2, C)
-        k, v = kv.unbind(2)
+        if k is None:
+            k, v = self.prepare_kv(cond, B)
         q = self.q_norm(q).view(first_dim, -1, self.num_heads, self.head_dim)
-        k = self.k_norm(k).view(first_dim, -1, self.num_heads, self.head_dim)
-        v = v.view(first_dim, -1, self.num_heads, self.head_dim)
 
         if self.use_xformers:
             attn_bias = None

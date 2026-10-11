@@ -80,21 +80,35 @@ def activation_storage(mode, *, device=None, audit=None, gpu_budget_gib=0.):
     so backward does not retain/read freed FSDP all-gather storage. FSDP's own
     parameter hooks still unshard and reduce the actual parameter gradients.
     A GPU budget keeps independent copies with the same contiguous layout as
-    native pinned CPU packing. Its cumulative cap resets each TBPTT window;
+    native CPU packing. Its cumulative cap resets each storage context (one
+    full sequence or one legacy TBPTT window);
     allocator, communication and backward workspace are outside this budget.
     """
-    if mode not in ("none", "cpu"): raise ValueError("activation_offload must be none or cpu")
+    if mode not in ("none", "cpu", "cpu-pageable"):
+        raise ValueError("activation_offload must be none or cpu or cpu-pageable")
     if (isinstance(gpu_budget_gib, bool) or not isinstance(gpu_budget_gib, (int, float))
             or not math.isfinite(gpu_budget_gib) or gpu_budget_gib < 0):
         raise ValueError("activation GPU budget must be finite and nonnegative")
-    if gpu_budget_gib and mode != "cpu":
+    if gpu_budget_gib and mode not in ("cpu", "cpu-pageable"):
         raise ValueError("activation GPU budget requires cpu offload")
     if mode == "none": return nullcontext()
-    if mode == "cpu":
+    if mode in ("cpu", "cpu-pageable"):
         # CPU tensors already live on the host. Pinned packing would only
         # change their strides and can change backward rounding on GPU hosts.
         if device is not None and torch.device(device).type == "cpu": return nullcontext()
-        storage = torch.autograd.graph.save_on_cpu(pin_memory=True)
+        if mode == "cpu":
+            storage = torch.autograd.graph.save_on_cpu(pin_memory=True)
+        else:
+            def pack_to_cpu(tensor):
+                # Independent contiguous snapshots survive FSDP all-gather storage release.
+                packed = torch.empty(tensor.size(), dtype=tensor.dtype, layout=tensor.layout,
+                                     device="cpu", pin_memory=False)
+                packed.copy_(tensor)
+                return tensor.device, packed
+            def unpack_from_cpu(packed):
+                device, tensor = packed
+                return tensor.to(device, non_blocking=False)
+            storage = torch.autograd.graph.saved_tensors_hooks(pack_to_cpu, unpack_from_cpu)
         if audit is not None or gpu_budget_gib:
             pack = storage.pack_hook
             budget = (int(gpu_budget_gib) * (1 << 30)
@@ -123,7 +137,7 @@ def activation_storage(mode, *, device=None, audit=None, gpu_budget_gib=0.):
 
 
 def activation_storage_stats(audit):
-    """Cumulative saved-tensor copy payload per window, not live bytes or host RSS."""
+    """Cumulative saved-tensor copy payload per storage context, not live bytes or RSS."""
     sizes = [(math.prod(key[2]) * key[4] * count, key, count) for key, count in audit.items()]
     gpu_sizes = [row for row in sizes if len(row[1]) > 5 and row[1][5] == "gpu"]
     gpu_bytes = sum(row[0] for row in gpu_sizes)
@@ -135,7 +149,7 @@ def activation_storage_stats(audit):
                                 "shape": list(key[2]), "stride": list(key[3]),
                                 "saved_on": key[5] if len(key) > 5 else "cpu"}
                                for size, key, count in sorted(sizes, reverse=True)[:8]],
-            "measurement": "TBPTT-window cumulative saved-tensor copy payload; not live memory or RSS"}
+            "measurement": "storage-context cumulative saved-tensor copy payload; not live memory or RSS"}
 
 
 def _memory_phase(callback, phase, **info):
@@ -339,6 +353,14 @@ def train_clip(model,
                memory_callback=None,
                audit_update=False,
                history_training=None):
+    if getattr(model, "ttn_training_protocol", "clean-tbptt") == "frame-noisy-fullgrad-v1":
+        from .sequence_training import train_sequence
+        return train_sequence(model, clean, y, camera_conditions, optimizer, loss_fn, timesteps, noise,
+            width=width, height=height, mask=mask, data_info=data_info, extras=extras, valid_mask=valid_mask,
+            tbptt=tbptt, chunk_size=chunk_size, outer_clip=outer_clip, on_prediction=on_prediction,
+            window_model=window_model, parallel=parallel, activation_offload=activation_offload,
+            activation_gpu_budget_gib=activation_gpu_budget_gib, memory_callback=memory_callback,
+            audit_update=audit_update, history_training=history_training)
     if tbptt not in (1, 2, 4): raise ValueError("reference TBPTT supports K=1,2,4")
     activation_storage(activation_offload, device="cpu", gpu_budget_gib=activation_gpu_budget_gib)
     b, _, frames, _, _ = clean.shape
@@ -359,7 +381,7 @@ def train_clip(model,
     loss_valid = valid.clone()
     loss_valid[:, 0] = False
     total = loss_valid.sum(-1).clamp_min(1)
-    offload_audit = Counter() if memory_callback is not None and activation_offload == "cpu" else None
+    offload_audit = Counter() if memory_callback is not None and activation_offload in ("cpu", "cpu-pageable") else None
     if offload_audit is not None:
         callback = memory_callback
         def traced(phase, **info):

@@ -139,10 +139,16 @@ def get_tokenizer_and_text_encoder(name="T5", device="cuda"):
         tokenizer = T5Tokenizer.from_pretrained(text_encoder_dict[name])
         text_encoder = T5EncoderModel.from_pretrained(text_encoder_dict[name], torch_dtype=torch.float16).to(device)
     elif "gemma" in name:
-        tokenizer = AutoTokenizer.from_pretrained(text_encoder_dict[name])
+        from huggingface_hub import constants, snapshot_download
+
+        source = text_encoder_dict[name]
+        if constants.HF_HUB_OFFLINE:
+            # A local directory also prevents Transformers' tokenizer metadata queries.
+            source = snapshot_download(source, local_files_only=True)
+        tokenizer = AutoTokenizer.from_pretrained(source)
         tokenizer.padding_side = "right"
         text_encoder = (
-            AutoModelForCausalLM.from_pretrained(text_encoder_dict[name], torch_dtype=torch.bfloat16)
+            AutoModelForCausalLM.from_pretrained(source, torch_dtype=torch.bfloat16)
             .get_decoder()
             .to(device)
         )

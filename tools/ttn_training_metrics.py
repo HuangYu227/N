@@ -28,7 +28,8 @@ def gib(value):
 
 
 def line(values):
-    print(" | ".join("null" if v is None else f"{v:.6g}" for v in values), flush=True)
+    print(" | ".join("null" if v is None else v if isinstance(v, str) else f"{v:.6g}"
+                     for v in values), flush=True)
 
 
 def change(before, after):
@@ -49,34 +50,69 @@ def records(root):
                 print("跳过未完整写入行：", path, number, flush=True)
 
 
-def anchor_rows(row):
+def sampled_anchors(row):
     rank = next(r for r in row["ranks"] if r["rank"] == 0)
     for chunk in rank["chunks"]:
         if chunk["chunk"] + 1 not in (1, 5, 20, 40): continue
         for anchor in chunk["anchors"]:
-            p = anchor.get("proximal", {}).get("per_head", {})
-            spectrum = anchor.get("state_spectrum", {}).get("committed", {})
-            calls = anchor.get("proximal_trajectory", [])
-            noisy = calls[-1] if calls else {}
-            query = noisy.get("heldout_query", {})
-            energy = mean(spectrum.get("top1_energy_fraction"))
-            effect = noisy.get("output_effect", {}).get("relative_delta")
-            yield [chunk["chunk"] + 1, anchor["block"], anchor.get("state", {}).get("rms"),
-                mean(spectrum.get("stable_rank")), 100 * energy if energy is not None else None,
+            yield chunk, anchor
+
+
+def anchor_rows(row):
+    for chunk, anchor in sampled_anchors(row):
+        proximal = anchor.get("proximal", {})
+        frames = proximal.get("frames", [])
+        p = ({key: [frame.get("per_head", {}).get(key) for frame in frames]
+              for key in {key for frame in frames for key in frame.get("per_head", {})}}
+             if frames else proximal.get("per_head", {}))
+        spectrum = anchor.get("state_spectrum", {}).get("committed", {})
+        calls = anchor.get("proximal_trajectory", [])
+        noisy = proximal if frames else calls[-1] if calls else {}
+        query = noisy.get("heldout_query", {})
+        energy = mean(spectrum.get("top1_energy_fraction"))
+        effect = noisy.get("output_effect", {}).get("relative_delta")
+        yield [chunk["chunk"] + 1, anchor["block"], anchor.get("state", {}).get("rms"),
+            mean(spectrum.get("stable_rank")), 100 * energy if energy is not None else None,
+            change(p.get("inner_objective_before"), p.get("inner_objective_after")),
+            change(p.get("current_residual_mse_before"), p.get("current_residual_mse_after")),
+            change(p.get("history_residual_mse_before"), p.get("history_residual_mse_after")),
+            mean(p.get("history_current_gradient_ratio")), mean(p.get("history_current_gradient_cosine")),
+            change(query.get("before"), query.get("after_support_solve")),
+            100 * effect if effect is not None else None]
+
+
+def frame_rows(row):
+    for chunk, anchor in sampled_anchors(row):
+        for frame in anchor.get("proximal", {}).get("frames", []):
+            p = frame.get("per_head", {})
+            active = frame.get("history_active", [])
+            yield [chunk.get("history_source", "noisy"),
+                ",".join(str(i) for i in dict.fromkeys(numbers(frame.get("frame_ids", [])))), anchor["block"],
+                100 * sum(active) / len(active) if active else None,
                 change(p.get("inner_objective_before"), p.get("inner_objective_after")),
                 change(p.get("current_residual_mse_before"), p.get("current_residual_mse_after")),
-                change(p.get("history_residual_mse_before"), p.get("history_residual_mse_after")),
-                mean(p.get("history_current_gradient_ratio")), mean(p.get("history_current_gradient_cosine")),
-                change(query.get("before"), query.get("after_support_solve")),
-                100 * effect if effect is not None else None]
+                change(p.get("history_residual_mse_before"), p.get("history_residual_mse_after"))]
+
+
+def cache_bytes(chunk):
+    if "memory_storage_bytes" in chunk:
+        return chunk["memory_storage_bytes"]
+    values = [anchor.get("memory_storage_bytes") for anchor in chunk.get("anchors", [])]
+    return sum(values) if values and all(value is not None for value in values) else None
 
 
 def report(run):
     run = Path(run)
     print("开始读取训练指标：", run, flush=True)
-    plan = json.loads((run / "chain.json").read_text(encoding="utf-8"))
-    roots = list(dict.fromkeys([Path(plan["source"]), run]))
-    print("step | loss | grad | 秒 | GPU峰值GiB | 采样RSS最大GiB | 缓存最大GiB", flush=True)
+    roots = [run]
+    if (run / "chain.json").is_file():
+        plan = json.loads((run / "chain.json").read_text(encoding="utf-8"))
+        roots = list(dict.fromkeys([Path(plan["source"]), run]))
+    if (run / "run_config.json").is_file():
+        training = json.loads((run / "run_config.json").read_text(encoding="utf-8")).get("training", {})
+        print("运行协议：", training.get("training_protocol", "clean-tbptt"),
+              "latent帧：", training.get("training_latent_frames"), flush=True)
+    print("step | loss | grad | 秒 | GPU峰值GiB | 采样RSS最大GiB | TLA缓存payload最大GiB", flush=True)
     latest = None
     for root in roots:
         print("读取：", root / "train.jsonl", flush=True)
@@ -87,7 +123,7 @@ def report(run):
             line([row["step"], row.get("loss"), row.get("outer_grad_norm"), row.get("seconds"),
                 gib(maximum([r.get("peak_allocated_bytes") for r in ranks])),
                 gib(maximum([p.get("host_rss_bytes") for p in phases])),
-                gib(maximum([c.get("memory_storage_bytes") for c in chunks]))])
+                gib(maximum([cache_bytes(c) for c in chunks]))])
             print("  chunks/commits：", [(r["rank"], len(r.get("chunks", [])), r.get("commits")) for r in ranks],
                   "记录全部有限：", all(math.isfinite(x) for x in numbers(row)), flush=True)
             if any("offload_saved_tensors" in p for p in phases):
@@ -100,16 +136,22 @@ def report(run):
                 # Keep only small summaries; a complete step can be a large JSON object.
                 latest = {"step": row["step"], "tbptt": row.get("tbptt"), "config": {k: cfg.get(k) for k in (
                     "memory_update", "memory_transport", "memory_selection", "memory_capacity_frames",
-                    "memory_history_weight", "memory_kappa", "local_update", "persistent_meta", "persistent_update")},
-                    "anchors": list(anchor_rows(row)), "health": [(r["rank"],
+                    "memory_history_weight", "memory_kappa", "memory_granularity", "memory_frame_kappa",
+                    "memory_start_frame", "local_update", "persistent_meta", "persistent_update")},
+                    "anchors": list(anchor_rows(row)), "frames": list(frame_rows(row)), "health": [(r["rank"],
                         r.get("parameter_update", {}).get("missing_core_gradients"),
                         r.get("parameter_update", {}).get("by_origin")) for r in ranks]}
             del row, ranks, phases, chunks
     if latest is None: raise ValueError("没有完整训练记录")
     print("\n最后step：", latest["step"], "TBPTT：", latest["tbptt"], "配置：", latest["config"], flush=True)
     print("rank0，均值跨head；Δ%=(after/before-1)*100；null表示未记录/未定义。", flush=True)
+    if latest["frames"]:
+        print("逐帧协议：S及谱为每组末帧；内目标/残差按帧/head均值计算；输出Δ为整个noisy组的配对读出变化。", flush=True)
     print("chunk | anchor | S_RMS | stable-rank | top1能量% | 内目标Δ% | 当前残差Δ% | 历史残差Δ% | 历史/当前梯度 | 梯度cos | noisy queryΔ% | noisy DirectS输出Δ%", flush=True)
     for values in latest["anchors"]: line(values)
+    if latest["frames"]:
+        print("history | latent frame（从0计数） | anchor | history活跃% | 内目标Δ% | 当前残差Δ% | 历史残差Δ%", flush=True)
+        for values in latest["frames"]: line(values)
     for rank, missing, origins in latest["health"]:
         print("rank", rank, "缺失核心梯度=", missing, "参数来源更新=", origins, flush=True)
     print("读取完成；未加载权重、未重算SHA、未提交作业。内部残差不是视频rollout MSE。", flush=True)

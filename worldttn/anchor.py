@@ -13,6 +13,7 @@ from .runtime import TTNSystem
 from .sink import sink_read_stats, sink_effective_stats, validate_sink
 from . import replay, memory_cache
 from .proximal import proximal_correct
+from .diagnostics import diagnostics_enabled
 
 
 class TTNAnchor(nn.Module):
@@ -86,7 +87,8 @@ class TTNAnchor(nn.Module):
         incoming_cache = kwargs.get("kv_cache")
         cache = list(incoming_cache) if incoming_cache is not None else [None] * 10
         cache[0] = cache[1] = None  # Visual history lives in TTN S, never visual K/V.
-        diagnostic = kwargs.get("ttn_diagnostic")
+        telemetry = diagnostics_enabled()
+        diagnostic = kwargs.get("ttn_diagnostic") if telemetry else None
         cfg = self.config
         execution = getattr(self, "ttn_execution", DEFAULT_EXECUTION)
         validate_sink(ctx.sink_options, cfg, ctx.ablation, execution)
@@ -130,7 +132,25 @@ class TTNAnchor(nn.Module):
             with annotation(execution, "CorrectRead"):
                 replay_result = None
                 proximal_stats = None
-                if cfg.memory_update == "proximal":
+                if cfg.memory_granularity == "frame":
+                    from .frame_memory import frame_correct
+                    collect = telemetry and (ctx.clean_mode or ctx.collect_memory_stats or diagnostic is not None)
+                    state, raw, w, retained, frame_stats = frame_correct(predicted, q, k, v, beta, write,
+                        ctx.frame_ids, HW, cfg, retained=ctx.memory_caches[self.index] if ctx.memory_caches else None,
+                        prefill=ctx.prefill_mode, collect_stats=collect)
+                    if ctx.clean_mode and cfg.memory_selection != "none":
+                        ctx.memory_candidates[self.index] = retained
+                    if collect:
+                        proximal_stats = dict(frame_stats[-1], frames=frame_stats,
+                            implementation="frame_proximal_s", selection=cfg.memory_selection,
+                            position=cfg.memory_position, transport=cfg.memory_transport,
+                            persistent_commit=ctx.clean_mode and not ctx.sequence_mode,
+                            meta_gradient_enabled=state.requires_grad)
+                    frame_delta_raw = None
+                    if collect:
+                        with torch.no_grad():
+                            frame_delta_raw = raw.detach() - q.detach() @ predicted.detach()
+                elif cfg.memory_update == "proximal":
                     if (execution.core_backend, execution.psi_backend) != ("reference", "reference"):
                         raise ValueError("proximal memory requires reference/reference")
                     histories = ()
@@ -141,7 +161,7 @@ class TTNAnchor(nn.Module):
                                 prefix_frames=cfg.memory_prefix_frames, recent_frames=cfg.memory_recent_frames)
                         histories = memory_cache.sources(retained, prefix_frames=cfg.memory_prefix_frames,
                                                         recent_frames=cfg.memory_recent_frames)
-                    collect = ctx.clean_mode or ctx.collect_memory_stats or diagnostic is not None
+                    collect = telemetry and (ctx.clean_mode or ctx.collect_memory_stats or diagnostic is not None)
                     state, w, proximal_stats = proximal_correct(predicted, k, v, beta, write,
                         history=histories, history_weight=cfg.memory_history_weight, kappa=cfg.memory_kappa,
                         eps=cfg.eps, collect_stats=collect)
@@ -264,15 +284,18 @@ class TTNAnchor(nn.Module):
                             gradient = fn(ctx.previous[:, self.index], aux.kt_weighted_residual,
                                           ctx.psi_snapshot.for_anchor(self.index), write.sum(-1), cfg.delta_psi)
                 with annotation(execution, "Stats"):
-                    stats = clean_anchor_stats(ctx.previous[:, self.index], ctx.predicted[:, self.index],
+                    stats = (clean_anchor_stats(ctx.previous[:, self.index], ctx.predicted[:, self.index],
                                                state, q, k, v, beta, w, read, write, gradient, cfg)
-                    if cfg.memory_update == "proximal":
+                             if telemetry else {})
+                    if telemetry and cfg.memory_update == "proximal":
                         stats["state_update"] = "live_proximal_s"
                         stats["per_head"].pop("eta_s", None)  # No legacy scalar gradient step is applied.
                     if persistent_geometry is not None: stats["persistent_rotation_geometry"] = persistent_geometry
                 ctx.stage(self.index, state, gradient, stats)
         raw = raw.transpose(1, 2).reshape(b, n, c)
-        if ctx.clean_mode:
+        spectral = getattr(self, "_ttn_spectral_readout", None)
+        spectral_visual = raw if spectral is not None else None
+        if ctx.clean_mode and telemetry:
             stats.update(camera_attention=cfg.camera_attention,
                          camera_cached_tokens=int(incoming_cache[2].shape[2]) if cfg.camera_attention == "sana" and incoming_cache is not None and incoming_cache[2] is not None else 0,
                          camera_current_tokens=n if camera_conditions is not None else 0,
@@ -300,7 +323,7 @@ class TTNAnchor(nn.Module):
                         camera_out = to(cq @ camera_state)  # output transform BEFORE MergeHeads
                         camera_out = camera_out.transpose(1, 2).reshape(b, n, c)
             camera_contribution = self.out_proj_cam(camera_out.to(x.dtype))
-            if ctx.clean_mode:
+            if ctx.clean_mode and telemetry:
                 stats.update(camera_raw=matrix_scale(camera_out), camera_contribution=matrix_scale(camera_contribution))
             if diagnostic is not None:
                 diagnostic("camera_raw", camera_out.to(x.dtype))
@@ -310,7 +333,8 @@ class TTNAnchor(nn.Module):
         gate = F.silu(self.output_gate(x).float())
         if proximal_stats is not None and (ctx.clean_mode or ctx.collect_memory_stats or diagnostic is not None):
             with torch.no_grad():
-                delta_raw = (q @ (state-predicted)).transpose(1, 2).reshape(b, n, c)
+                delta_raw = (frame_delta_raw if cfg.memory_granularity == "frame" else q @ (state-predicted))
+                delta_raw = delta_raw.transpose(1, 2).reshape(b, n, c)
             sink_effective_stats(proximal_stats, delta_raw, gate, self.proj, read, self.heads)
             proximal_stats["measurement"] = "Direct-S change from incoming prior; FP32 gate/proj before quantization"
             if ctx.clean_mode: ctx.memory_stats[self.index] = proximal_stats
@@ -334,9 +358,14 @@ class TTNAnchor(nn.Module):
             elif ctx.collect_sink_stats and ctx.sink_trajectory:
                 ctx.sink_trajectory[-1]["anchors"][self.index] = sink_stats
             if diagnostic is not None: diagnostic("sink_read", sink_stats)
-        gated = (raw * gate).to(x.dtype)
+        gated = raw * gate
+        if spectral is not None:
+            gated = spectral.apply(self.index, ctx, q, spectral_visual, gate, gated, HW)
+        gated = gated.to(x.dtype)
         if diagnostic is not None: diagnostic("gated_raw", gated)
         out = self.proj(gated) * read[..., None].to(x.dtype)
+        if spectral is not None:
+            spectral.finish(self.index, ctx, out, self.proj, x.dtype, read)
         if proximal_stats is not None:
             with torch.no_grad():
                 # Hold input/camera/gate fixed; include the actual output dtype's rounding.
@@ -351,7 +380,7 @@ class TTNAnchor(nn.Module):
                     "changed_fraction": ((delta_out != 0) & valid).sum().item()/max(valid.sum().item(), 1),
                     "measurement": "paired anchor outputs after quantization, same features/camera; no rollout quality claim"}
             if diagnostic is not None: diagnostic("proximal_update", proximal_stats)
-        if ctx.clean_mode: stats["anchor_output"] = matrix_scale(out)
+        if ctx.clean_mode and telemetry: stats["anchor_output"] = matrix_scale(out)
         if cfg.camera_attention == "sana":
             cache[6] = x.new_tensor([0.])  # Native concat layout: camera K/V in slots 2/3.
             cache[4] = cache[5] = cache[7] = cache[8] = None

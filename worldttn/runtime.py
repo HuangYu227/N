@@ -75,6 +75,7 @@ class TTNChunkContext:
     memory_trajectory: list = field(default_factory=list)
     memory_call_count: int = 0
     collect_memory_stats: bool = False
+    sequence_mode: bool = False
 
     def for_clean(self):
         return TTNChunkContext(self.predicted, self.previous, self.psi, self.cbase, self.system, self.frame_ids,
