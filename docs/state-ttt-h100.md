@@ -20,7 +20,7 @@ the current noisy loss. This update does not add a new Sink or distillation stag
 ## Start from SANA pretrained weights
 
 Run inside your existing tmux pane after activating `worldttn-fp8` and updating
-the `codex/ttn-dual-psi-fp8` checkout. GPU **index 3** is the requested device:
+the `codex/ttn-dual-psi-fp8` checkout. GPU **index 5** is the requested device:
 
 ```bash
 ROOT="${WORLDTTN_WORKSPACE:?Set WORLDTTN_WORKSPACE to your isolated workspace root}"
@@ -29,8 +29,8 @@ git fetch origin refs/heads/codex/ttn-dual-psi-fp8:refs/remotes/origin/codex/ttn
 test "$(git branch --show-current)" = codex/ttn-dual-psi-fp8
 git merge --ff-only origin/codex/ttn-dual-psi-fp8
 DATASET_ROOT="$ROOT/datasets/sana-wm-example"
-RUN="$PWD/output/state-ttt-h100-gpu3-$(date -u +%Y%m%dT%H%M%SZ)"
-bash tools/ttn_train_state_ttt_h100.sh 3 "$DATASET_ROOT" "$RUN"
+RUN="$PWD/output/state-ttt-h100-gpu5-$(date -u +%Y%m%dT%H%M%SZ)"
+bash tools/ttn_train_state_ttt_h100.sh 5 "$DATASET_ROOT" "$RUN"
 ```
 
 The launcher starts a **single process** (`--parallel single`); the existing
@@ -41,10 +41,14 @@ Batch size is one clip / optimizer step; it is not the same effective batch as
 the earlier two- or four-GPU jobs. The inherited/new parameter learning rates
 remain 1e-6/1e-5 rather than changing silently with GPU count.
 
+Dataset construction supports this direct Python entrypoint without `RANK`
+or an initialized process group. It uses SANA's safe rank helper (rank 0 for
+single-process execution); distributed runs use their initialized group rank.
+
 To resume this new architecture, keep its own output directory and pass:
 
 ```bash
-bash tools/ttn_train_state_ttt_h100.sh 3 "$DATASET_ROOT" "$RUN" --resume
+bash tools/ttn_train_state_ttt_h100.sh 5 "$DATASET_ROOT" "$RUN" --resume
 ```
 
 ## Metrics and checkpoints

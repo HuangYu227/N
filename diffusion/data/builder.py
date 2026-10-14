@@ -23,6 +23,7 @@ from termcolor import colored
 from torch.utils.data import DataLoader
 
 from diffusion.data.transforms import get_transform
+from diffusion.utils.dist_utils import get_rank
 from diffusion.utils.logger import get_root_logger
 
 
@@ -67,7 +68,7 @@ def build_dataset(cfg, resolution=224, **kwargs):
     logger = get_root_logger()
 
     dataset_type = cfg.get("type")
-    rank = int(os.environ["RANK"])
+    rank = get_rank()
     if rank == 0:
         logger.info(f"Constructing dataset {dataset_type}...")
     t = time.time()

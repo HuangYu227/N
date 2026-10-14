@@ -33,7 +33,7 @@ def test_enhanced_and_legacy_configs_have_distinct_checkpoint_identities():
 
 
 @pytest.mark.parametrize('exit_code', [0, 7])
-def test_h100_launcher_uses_gpu3_and_records_real_training_exit(tmp_path, exit_code):
+def test_h100_launcher_uses_gpu5_and_records_real_training_exit(tmp_path, exit_code):
     data = tmp_path / 'data-root'
     for name in ('data/sekai_game_train_961frames_16fps_ovl640',
                  'data/vae_cache/LTX2VAE_diffusers_704x1280/sekai_game_train_961frames_16fps_ovl640'):
@@ -46,17 +46,17 @@ def test_h100_launcher_uses_gpu3_and_records_real_training_exit(tmp_path, exit_c
                     'exit "$TEST_TRAIN_EXIT"\n', encoding='utf-8')
     fake.chmod(0o755)
     output = tmp_path / 'new-run'
-    result = subprocess.run([bash(), 'tools/ttn_train_state_ttt_h100.sh', '3',
+    result = subprocess.run([bash(), 'tools/ttn_train_state_ttt_h100.sh', '5',
                              data.as_posix(), output.as_posix()], cwd=ROOT,
                             env={**os.environ, 'PYTHON': fake.as_posix(), 'TEST_TRAIN_EXIT': str(exit_code)},
                             capture_output=True, text=True, encoding='utf-8', timeout=30)
     assert result.returncode == exit_code, result.stderr
     assert (output / 'train.exit-code').read_text().strip() == str(exit_code)
     log = (output / 'train.log').read_text(encoding='utf-8')
-    assert 'GPU=3' in log
+    assert 'GPU=5' in log
     assert '--parallel\nsingle' in log and '--max-steps\n500' in log
     assert 'configs/worldttn/state_ttt_fp8.json' in log
-    repeated = subprocess.run([bash(), 'tools/ttn_train_state_ttt_h100.sh', '3',
+    repeated = subprocess.run([bash(), 'tools/ttn_train_state_ttt_h100.sh', '5',
                                data.as_posix(), output.as_posix()], cwd=ROOT,
                               capture_output=True, text=True, encoding='utf-8', timeout=30)
     assert repeated.returncode == 2 and 'new output directory' in repeated.stderr
