@@ -33,9 +33,8 @@ from diffusion.model.ops.fused_gdn_chunkwise import (
 # has only ~102 KB SRAM/SM. Default BLOCK_S=64 + num_stages=2 needs
 # ~114-120 KB (BLOCK_D=128 fp32 accumulator dominates: 64 KB; bf16 M_f
 # 32 KB; plus per-stage Q/dO tiles). Drop to BS=16 + ns=1 there.
-# (NOTE: phase_a_kv_bwd still OOMs at BS=16+ns=1 on consumer Blackwell —
-# BLOCK_D × BLOCK_D bf16 dA+dP buffers alone exceed SRAM. Real fix is a
-# D-tile rewrite, deferred. NVIDIA GPUs work fine.)
+# Phase A also tiles output columns on devices with less than 150 KiB
+# shared memory, including L20; the D-wide dot reduction is unchanged.
 # ──────────────────────────────────────────────────────────────────
 _BWD_LAUNCH_PARAMS: dict[str, dict] = {
     "ampere": {"BLOCK_S": 64, "phase_c_ns": 2, "phase_a_ns": 1},
@@ -45,17 +44,24 @@ _BWD_LAUNCH_PARAMS: dict[str, dict] = {
 }
 
 
-def _resolve_bwd_params() -> dict:
+def _resolve_bwd_params(device=None) -> dict:
     """Return arch-appropriate launch params for the bwd Triton kernels."""
     if not torch.cuda.is_available():
         return _BWD_LAUNCH_PARAMS["ampere"]
-    cap = torch.cuda.get_device_capability(0)
+    cap = torch.cuda.get_device_capability(device)
     return _BWD_LAUNCH_PARAMS.get(_arch_key(cap), _BWD_LAUNCH_PARAMS["ampere"])
 
 
 def _resolve_bwd_block_s(default: int = 64) -> int:
     """Return arch-appropriate BLOCK_S for the chunkwise bwd kernels."""
     return _resolve_bwd_params().get("BLOCK_S", default)
+
+
+def _phase_a_kv_block_col(device, block_d):
+    # L20 and consumer GPUs cannot hold the full 128-column backward buffers.
+    if block_d >= 128 and torch.cuda.get_device_properties(device).shared_memory_per_block_optin < 150 * 1024:
+        return 32
+    return block_d
 
 
 # ======================================================================
@@ -130,7 +136,7 @@ def _phase_c_bwd_kernel(
 def phase_c_bwd(Q, M_post, dO, D, BLOCK_S=None, dot_precision=0):
     """Phase C̄ driver. Q, dO: (B, F, S, D); M_post: (B, F, D, D).
     Returns dQ: (B, F, S, D), dM_C: (B, F, D, D)."""
-    p = _resolve_bwd_params()
+    p = _resolve_bwd_params(Q.device)
     if BLOCK_S is None:
         BLOCK_S = p["BLOCK_S"]
     ns = p["phase_c_ns"]
@@ -430,6 +436,7 @@ def _phase_a_kv_bwd_kernel(
     D: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_S: tl.constexpr,
+    BLOCK_COL: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
 ):
     """One block per (b, f). Loops over S tiles producing dK, dV, dβ from dA, dP constants."""
@@ -447,8 +454,10 @@ def _phase_a_kv_bwd_kernel(
     offs_dd = offs_d[:, None] * BLOCK_D + offs_d[None, :]
     mask_dd = mask_d[:, None] & mask_d[None, :]
 
-    dA = tl.load(dA_ptr + (b * F + f) * BLOCK_D * BLOCK_D + offs_dd, mask=mask_dd, other=0.0).to(tl.bfloat16)
-    dP = tl.load(dP_ptr + (b * F + f) * BLOCK_D * BLOCK_D + offs_dd, mask=mask_dd, other=0.0).to(tl.bfloat16)
+    matrix_base = (b * F + f) * BLOCK_D * BLOCK_D
+    if BLOCK_COL == BLOCK_D:
+        dA = tl.load(dA_ptr + matrix_base + offs_dd, mask=mask_dd, other=0.0).to(tl.bfloat16)
+        dP = tl.load(dP_ptr + matrix_base + offs_dd, mask=mask_dd, other=0.0).to(tl.bfloat16)
 
     qkv_stride_bn = F * S * D
     qkv_stride_n = D
@@ -470,30 +479,49 @@ def _phase_a_kv_bwd_kernel(
         V_tile = tl.load(v_ptrs, mask=mask_sd, other=0.0).to(tl.float32)
         beta_tile = tl.load(beta_bf_base + offs_s, mask=mask_s, other=0.0).to(tl.float32)
 
-        K_dP = tl.dot(K_tile.to(tl.bfloat16), dP, out_dtype=tl.float32, input_precision=dot_ip)
-        K_dPT = tl.dot(K_tile.to(tl.bfloat16), tl.trans(dP), out_dtype=tl.float32, input_precision=dot_ip)
-        dK_from_P = beta_tile[:, None] * (K_dP + K_dPT)
-
-        V_dAT = tl.dot(V_tile.to(tl.bfloat16), tl.trans(dA), out_dtype=tl.float32, input_precision=dot_ip)
-        dK_from_A = beta_tile[:, None] * V_dAT
-        dK_tile = dK_from_P + dK_from_A
-
-        K_dA = tl.dot(K_tile.to(tl.bfloat16), dA, out_dtype=tl.float32, input_precision=dot_ip)
-        dV_tile = beta_tile[:, None] * K_dA
-
-        dbeta_tile = tl.sum(K_dP * K_tile, axis=1) + tl.sum(K_dA * V_tile, axis=1)
-
-        dk_ptrs = dK_bf_base + offs_s[:, None] * qkv_stride_n + offs_d[None, :]
-        dv_ptrs = dV_bf_base + offs_s[:, None] * qkv_stride_n + offs_d[None, :]
-        tl.store(dk_ptrs, dK_tile, mask=mask_sd)
-        tl.store(dv_ptrs, dV_tile, mask=mask_sd)
+        if BLOCK_COL == BLOCK_D:
+            K_dP = tl.dot(K_tile.to(tl.bfloat16), dP, out_dtype=tl.float32, input_precision=dot_ip)
+            K_dPT = tl.dot(K_tile.to(tl.bfloat16), tl.trans(dP), out_dtype=tl.float32, input_precision=dot_ip)
+            dK_from_P = beta_tile[:, None] * (K_dP + K_dPT)
+            V_dAT = tl.dot(V_tile.to(tl.bfloat16), tl.trans(dA), out_dtype=tl.float32, input_precision=dot_ip)
+            dK_from_A = beta_tile[:, None] * V_dAT
+            dK_tile = dK_from_P + dK_from_A
+            K_dA = tl.dot(K_tile.to(tl.bfloat16), dA, out_dtype=tl.float32, input_precision=dot_ip)
+            dV_tile = beta_tile[:, None] * K_dA
+            dbeta_tile = tl.sum(K_dP * K_tile, axis=1) + tl.sum(K_dA * V_tile, axis=1)
+            tl.store(dK_bf_base + offs_s[:, None] * qkv_stride_n + offs_d[None, :], dK_tile, mask=mask_sd)
+            tl.store(dV_bf_base + offs_s[:, None] * qkv_stride_n + offs_d[None, :], dV_tile, mask=mask_sd)
+        else:
+            dbeta_tile = tl.full((BLOCK_S,), 0., tl.float32)
+            for c0 in range(0, BLOCK_D, BLOCK_COL):
+                cols = c0 + tl.arange(0, BLOCK_COL)
+                mask_dc = mask_d[:, None] & (cols[None, :] < D)
+                direct = offs_d[:, None] * BLOCK_D + cols[None, :]
+                transposed = cols[None, :] * BLOCK_D + offs_d[:, None]
+                dp = tl.load(dP_ptr + matrix_base + direct, mask=mask_dc, other=0.).to(tl.bfloat16)
+                dpt = tl.load(dP_ptr + matrix_base + transposed, mask=mask_dc, other=0.).to(tl.bfloat16)
+                dat = tl.load(dA_ptr + matrix_base + transposed, mask=mask_dc, other=0.).to(tl.bfloat16)
+                da = tl.load(dA_ptr + matrix_base + direct, mask=mask_dc, other=0.).to(tl.bfloat16)
+                kdp = tl.dot(K_tile.to(tl.bfloat16), dp, out_dtype=tl.float32, input_precision=dot_ip)
+                kdpt = tl.dot(K_tile.to(tl.bfloat16), dpt, out_dtype=tl.float32, input_precision=dot_ip)
+                vdat = tl.dot(V_tile.to(tl.bfloat16), dat, out_dtype=tl.float32, input_precision=dot_ip)
+                kda = tl.dot(K_tile.to(tl.bfloat16), da, out_dtype=tl.float32, input_precision=dot_ip)
+                dk = beta_tile[:, None] * (kdp + kdpt) + beta_tile[:, None] * vdat
+                dv = beta_tile[:, None] * kda
+                mask_sc = mask_s[:, None] & (cols[None, :] < D)
+                offsets = offs_s[:, None] * qkv_stride_n + cols[None, :]
+                raw_k = tl.load(K_bf_base + offsets, mask=mask_sc, other=0.).to(tl.float32)
+                raw_v = tl.load(V_bf_base + offsets, mask=mask_sc, other=0.).to(tl.float32)
+                dbeta_tile += tl.sum(kdp * raw_k, axis=1) + tl.sum(kda * raw_v, axis=1)
+                tl.store(dK_bf_base + offsets, dk, mask=mask_sc)
+                tl.store(dV_bf_base + offsets, dv, mask=mask_sc)
         tl.store(dbeta_bf_base + offs_s, dbeta_tile, mask=mask_s)
 
 
 def phase_a_kv_bwd(K, V, beta, dA, dP, D, BLOCK_S=None, dot_precision=0):
     """Phase Ā KV driver. K, V: (B, F, S, D); dA, dP: (B, F, D, D); beta: (B, F, S).
     Returns dK, dV, dbeta."""
-    p = _resolve_bwd_params()
+    p = _resolve_bwd_params(K.device)
     if BLOCK_S is None:
         BLOCK_S = p["BLOCK_S"]
     ns = p["phase_a_ns"]
@@ -527,6 +555,7 @@ def phase_a_kv_bwd(K, V, beta, dA, dP, D, BLOCK_S=None, dot_precision=0):
         D=D,
         BLOCK_D=BLOCK_D,
         BLOCK_S=BLOCK_S,
+        BLOCK_COL=_phase_a_kv_block_col(K.device, BLOCK_D),
         DOT_PRECISION=dot_precision,
         num_warps=8,
         num_stages=ns,
@@ -551,6 +580,7 @@ def _phase_a_z_bwd_kernel(
     D: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_S: tl.constexpr,
+    BLOCK_COL: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
 ):
     """Phase Ā for Z-stream. One block per (b, f). dB_z (D-vector) broadcasts across S tiles."""
@@ -569,7 +599,9 @@ def _phase_a_z_bwd_kernel(
     mask_dd = mask_d[:, None] & mask_d[None, :]
 
     dB_z = tl.load(dB_z_ptr + (b * F + f) * BLOCK_D + offs_d, mask=mask_d, other=0.0)
-    dP_z = tl.load(dP_z_ptr + (b * F + f) * BLOCK_D * BLOCK_D + offs_dd, mask=mask_dd, other=0.0).to(tl.bfloat16)
+    matrix_base = (b * F + f) * BLOCK_D * BLOCK_D
+    if BLOCK_COL == BLOCK_D:
+        dP_z = tl.load(dP_z_ptr + matrix_base + offs_dd, mask=mask_dd, other=0.0).to(tl.bfloat16)
 
     qkv_stride_bn = F * S * D
     qkv_stride_n = D
@@ -587,24 +619,40 @@ def _phase_a_z_bwd_kernel(
         K_tile = tl.load(k_ptrs, mask=mask_sd, other=0.0).to(tl.float32)
         beta_tile = tl.load(beta_bf_base + offs_s, mask=mask_s, other=0.0).to(tl.float32)
 
-        K_dPz = tl.dot(K_tile.to(tl.bfloat16), dP_z, out_dtype=tl.float32, input_precision=dot_ip)
-        K_dPzT = tl.dot(K_tile.to(tl.bfloat16), tl.trans(dP_z), out_dtype=tl.float32, input_precision=dot_ip)
-        dK_from_Pz = beta_tile[:, None] * (K_dPz + K_dPzT)
-        dK_from_Bz = beta_tile[:, None] * dB_z[None, :]
-        dK_tile = dK_from_Pz + dK_from_Bz
-
-        dbeta_from_Pz = tl.sum(K_dPz * K_tile, axis=1)
-        dbeta_from_Bz = tl.sum(K_tile * dB_z[None, :], axis=1)
-        dbeta_tile = dbeta_from_Pz + dbeta_from_Bz
-
-        dk_ptrs = dK_bf_base + offs_s[:, None] * qkv_stride_n + offs_d[None, :]
-        tl.store(dk_ptrs, dK_tile, mask=mask_sd)
+        if BLOCK_COL == BLOCK_D:
+            K_dPz = tl.dot(K_tile.to(tl.bfloat16), dP_z, out_dtype=tl.float32, input_precision=dot_ip)
+            K_dPzT = tl.dot(K_tile.to(tl.bfloat16), tl.trans(dP_z), out_dtype=tl.float32, input_precision=dot_ip)
+            dK_from_Pz = beta_tile[:, None] * (K_dPz + K_dPzT)
+            dK_from_Bz = beta_tile[:, None] * dB_z[None, :]
+            dK_tile = dK_from_Pz + dK_from_Bz
+            dbeta_from_Pz = tl.sum(K_dPz * K_tile, axis=1)
+            dbeta_from_Bz = tl.sum(K_tile * dB_z[None, :], axis=1)
+            dbeta_tile = dbeta_from_Pz + dbeta_from_Bz
+            tl.store(dK_bf_base + offs_s[:, None] * qkv_stride_n + offs_d[None, :], dK_tile, mask=mask_sd)
+        else:
+            dbeta_tile = tl.full((BLOCK_S,), 0., tl.float32)
+            for c0 in range(0, BLOCK_D, BLOCK_COL):
+                cols = c0 + tl.arange(0, BLOCK_COL)
+                mask_dc = mask_d[:, None] & (cols[None, :] < D)
+                dp = tl.load(dP_z_ptr + matrix_base + offs_d[:, None] * BLOCK_D + cols[None, :],
+                             mask=mask_dc, other=0.).to(tl.bfloat16)
+                dpt = tl.load(dP_z_ptr + matrix_base + cols[None, :] * BLOCK_D + offs_d[:, None],
+                              mask=mask_dc, other=0.).to(tl.bfloat16)
+                kdp = tl.dot(K_tile.to(tl.bfloat16), dp, out_dtype=tl.float32, input_precision=dot_ip)
+                kdpt = tl.dot(K_tile.to(tl.bfloat16), dpt, out_dtype=tl.float32, input_precision=dot_ip)
+                db = tl.load(dB_z_ptr + (b * F + f) * BLOCK_D + cols, mask=cols < D, other=0.)
+                dk = beta_tile[:, None] * (kdp + kdpt) + beta_tile[:, None] * db[None, :]
+                mask_sc = mask_s[:, None] & (cols[None, :] < D)
+                offsets = offs_s[:, None] * qkv_stride_n + cols[None, :]
+                raw_k = tl.load(K_bf_base + offsets, mask=mask_sc, other=0.).to(tl.float32)
+                dbeta_tile += tl.sum(kdp * raw_k, axis=1) + tl.sum(raw_k * db[None, :], axis=1)
+                tl.store(dK_bf_base + offsets, dk, mask=mask_sc)
         tl.store(dbeta_bf_base + offs_s, dbeta_tile, mask=mask_s)
 
 
 def phase_a_z_bwd(K, beta, dB_z, dP_z, D, BLOCK_S=None, dot_precision=0):
     """Phase Ā_z driver."""
-    p = _resolve_bwd_params()
+    p = _resolve_bwd_params(K.device)
     if BLOCK_S is None:
         BLOCK_S = p["BLOCK_S"]
     ns = p["phase_a_ns"]
@@ -641,6 +689,7 @@ def phase_a_z_bwd(K, beta, dB_z, dP_z, D, BLOCK_S=None, dot_precision=0):
         D=D,
         BLOCK_D=BLOCK_D,
         BLOCK_S=BLOCK_S,
+        BLOCK_COL=_phase_a_kv_block_col(K.device, BLOCK_D),
         DOT_PRECISION=dot_precision,
         num_warps=8,
         num_stages=ns,

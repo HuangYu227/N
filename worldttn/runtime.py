@@ -47,6 +47,12 @@ class TTNChunkContext:
     noise_info: dict = field(default_factory=dict)
     collect_local_stats: bool = False
     local_trajectory: list = field(default_factory=list)
+    sequence_mode: bool = False
+    sequence_coefficients: tuple = ()
+    camera_cached_chunks: int = 2
+    checkpoint_cpu_inputs: bool = False
+    measure_psi_output: bool = False
+    sequence_memory_callback: object = None
 
     def for_clean(self):
         return TTNChunkContext(self.predicted, self.previous, self.psi, self.cbase, self.system, self.frame_ids,

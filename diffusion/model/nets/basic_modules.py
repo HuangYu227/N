@@ -26,7 +26,7 @@ from diffusion.distributed.context_parallel.halo_exchange import cp_halo_exchang
 from diffusion.model.act import build_act, get_act_name
 from diffusion.model.norms import build_norm, get_norm_name
 from diffusion.model.registry import FFN_BLOCKS
-from diffusion.model.utils import get_same_padding, val2tuple
+from diffusion.model.utils import checkpoint_preserving_strides, get_same_padding, val2tuple
 
 
 class ConvLayer(nn.Module):
@@ -173,9 +173,14 @@ class GLUMBConv(nn.Module):
         # Conservative estimate of the largest intermediate (after inverted_conv).
         elements_per_bt = self.inverted_conv.conv.out_channels * H * W
         max_bt = max(1, _INT32_SAFE_CONV_ELEMENTS // elements_per_bt)
+        # Only pure spatial computation is replayed. Temporal cache writes stay
+        # in forward(), outside this checkpoint and outside its recomputation.
+        spatial = self._apply_spatial
+        if getattr(self, "ttn_activation_checkpointing", False) and torch.is_grad_enabled():
+            spatial = lambda value: checkpoint_preserving_strides(self._apply_spatial, value)
         if BT <= max_bt:
-            return self._apply_spatial(x)
-        return torch.cat([self._apply_spatial(x[s : s + max_bt]) for s in range(0, BT, max_bt)], dim=0)
+            return spatial(x)
+        return torch.cat([spatial(x[s : s + max_bt]) for s in range(0, BT, max_bt)], dim=0)
 
     def forward(self, x: torch.Tensor, HW=None) -> torch.Tensor:
         B, N, C = x.shape
@@ -386,7 +391,8 @@ class CachedGLUMBConvTemp(GLUMBConvTemp):
                 padded_size = x_t_conv_in.shape[2] - x_reshaped.shape[2]
 
             if save_kv_cache:  # Save current chunk's cache for next chunk
-                kv_cache[-1] = x_reshaped[:, :, -padding_size:, :].detach().clone()
+                kv_cache[-1] = (x_t_conv_in[:, :, -padding_size:, :].clone()
+                    if kwargs.get("ttn_live_cache", False) else x_reshaped[:, :, -padding_size:, :].detach().clone())
 
         t_conv_out = self.t_conv(x_t_conv_in)[:, :, padded_size:]
         x_out = x_reshaped + t_conv_out

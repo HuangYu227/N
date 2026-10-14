@@ -146,6 +146,7 @@ def _cached_temporal_short_conv(
     HW: tuple[int, int, int],
     conv_cache: torch.Tensor | None,
     save_cache: bool,
+    live_cache: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Short conv with cached left context: forward-cached + backward-isolated.
 
@@ -183,7 +184,7 @@ def _cached_temporal_short_conv(
         # Prepend cached left context and run full causal conv, then slice.
         x_fwd_in = torch.cat([conv_cache.to(x_t.dtype), x_t], dim=1)
         y_fwd_full, _ = conv(x_fwd_in)
-        y_fwd = y_fwd_full[:, K - 1 :, :]  # drop positions from cached prefix
+        y_fwd = y_fwd_full[:, conv_cache.shape[1]:, :]
     else:
         y_fwd, _ = conv(x_t)
 
@@ -202,7 +203,8 @@ def _cached_temporal_short_conv(
     # Save cache: last K-1 timesteps of the conv INPUT (for next chunk's left context).
     new_cache: torch.Tensor | None = None
     if save_cache and K > 1:
-        new_cache = x_t[:, -(K - 1) :, :].detach().clone()
+        new_cache = x_fwd_in[:, -(K - 1):] if conv_cache is not None else x_t[:, -(K - 1):]
+        new_cache = new_cache.clone() if live_cache else x_t[:, -(K - 1):].detach().clone()
 
     # Reshape back to (B, N, C).
     y = y.reshape(B_orig, S, T, C).permute(0, 2, 1, 3).reshape(B_orig, N, C)
@@ -619,6 +621,7 @@ def _cam_prep_triton(
     rotary_emb: torch.Tensor | None,
     conv_cache: torch.Tensor | None,
     save_cache: bool,
+    live_cache: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, callable, torch.Tensor | None]:
     """Streaming cam-branch QKV prep through the bidir's fused Triton kernel.
 
@@ -670,6 +673,7 @@ def _cam_prep_triton(
             HW,
             conv_cache,
             save_cache,
+            live_cache,
         )
 
     q_raw = q_raw.contiguous().view(B, N, H_heads, D_head).contiguous()
@@ -786,7 +790,8 @@ def _cached_gdn_forward_triton(
     if layer.conv_k is not None:
         k_flat = qkv[:, :, 1].reshape(B, N, C)
         k_flat, new_conv_cache = _cached_temporal_short_conv(
-            k_flat, layer.conv_k, HW, kv_cache[_SLOT_SHORTCONV], save_kv_cache
+            k_flat, layer.conv_k, HW, kv_cache[_SLOT_SHORTCONV], save_kv_cache,
+            kwargs.get("ttn_live_cache", False)
         )
         qkv = qkv.clone() if torch.is_grad_enabled() and qkv.requires_grad else qkv.contiguous()
         qkv[:, :, 1].copy_(k_flat.reshape(B, N, H, D))
@@ -818,8 +823,9 @@ def _cached_gdn_forward_triton(
     )
 
     if save_kv_cache:
-        kv_cache[_SLOT_FWD_KV] = S_kv_new.detach().clone()
-        kv_cache[_SLOT_FWD_Z] = S_z_new.detach().clone()
+        live = kwargs.get("ttn_live_cache", False)
+        kv_cache[_SLOT_FWD_KV] = S_kv_new if live else S_kv_new.detach().clone()
+        kv_cache[_SLOT_FWD_Z] = S_z_new if live else S_z_new.detach().clone()
         kv_cache[_SLOT_TYPE_FLAG] = _TYPE_STATE
 
     # 5. Output gate + projection, matching the torch path's tail.

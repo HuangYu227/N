@@ -201,7 +201,7 @@ def check_distributed(device):
 
 class ParallelTraining:
     def __init__(self, model, loss_fn, mode="single", *, activation_offload="none", memory_trace=False):
-        if activation_offload not in ("none", "cpu"): raise ValueError("activation_offload must be none or cpu")
+        if activation_offload not in ("none", "cpu", "cpu-pageable"): raise ValueError("activation_offload must be none or cpu or cpu-pageable")
         self.model = model
         self.loss_fn = loss_fn
         self.mode = mode
@@ -209,6 +209,9 @@ class ParallelTraining:
         self.memory_trace = memory_trace
         self.rank, self.world = rank_world()
         self.window = TTNTrainingWindow(model, loss_fn)
+        if getattr(model, 'ttn_training_protocol', '') == 'dual-psi-clean-fullgrad-v1':
+            from .legacy_sequence_training import LegacySequenceTraining
+            self.window = LegacySequenceTraining(model, loss_fn)
         if mode == "ddp":
             if self.world < 2: raise ValueError("DDP requires an initialized multi-process group")
             from torch.nn.parallel import DistributedDataParallel

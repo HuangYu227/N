@@ -1,0 +1,2 @@
+# Validated together with PyTorch 2.9.1+cu128; do not upgrade a running training environment.
+torchao==0.14.1

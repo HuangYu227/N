@@ -79,12 +79,31 @@ def synthetic_bundle(config, device, frames=13, height=22, width=40):
 
 
 def build(args, stage=None, sana_path=None):
-    from .sana import load_sana_config, build_sana, configure_cross_attention
+    from .sana import load_sana_config, build_sana, configure_cross_attention, configure_activation_checkpointing
     ttn, settings = read_reference(args.config, stage or args.stage)
     source = sana_path or args.sana_config or settings["sana_config"]
     source = Path(source)
     if not source.is_absolute(): source = ROOT / source
     config = load_sana_config(source)
+    protocol = settings.get("training_protocol", "clean-tbptt")
+    if protocol not in ("clean-tbptt", "dual-psi-clean-fullgrad-v1"):
+        raise ValueError("unknown training protocol")
+    if protocol == "dual-psi-clean-fullgrad-v1":
+        if not (ttn.local_update and ttn.persistent_meta) or settings.get("tbptt") != 0:
+            raise ValueError("dual-psi fullgrad requires live Local/Persistent meta and tbptt=0")
+        if getattr(args, "tbptt", None) not in (None, 0): raise ValueError("fullgrad forbids TBPTT windows")
+    frames = settings.get("training_latent_frames")
+    if frames is not None:
+        if type(frames) is not int or frames < 4 or frames % 3 != 1: raise ValueError("training_latent_frames must be 1+3n")
+        config.data.num_frames = config.data.vae_ratio[0] * (frames-1) + 1
+        if getattr(args, "command", None) == "train": args.frames = frames
+    probability = getattr(args, "empty_text_probability", None)
+    if probability is None: probability = settings.get("empty_text_probability", 0.)
+    if not isinstance(probability, (int, float)) or not 0 <= probability <= 1:
+        raise ValueError("empty text probability must be 0..1")
+    args.empty_text_probability = probability
+    if probability and (getattr(args, "batch_file", None) or config.data.load_text_feat):
+        raise ValueError("empty text sampling requires raw prompts and frozen text encoder")
     root = getattr(args, "dataset_root", None)
     if root:
         from .sana import resolve_data_paths
@@ -97,11 +116,19 @@ def build(args, stage=None, sana_path=None):
     # Do not quantize inherited master weights to BF16 before joint fine-tuning.
     options = {"dtype": torch.float32} if getattr(args, "train_scope", "ttn") in ("ttn-visual", "ttn-new", "dit") else {}
     model = build_sana(config, ttn, args.base_weights, device=args.device, **options)
+    model.ttn_training_protocol = protocol
+    model.ttn_training_latent_frames = frames
+    model.ttn_camera_cached_chunks = settings.get("camera_cached_chunks", -1)
+    model.ttn_fullgrad_checkpoint = settings.get("fullgrad_checkpoint", True)
+    for block in model.blocks: block.ttn_fullgrad_checkpoint = model.ttn_fullgrad_checkpoint
+    memory = configure_activation_checkpointing(model, settings.get("activation_checkpointing", "none"))
     configure_from_args(model, args)
     policy = configure_cross_attention(model, getattr(args, "cross_attn_backend", "auto"),
                                        diagnostic_unmask_all_valid=getattr(args, "diagnostic_unmask_all_valid", False))
     from .distributed import rank_world
-    if rank_world()[0] == 0: print("[TTN SDPA] " + json.dumps(policy), flush=True)
+    if rank_world()[0] == 0:
+        print("[TTN SDPA] " + json.dumps(policy), flush=True)
+        print("[TTN activation checkpoint] " + json.dumps(memory), flush=True)
     return model, config, settings
 
 
@@ -109,6 +136,12 @@ def train_update(model, config, batch, optimizer, k, parallel=None, *, activatio
     from .cuda_debug import cuda_diagnostics
     from train_video_scripts.train_sana_wm_stage1 import _build_timesteps, _build_time_sampler
     clean = batch["clean_latents"].float()
+    expected = getattr(model, "ttn_training_latent_frames", None)
+    if expected is not None and clean.shape[2] != expected:
+        raise ValueError("batch latent frames disagree with training identity")
+    if k == 0 and (not torch.isfinite(clean).all() or batch.get("frame_valid_mask") is not None
+                   and not batch["frame_valid_mask"].all()):
+        raise ValueError("full episode requires finite unpadded complete clips")
     sampler = _build_time_sampler(config, clean.shape[2], clean.device)
     timesteps, _ = _build_timesteps(config, clean, clean.shape[2], True, time_sampler=sampler)
     noise = torch.randn_like(clean)
@@ -144,11 +177,13 @@ def train_update(model, config, batch, optimizer, k, parallel=None, *, activatio
                                 data_info=batch.get("data_info"), extras=extras,
                                 valid_mask=batch.get("frame_valid_mask"), tbptt=k, parallel=parallel,
                                 activation_offload=activation_offload,
+                                cached_chunks=getattr(model, "ttn_camera_cached_chunks", -1),
                                 memory_callback=trace if memory_trace else None)
     except torch.OutOfMemoryError:
         trace("oom", failed_after=memory_records[-1]["phase"] if memory_records else "unknown")
         raise
-    result.update(activation_offload=activation_offload, memory_phases=memory_records)
+    result.update(activation_offload=activation_offload, memory_phases=memory_records,
+                  unconditional=bool(batch.get("unconditional", False)))
     return result
 
 
@@ -263,6 +298,9 @@ def _dataset_batch(raw, config, args, tokenizer=None, encoder=None, encoder_devi
         raw, args.device, torch.float32, config.data.load_text_feat,
         getattr(config.data, "return_chunk_plucker", False))
     if not config.data.load_text_feat:
+        probability = getattr(args, "empty_text_probability", 0.) or 0.
+        unconditional = bool(torch.rand(()).item() < probability) if probability else False
+        if unconditional: y = [""] * len(y)
         with torch.no_grad():
             y, mask = _encode_prompts(y, tokenizer, encoder, config, encoder_device)
         y, mask = y.to(args.device), mask.to(args.device)
@@ -270,6 +308,7 @@ def _dataset_batch(raw, config, args, tokenizer=None, encoder=None, encoder_devi
     batch = {"clean_latents": clean, "y": y, "mask": mask,
              "data_info": to_device(info, args.device), "camera_conditions": camera.float(),
              "width": clean.shape[-1], "height": clean.shape[-2]}
+    batch["unconditional"] = unconditional if not config.data.load_text_feat else False
     if plucker is not None: batch["chunk_plucker"] = plucker
     return batch
 
@@ -304,6 +343,17 @@ def _training_identity(args, config, settings, k):
                                 "local_objective": "weighted_v_energy_support", "persistent_objective": "raw_weighted_innovation",
                                 "support": "absolute_frame_xy_checkerboard", "local_eta_init": .01, "local_delta": 1.,
                                 "noise_gate": False}
+    if settings.get("training_protocol") == "dual-psi-clean-fullgrad-v1":
+        identity.update(training_protocol="dual-psi-clean-fullgrad-v1",
+                        training_latent_frames=settings["training_latent_frames"],
+                        empty_text_probability=getattr(args, "empty_text_probability", .1),
+                        camera_cached_chunks=settings.get("camera_cached_chunks", 2))
+        identity["execution"].update(activation_checkpointing=settings.get("activation_checkpointing", "none"),
+                                     fullgrad_checkpoint=settings.get("fullgrad_checkpoint", True))
+    precision = getattr(args, "train_precision", None) or settings.get("training_precision", "bf16")
+    if precision != "bf16":
+        from .fp8 import precision_identity
+        identity["compute_precision"] = precision_identity(precision)
     return identity
 
 
@@ -317,7 +367,7 @@ def _training_record(model, result, timing, parallel):
     if "anchor_gradients" in result: local["anchor_gradients"] = result["anchor_gradients"]
     from .distributed import gather_records
     if "parameter_update" in result: local["parameter_update"] = result["parameter_update"]
-    for key in ("optimizer_updates", "exposure"):
+    for key in ("optimizer_updates", "exposure", "sequence", "unconditional", "prediction_diagnostics", "lifecycle"):
         if key in result: local[key] = result[key]
     ranks = gather_records(local)
     return {"loss": sum(record["loss"] for record in ranks) / parallel.world,
@@ -337,7 +387,7 @@ def benchmark_run(args):
 
 def checkpoint_due(args, step):
     enabled = not benchmark_run(args) or getattr(args, "benchmark_save_checkpoint", False)
-    return enabled and (step % args.save_every == 0 or step == args.max_steps)
+    return enabled and (step % args.save_every == 0 or step == args.max_steps or step in getattr(args,'extra_checkpoint_steps',()))
 
 
 def resolve_train_scope(args):
@@ -375,12 +425,13 @@ def train_command(args):
     resolve_train_scope(args)
     args._failure_phase = "model-build"
     model, config, settings = build(args)
+    args.extra_checkpoint_steps = settings.get('startup_checkpoint_steps', ())
     from .anchor import configure_train_scope, is_ttn_parameter
     if getattr(args, "train_scope", "ttn") != "ttn":
         configure_train_scope(model, args.train_scope)
     mode = getattr(args, "parallel", "single")
     rank, world = rank_world()
-    k = args.tbptt or settings.get("tbptt", 2)
+    k = (args.tbptt if args.tbptt is not None else settings.get("tbptt", 2))
     payload = read_checkpoint(args.adapter, model, resume=args.resume) if args.adapter else None
     resolve_optimizer_policy(args, payload)
     identity = _training_identity(args, config, settings, k)
@@ -396,7 +447,14 @@ def train_command(args):
         resume_execution = validate_training_checkpoint(payload, mode, world, identity, benchmark=benchmark_run(args))
     elif args.resume and mode != "single":
         raise ValueError("multi-GPU resume requires optimizer shards; use --adapter without --resume for initialization")
-    if payload: apply_checkpoint_weights(model, payload)
+    if payload:
+        apply_checkpoint_weights(model, payload)
+        # Release copied CPU weights before constructing the training graph.
+        payload = {key: value for key, value in payload.items() if key not in ('adapter', 'optimizer')}
+    from .fp8 import configure_training_precision
+    precision = getattr(args, "train_precision", None) or settings.get("training_precision", "bf16")
+    precision_report = configure_training_precision(model, precision)
+    if rank == 0: print("[TTN training precision] " + json.dumps(precision_report), flush=True)
     parallel = ParallelTraining(model, SANAFlowLoss(config), mode,
                                 activation_offload=getattr(args, "activation_offload", "none"),
                                 memory_trace=getattr(args, "memory_trace", False))
@@ -467,6 +525,7 @@ def train_command(args):
                "storage": parallel.storage_record(optimizer),
                "provenance": implementation_identity(),
                "execution": execution_report(model), "resume_execution": resume_execution, "precision": precision_audit(),
+               "training_precision": precision_report,
                "camera_attention": model.ttn_system.config.camera_attention,
                "history_protocol": {"clean_commits": "GT after current noisy loss", "camera_cache": "all previous chunks within clip",
                                     "prefill": "initial frame once; independent GDN/FFN scratch caches", "telemetry": "detached statistics; rank/head separated",
@@ -474,6 +533,12 @@ def train_command(args):
                                     "local_lifecycle": "ephemeral per noisy call" if model.ttn_system.config.local_update else "disabled"},
                "implementation": {name: {"path": str(path.resolve()), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
                                   for name, path in sources.items()}}
+        if k == 0:
+            run["history_protocol"].update(training_protocol="dual-psi-clean-fullgrad-v1",
+                persistent_gradient="live entire episode including observed prefill; no temporal detach",
+                camera_cache=f"last {model.ttn_camera_cached_chunks} groups; retained entries live",
+                temporal_detaches=0, backward_calls=1,
+                empty_text_probability=args.empty_text_probability)
         if unfreeze:
             run["initialization"] = {"checkpoint": str(Path(args.adapter).resolve()), "step": step,
                                      "optimizer_reset": True, "rng_and_data_cursor_restored": True}
@@ -561,8 +626,15 @@ def train_command(args):
             (output / "performance.json").write_text(json.dumps(performance, indent=2), encoding="utf-8")
         if checkpoint_due(args, step):
             args._failure_phase = "checkpoint-save"
-            save_training_checkpoint(output / "last.pt", parallel, optimizer, step,
+            receipt = save_training_checkpoint(output / "last.pt", parallel, optimizer, step,
                                      stream.state_dict() if stream is not None else {}, identity)
+            if rank == 0 and step in settings.get('keep_model_steps', ()):
+                from .checkpoint_integrity import publish_model
+                directory = output / 'models'
+                directory.mkdir(exist_ok=True)
+                saved = directory / f'step-{step:08d}.pt'
+                publish_model(output / 'last.pt', saved)
+                (saved.with_suffix('.json')).write_text(json.dumps(receipt, indent=2), encoding='utf-8')
     if benchmark_steps and args.ttn_core_backend == "compiled": benchmark_warmup(False)
 
 
@@ -610,7 +682,7 @@ def smoke_command(args):
         batch = load_bundle(args.batch_file, args.device) if args.batch_file else synthetic_bundle(
             config, args.device, args.frames, args.latent_height, args.latent_width)
         result, train_timing = timed_cuda(
-            lambda: train_update(model, config, batch, optimizer, args.tbptt or settings.get("tbptt", 2),
+            lambda: train_update(model, config, batch, optimizer, (args.tbptt if args.tbptt is not None else settings.get("tbptt", 2)),
                                  activation_offload=args.activation_offload, memory_trace=args.memory_trace))
         gradients = {
             name: float(p.grad.float().norm())
@@ -684,7 +756,7 @@ def distributed_smoke_command(args):
         batch = load_bundle(args.batch_file.replace("{rank}", str(rank)), args.device) if args.batch_file else (
             synthetic_bundle(config, args.device, args.frames, args.latent_height, args.latent_width))
         if batch["clean_latents"].shape[0] != 1: raise ValueError("smoke training uses one clip per rank")
-        k = args.tbptt or settings.get("tbptt", 2)
+        k = (args.tbptt if args.tbptt is not None else settings.get("tbptt", 2))
         result, timing = timed_cuda(lambda: train_update(model, config, batch, optimizer, k, parallel))
         expected = len(chunk_ranges(batch["clean_latents"].shape[2])) + 1
         if result["runtime"].commit_count != expected or result["runtime"].predict_count != expected:
@@ -753,7 +825,7 @@ def diagnose_update_command(args):
     batch = load_bundle(args.batch_file.replace("{rank}", str(rank)), args.device) if args.batch_file else (
         synthetic_bundle(config, args.device, args.frames, args.latent_height, args.latent_width))
     if batch["clean_latents"].shape[0] != 1: raise ValueError("diagnosis uses one clip per rank")
-    k = args.tbptt or settings.get("tbptt", 2)
+    k = (args.tbptt if args.tbptt is not None else settings.get("tbptt", 2))
     result, timing = timed_cuda(lambda: train_update(model, config, batch, optimizer, k, parallel))
     expected = len(chunk_ranges(batch["clean_latents"].shape[2])) + 1
     runtime = result["runtime"]
@@ -810,8 +882,10 @@ def main():
                         help="explicitly save resume bundles in benchmark/profiler/layout runs (default: no checkpoint IO)")
     parser.add_argument("--ttn-compare-reference", action="store_true",
                         help="evaluate: add same-weight TTN reference rollout and direct latent/S/psi differences")
-    parser.add_argument("--activation-offload", choices=("none", "cpu"), default="none",
+    parser.add_argument("--activation-offload", choices=("none", "cpu", "cpu-pageable"), default="none",
                         help="store backward saved tensors in pinned host RAM; single/DDP/FSDP2, no forward replay")
+    parser.add_argument("--train-precision", choices=("bf16", "fp8"),
+                        help="train: FP8 FFN/text projections with FP32 TLA/TTT cores; requires torchao")
     parser.add_argument("--memory-trace", action="store_true",
                         help="print per-rank prefill/noisy/clean/backward/optimizer memory diagnostics")
     parser.add_argument("--cuda-trace", action="store_true",
@@ -851,7 +925,8 @@ def main():
                         help="train: initialize DiT from C/sana-camera ttn-new or legacy visual warmup; reset optimizer, restore progress")
     parser.add_argument("--max-steps", type=int, default=1)
     parser.add_argument("--save-every", type=int, default=50)
-    parser.add_argument("--tbptt", type=int, choices=(1, 2, 4))
+    parser.add_argument("--tbptt", type=int, choices=(0, 1, 2, 4))
+    parser.add_argument("--empty-text-probability", type=float)
     parser.add_argument("--steps", type=int, help="default 4 for smoke; evaluate requires an explicit quality schedule")
     parser.add_argument("--cfg-scale", type=float, default=4.5)
     parser.add_argument("--cached-blocks", type=int, default=-1)
@@ -925,6 +1000,8 @@ def main():
     else:
         os.environ.pop("TTN_CUDA_TRACE_DIR", None)
     if args.resume and not args.adapter: parser.error("--resume requires --adapter")
+    if args.train_precision is not None and args.command != "train":
+        parser.error("--train-precision is supported only for train")
     from .distributed import initialize, resolve_launch_environment, check_distributed, rank_world
     try:
         launch = resolve_launch_environment()

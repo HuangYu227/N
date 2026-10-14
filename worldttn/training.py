@@ -1,21 +1,55 @@
 """Causal clean-history training, one optimizer step per clip, explicit TBPTT windows."""
 from contextlib import nullcontext
+import weakref
 from dataclasses import dataclass, field
 import torch
 from .session import TTNSession, carry_cache
 from .cuda_debug import trace_backward
 
 
-def activation_storage(mode):
-    """Copy saved tensors to host before FSDP resharding; never replay TTN forwards.
+def activation_storage(mode, *, device=None):
+    """Snapshot saved tensors before FSDP resharding; never replay TTN forwards.
 
     Native save_on_cpu copies values (including weight views) during forward,
     so backward does not retain/read freed FSDP all-gather storage. FSDP's own
     parameter hooks still unshard and reduce the actual parameter gradients.
     """
+    if mode not in ("none", "cpu", "cpu-pageable"):
+        raise ValueError("activation_offload must be none or cpu or cpu-pageable")
     if mode == "none": return nullcontext()
-    if mode == "cpu": return torch.autograd.graph.save_on_cpu(pin_memory=True)
-    raise ValueError("activation_offload must be none or cpu")
+    if mode in ("cpu", "cpu-pageable"):
+        # CPU tensors already live on the host. Pinned packing would only
+        # change their strides and can change backward rounding on GPU hosts.
+        if device is not None and torch.device(device).type == "cpu": return nullcontext()
+        if mode == "cpu":
+            storage = torch.autograd.graph.save_on_cpu(pin_memory=True)
+        else:
+            snapshots = {}
+            def pack_to_cpu(tensor):
+                # Frozen host-side teacher features already have stable storage.
+                if tensor.device.type == "cpu" and not tensor.requires_grad:
+                    return tensor.device, tensor.detach()
+                root = tensor._base if tensor._base is not None else tensor
+                # Shared activations can reuse snapshots; leaf/FSDP parameters must always copy.
+                key = None
+                if root.grad_fn is not None and not tensor.is_inference():
+                    key = (id(root), tensor._version, tensor.storage_offset(), tuple(tensor.shape),
+                           tuple(tensor.stride()), tensor.dtype, tensor.device)
+                    cached = snapshots.get(key)
+                    if cached is not None and cached[0]() is root:
+                        packed = cached[1]()
+                        if packed is not None: return tensor.device, packed
+                # Independent contiguous snapshots survive FSDP all-gather storage release.
+                packed = torch.empty(tensor.size(), dtype=tensor.dtype, layout=tensor.layout,
+                                     device="cpu", pin_memory=False)
+                packed.copy_(tensor)
+                if key is not None: snapshots[key] = (weakref.ref(root), weakref.ref(packed))
+                return tensor.device, packed
+            def unpack_from_cpu(packed):
+                device, tensor = packed
+                return tensor.to(device, non_blocking=False)
+            storage = torch.autograd.graph.saved_tensors_hooks(pack_to_cpu, unpack_from_cpu)
+        return storage
 
 
 def _memory_phase(callback, phase, **info):
@@ -119,6 +153,8 @@ class ClipTrainingContext:
     total_loss: float = 0.
     memory_callback: object = None
     prefill_stats: dict = field(default_factory=dict)
+    full_gradient: bool = False
+    cached_chunks: int = -1
 
 
 class TTNTrainingWindow(torch.nn.Module):
@@ -135,6 +171,10 @@ class TTNTrainingWindow(torch.nn.Module):
         self.loss_fn = loss_fn
 
     def forward(self, episode, first=0, last=0, *, prefill=False, on_prediction=None):
+        if episode.full_gradient:
+            if prefill: raise ValueError("full-gradient prefill belongs inside the episode forward")
+            from .fullgradient import full_gradient_forward
+            return full_gradient_forward(self, episode, on_prediction)
         session = episode.session
         if prefill:
             _memory_phase(episode.memory_callback, "prefill_begin")
@@ -193,9 +233,20 @@ def train_clip(model,
                parallel=None,
                activation_offload="none",
                memory_callback=None,
-               audit_update=False):
-    if tbptt not in (1, 2, 4): raise ValueError("reference TBPTT supports K=1,2,4")
-    if activation_offload not in ("none", "cpu"): raise ValueError("activation_offload must be none or cpu")
+               audit_update=False,
+               cached_chunks=-1):
+    if getattr(model, 'ttn_training_protocol', '') == 'dual-psi-clean-fullgrad-v1':
+        from .legacy_sequence_training import train_legacy_sequence
+        return train_legacy_sequence(model, clean, y, camera_conditions, optimizer, loss_fn, timesteps, noise,
+            width=width, height=height, mask=mask, data_info=data_info, extras=extras, valid_mask=valid_mask,
+            tbptt=tbptt, chunk_size=chunk_size, outer_clip=outer_clip, on_prediction=on_prediction,
+            window_model=window_model, parallel=parallel, activation_offload=activation_offload,
+            memory_callback=memory_callback, audit_update=audit_update, cached_chunks=cached_chunks)
+    if type(tbptt) is not int or tbptt not in (0, 1, 2, 4): raise ValueError("TBPTT supports 0 (full episode),1,2,4")
+    if tbptt == 0 and parallel is not None and parallel.mode == 'fsdp2':
+        raise ValueError('full-gradient FSDP2 requires dual-psi-clean-fullgrad-v1 layer scan')
+    if activation_offload not in ("none", "cpu", "cpu-pageable"): raise ValueError("invalid activation_offload")
+    if type(cached_chunks) is not int or cached_chunks not in (-1, 1, 2): raise ValueError("cached_chunks must be -1,1,2")
     b, _, frames, _, _ = clean.shape
     if timesteps.ndim == 1: timesteps = timesteps[:, None, None].expand(b, 1, frames).clone()
     if timesteps.shape != (b, 1, frames) or noise.shape != clean.shape:
@@ -213,22 +264,26 @@ def train_clip(model,
     model.eval()  # disables stochastic conditioning; does NOT disable differentiation
     episode = ClipTrainingContext(session, clean, y, timesteps, noise, loss_valid, total,
                                   chunk_ranges(frames, chunk_size), [[None] * 10 for _ in model.blocks], mask, data_info,
-                                  memory_callback=memory_callback)
+                                  memory_callback=memory_callback, full_gradient=tbptt == 0,
+                                  cached_chunks=cached_chunks)
+    model.ttn_fullgrad_cpu_inputs = clean.is_cuda and activation_offload in ("cpu", "cpu-pageable")
     runner = parallel.window if parallel else window_model
     if runner is None: runner = TTNTrainingWindow(model, loss_fn)
     if parallel: parallel.validate_schedule(frames, tbptt, len(episode.ranges), b)
     # PyTorch 2.9 caches FP32 -> BF16 weights without grad_fn when their first
     # use is under no_grad. Prefill and training share the caller's AMP scope,
     # so keep prefill out of that weight cache; training still uses caching.
-    with torch.no_grad(), torch.autocast(device_type=clean.device.type,
+    if tbptt != 0:
+      with torch.no_grad(), torch.autocast(device_type=clean.device.type,
                                         enabled=torch.is_autocast_enabled(clean.device.type),
                                         dtype=torch.get_autocast_dtype(clean.device.type),
                                         cache_enabled=False):
         runner(episode, prefill=True)
-    if parallel: parallel.reshard()
-    runtime.detach()  # initial observed prefill is a boundary before generated-chunk windows
-    for first in range(0, len(episode.ranges), tbptt):
-        last = min(first + tbptt, len(episode.ranges))
+      if parallel: parallel.reshard()
+      runtime.detach()  # legacy prefill boundary
+    window = tbptt or len(episode.ranges)
+    for first in range(0, len(episode.ranges), window):
+        last = min(first + window, len(episode.ranges))
         sync = parallel.accumulation(last == len(episode.ranges)) if parallel else nullcontext()
         # FSDP swaps full parameter storage between chunk forwards. Cached AMP
         # weight casts share one backward node across those forwards and can
@@ -236,7 +291,7 @@ def train_clip(model,
         amp = torch.autocast(device_type=clean.device.type,
                              enabled=torch.is_autocast_enabled(clean.device.type),
                              dtype=torch.get_autocast_dtype(clean.device.type),
-                             cache_enabled=False) if parallel is not None and parallel.mode == "fsdp2" else nullcontext()
+                             cache_enabled=False) if tbptt == 0 or parallel is not None and parallel.mode == "fsdp2" else nullcontext()
         # DDP no_sync still encloses both forward and backward. CPU storage
         # preserves the full window's S/optional Persistent-meta graph.
         with sync, amp, activation_storage(activation_offload):
@@ -266,5 +321,9 @@ def train_clip(model,
               "exposure": {"clips": b, "valid_latent_frames": int(valid.sum()),
                   "predicted_latent_frames": int(loss_valid.sum()),
                   "predicted_chunks": sum(int((loss_valid[:, start:end].any(-1)).sum()) for start, end in episode.ranges)}}
+    if tbptt == 0:
+        result["sequence"] = {"protocol": "dual-psi-clean-fullgrad-v1", "backward_calls": 1,
+                              "temporal_detaches": 0, "cached_chunks": cached_chunks,
+                              "live_prefill": True}
     if updates is not None: result["optimizer_updates"] = updates
     return result

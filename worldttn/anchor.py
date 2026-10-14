@@ -10,6 +10,7 @@ from .performance import DEFAULT_EXECUTION, annotation, audit_layout
 from .stability import clean_anchor_stats, local_anchor_stats, matrix_scale
 from .geometry import apply_complex_rope
 from .runtime import TTNSystem
+from .fullgradient import _RECOMPUTING
 
 
 class TTNAnchor(nn.Module):
@@ -179,11 +180,11 @@ class TTNAnchor(nn.Module):
                             gradient = fn(ctx.previous[:, self.index], aux.kt_weighted_residual,
                                           ctx.psi_snapshot.for_anchor(self.index), write.sum(-1), cfg.delta_psi)
                 with annotation(execution, "Stats"):
-                    stats = clean_anchor_stats(ctx.previous[:, self.index], ctx.predicted[:, self.index],
+                    stats = {} if _RECOMPUTING.get() else clean_anchor_stats(ctx.previous[:, self.index], ctx.predicted[:, self.index],
                                                state, q, k, v, beta, w, read, write, gradient, cfg)
                 ctx.stage(self.index, state, gradient, stats)
         raw = raw.transpose(1, 2).reshape(b, n, c)
-        if ctx.clean_mode:
+        if ctx.clean_mode and not _RECOMPUTING.get():
             stats.update(camera_attention=cfg.camera_attention,
                          camera_cached_tokens=int(incoming_cache[2].shape[2]) if cfg.camera_attention == "sana" and incoming_cache is not None and incoming_cache[2] is not None else 0,
                          camera_current_tokens=n if camera_conditions is not None else 0,
@@ -211,7 +212,7 @@ class TTNAnchor(nn.Module):
                         camera_out = to(cq @ camera_state)  # output transform BEFORE MergeHeads
                         camera_out = camera_out.transpose(1, 2).reshape(b, n, c)
             camera_contribution = self.out_proj_cam(camera_out.to(x.dtype))
-            if ctx.clean_mode:
+            if ctx.clean_mode and not _RECOMPUTING.get():
                 stats.update(camera_raw=matrix_scale(camera_out), camera_contribution=matrix_scale(camera_contribution))
             if diagnostic is not None:
                 diagnostic("camera_raw", camera_out.to(x.dtype))
@@ -222,7 +223,26 @@ class TTNAnchor(nn.Module):
         gated = (raw * gate).to(x.dtype)
         if diagnostic is not None: diagnostic("gated_raw", gated)
         out = self.proj(gated) * read[..., None].to(x.dtype)
-        if ctx.clean_mode: stats["anchor_output"] = matrix_scale(out)
+        if ctx.clean_mode and not _RECOMPUTING.get(): stats["anchor_output"] = matrix_scale(out)
+        if (ctx.measure_psi_output and ctx.collect_local_stats and not ctx.clean_mode
+                and not ctx.prefill_mode and not _RECOMPUTING.get()):
+            with torch.no_grad(), torch.autocast(device_type=x.device.type, enabled=False):
+                base = CayleyFactors(ctx.system.generators.u[self.index].float(),
+                    ctx.system.generators.v[self.index].float(), ctx.cbase[:, self.index]).right(ctx.previous[:, self.index])
+                controls = [correct(s.detach(), k.detach(), v.detach(), beta.detach(), write, cfg.alpha_s, cfg.eps)[0]
+                            for s in (base, ctx.predicted[:, self.index])]
+                visual = [(q.detach() @ s).transpose(1,2).reshape(b,n,c) for s in controls]
+            with torch.no_grad():
+                camera = camera_contribution.detach() if camera_conditions is not None else 0
+                outputs = [self.proj(((value+camera)*gate.detach()).to(x.dtype))*read[...,None] for value in visual]
+                measurements = {}
+                for label, actual, reference in (('persistent', outputs[1], outputs[0]), ('local', out.detach(), outputs[1])):
+                    delta, norm = (actual.float()-reference.float()).norm(), reference.float().norm()
+                    measurements[label] = {'delta_norm': float(delta),
+                        'relative_delta': float(delta/norm) if norm > cfg.eps else None,
+                        'changed_fraction': float((actual != reference).float().mean())}
+                measurements['measurement'] = 'paired same-feature/camera anchor outputs after gate/projection/quantization; no quality claim'
+                ctx.local_stats[self.index]['output_effect'] = measurements
         if cfg.camera_attention == "sana":
             cache[6] = x.new_tensor([0.])  # Native concat layout: camera K/V in slots 2/3.
             cache[4] = cache[5] = cache[7] = cache[8] = None
