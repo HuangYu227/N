@@ -11,7 +11,8 @@ from tools import ttn_state_ttt_video as video
 
 def test_nvml_usage_is_for_our_pid_only_and_missing_measurements_fail():
     assert video.process_memory_mib('12, 55000\n34, 1800\n', 34) == 1800
-    assert video.process_memory_mib('12, 55000\n', 34) == 0
+    with pytest.raises(ValueError, match='unavailable'):
+        video.process_memory_mib('12, 55000\n', 34)
     with pytest.raises(ValueError, match='unavailable'):
         video.process_memory_mib('34, [Not Supported]\n', 34)
 

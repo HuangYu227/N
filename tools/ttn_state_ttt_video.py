@@ -24,6 +24,8 @@ def process_memory_mib(csv, pid):
                 values.append(int(fields[1]))
             except ValueError as error:
                 raise ValueError('Per-process GPU memory measurement unavailable') from error
+    if not values:
+        raise ValueError('Current generation PID memory accounting unavailable')
     return sum(values)
 
 
