@@ -46,9 +46,11 @@ def legacy_sequence_block(block, x, y, t, mask, hw, rope, context, **kwargs):
         if anchor is not None:
             previous = torch.stack([state if i == anchor else previous[:, i] for i in range(5)], 1)
             fast = torch.stack([psi if i == anchor else fast[:, i] for i in range(5)], 1)
-        factors = None if prefill else CayleyFactors(snapshot.system.generators.u.float(),
-            snapshot.system.generators.v.float(), coefficients+snapshot.system.config.delta_psi*fast.tanh())
-        predicted = previous if prefill else factors.right(previous)
+        # FP32 storage alone does not protect the Gram/transport GEMMs from AMP.
+        with torch.autocast(device_type=previous.device.type, enabled=False):
+            factors = None if prefill else CayleyFactors(snapshot.system.generators.u.float(),
+                snapshot.system.generators.v.float(), coefficients+snapshot.system.config.delta_psi*fast.tanh())
+            predicted = previous if prefill else factors.right(previous)
         valid = snapshot.read_mask[:batch, start:end]
         ids = snapshot.frame_ids[:batch, start:end]
         return replace(snapshot, previous=previous, predicted=predicted, psi=fast, cbase=coefficients,

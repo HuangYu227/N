@@ -36,6 +36,9 @@ class TTNAnchor(nn.Module):
                                    dtype=torch.float32)
         nn.init.zeros_(self.beta_proj.weight)
         nn.init.zeros_(self.beta_proj.bias)
+        if config.state_ttt_rank:
+            from .state_ttt import StateTTT
+            self.state_ttt=StateTTT(config,index).to(device=source.qkv.weight.device)
         self.qkv_store_buffer = None
         native_camera = getattr(source, "_cached_cam_branch_softmax", None)
         self._sana_camera_forward = native_camera.__func__ if native_camera is not None else None
@@ -97,7 +100,7 @@ class TTNAnchor(nn.Module):
         with torch.autocast(device_type=x.device.type, enabled=False):
             beta = self.beta_proj(x.float()).sigmoid().transpose(1, 2)
             predicted = ctx.predicted[:, self.index]
-            local_enabled = cfg.local_update and not ctx.clean_mode and not ctx.prefill_mode and ctx.ablation in ("full", "no-persistent")
+            local_enabled = cfg.local_update and not cfg.state_ttt_rank and not ctx.clean_mode and not ctx.prefill_mode and ctx.ablation in ("full", "no-persistent")
             if local_enabled:
                 support, query = ctx.support_query_masks(n, HW)
                 factors = ctx.live_factors
@@ -115,6 +118,21 @@ class TTNAnchor(nn.Module):
                     adapted = CayleyFactors(ctx.system.generators.u[self.index].float(),
                                            ctx.system.generators.v[self.index].float(), coeff).right(ctx.previous[:, self.index])
                     predicted = torch.where(support.any(-1)[:, None, None, None], adapted, predicted)
+            state_values=None
+            state_active=cfg.state_ttt_rank and not ctx.prefill_mode and ctx.ablation in (
+                ('full','no-local') if ctx.clean_mode else ('full','no-persistent'))
+            state_base=predicted
+            if state_active:
+                support,query=ctx.support_query_masks(n,HW)
+                selected=write if ctx.clean_mode else support
+                w=write_weights(beta,write,cfg.eps)
+                predicted,state_values=self.state_ttt(predicted,k,v,w,selected,clean=ctx.clean_mode,
+                    eps=cfg.eps,clip=cfg.inner_clip)
+                if not ctx.clean_mode and not _RECOMPUTING.get():
+                    with torch.no_grad():
+                        for label,value in (('query_loss_before',state_base),('query_loss_after',predicted)):
+                            state_values[label]=innovation_objective(value.detach(),k.detach(),v.detach(),w.detach(),
+                                query,normalized=True,eps=cfg.eps)[0]
             audit_layout(self, "clean" if ctx.clean_mode else "diagnostic" if diagnostic is not None else "noisy",
                          q=q, k=k, v=v, beta=beta, predicted=predicted, write=write)
             with annotation(execution, "CorrectRead"):
@@ -139,7 +157,7 @@ class TTNAnchor(nn.Module):
                     support, query = ctx.support_query_masks(n, HW)
                     gradient = clipped = local = torch.zeros_like(ctx.psi[:, self.index])
                     scale = torch.ones_like(gradient[..., :1])
-                    eta = F.softplus(ctx.system.local_eta_logits[self.index]) if cfg.local_update else None
+                    eta = F.softplus(ctx.system.local_eta_logits[self.index]) if cfg.local_update and not cfg.state_ttt_rank else None
                 with annotation(execution, "LocalStats"):
                     stats = local_anchor_stats(ctx.previous[:, self.index], ctx.predicted[:, self.index], predicted,
                                                state, k, v, w, support, query, gradient, clipped, scale, local, eta, cfg.eps)
@@ -153,11 +171,14 @@ class TTNAnchor(nn.Module):
                             **{part: {key: stats[part][key] for key in ("loss_before", "loss_after_transport")}
                                for part in ("support", "query")}}
                 if diagnostic is not None: diagnostic("local_update", stats)
+                if state_values is not None and not _RECOMPUTING.get():
+                    from .state_ttt import state_stats
+                    ctx.local_stats[self.index]['state_ttt']=state_stats(state_values,clean=False,policy=cfg.state_ttt_policy)
             if diagnostic is not None:
                 diagnostic("memory", (predicted, state, k, v, beta, w, write))
             if ctx.clean_mode:
                 gradient = torch.zeros_like(ctx.psi[:, self.index])
-                if cfg.stage == "C" and not ctx.prefill_mode:
+                if cfg.stage == "C" and not ctx.prefill_mode and not cfg.state_ttt_rank:
                     with annotation(execution, "Psi"):
                         if cfg.persistent_meta:
                             if ctx.ablation in ("full", "no-local"):
@@ -182,6 +203,9 @@ class TTNAnchor(nn.Module):
                 with annotation(execution, "Stats"):
                     stats = {} if _RECOMPUTING.get() else clean_anchor_stats(ctx.previous[:, self.index], ctx.predicted[:, self.index],
                                                state, q, k, v, beta, w, read, write, gradient, cfg)
+                if state_values is not None and not _RECOMPUTING.get():
+                    from .state_ttt import state_stats
+                    stats['state_ttt']=state_stats(state_values,clean=True,policy=cfg.state_ttt_policy)
                 ctx.stage(self.index, state, gradient, stats)
         raw = raw.transpose(1, 2).reshape(b, n, c)
         if ctx.clean_mode and not _RECOMPUTING.get():
@@ -224,7 +248,18 @@ class TTNAnchor(nn.Module):
         if diagnostic is not None: diagnostic("gated_raw", gated)
         out = self.proj(gated) * read[..., None].to(x.dtype)
         if ctx.clean_mode and not _RECOMPUTING.get(): stats["anchor_output"] = matrix_scale(out)
-        if (ctx.measure_psi_output and ctx.collect_local_stats and not ctx.clean_mode
+        if (state_values is not None and ctx.measure_psi_output and not ctx.clean_mode and not _RECOMPUTING.get()):
+            with torch.no_grad(),torch.autocast(device_type=x.device.type,enabled=False):
+                reference_state=correct(state_base.detach(),k.detach(),v.detach(),beta.detach(),write,cfg.alpha_s,cfg.eps)[0]
+                visual=(q.detach()@reference_state).transpose(1,2).reshape(b,n,c)
+            with torch.no_grad():
+                camera=camera_contribution.detach() if camera_conditions is not None else 0
+                reference=self.proj(((visual+camera)*gate.detach()).to(x.dtype))*read[...,None]
+                ctx.local_stats[self.index]['state_ttt']['output_effect']={
+                    'relative_delta':float((out.detach().float()-reference.float()).norm()/reference.float().norm().clamp_min(cfg.eps)),
+                    'changed_fraction':float((out.detach()!=reference).float().mean()),
+                    'measurement':'paired same features/camera after Correct/gate/projection; no quality claim'}
+        if (not cfg.state_ttt_rank and ctx.measure_psi_output and ctx.collect_local_stats and not ctx.clean_mode
                 and not ctx.prefill_mode and not _RECOMPUTING.get()):
             with torch.no_grad(), torch.autocast(device_type=x.device.type, enabled=False):
                 base = CayleyFactors(ctx.system.generators.u[self.index].float(),
@@ -293,7 +328,7 @@ def is_ttn_parameter(name):
 
 def is_ttn_new_parameter(name):
     """Parameter origin, independent of the replacement module's ownership."""
-    return name == "ttn_system.local_eta_logits" or name.startswith(("ttn_system.controller.", "ttn_system.generators.")) or any(
+    return name == "ttn_system.local_eta_logits" or any(name.startswith(f'blocks.{i}.attn.state_ttt.') for i in ANCHORS) or name.startswith(("ttn_system.controller.", "ttn_system.generators.")) or any(
         name.startswith(f"blocks.{i}.attn.beta_proj.") for i in ANCHORS)
 
 

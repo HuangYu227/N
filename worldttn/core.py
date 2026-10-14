@@ -1,5 +1,6 @@
 """Persistent matrix correction and rank-2 Cayley transport (no token-pair matrix)."""
 from dataclasses import dataclass, asdict
+import math
 from typing import NamedTuple
 import torch
 from torch import nn
@@ -31,6 +32,10 @@ class TTNConfig:
     # Missing in old checkpoints means the original detached Stage C update.
     local_update: bool = False
     persistent_meta: bool = False
+    local_eta_init: float = .01
+    state_ttt_rank: int = 0
+    state_ttt_policy: str = 'curvature'
+    state_ttt_gain: float = 1.
 
     def __post_init__(self):
         if self.stage not in ("A", "B", "C"):
@@ -45,9 +50,22 @@ class TTNConfig:
             raise ValueError("positive dimensions; UCPE half-head must be divisible by four")
         if not 0 < self.alpha_s < 2 or self.eps <= 0 or min(self.delta_psi, self.eta_psi, self.inner_clip) < 0:
             raise ValueError("invalid correction/adaptation hyperparameters")
+        if not math.isfinite(self.local_eta_init) or self.local_eta_init <= 0:
+            raise ValueError("local_eta_init must be finite and positive")
+        if type(self.state_ttt_rank) is not int or not 0<=self.state_ttt_rank<=self.head_dim:
+            raise ValueError('state TTT rank must be 0..head_dim')
+        if self.state_ttt_policy not in ('fixed','curvature') or not math.isfinite(self.state_ttt_gain) or self.state_ttt_gain<=0:
+            raise ValueError('invalid state TTT step policy or gain')
+        if self.state_ttt_rank and (self.stage!='C' or (self.state_ttt_policy=='curvature' and self.state_ttt_gain>=2)):
+            raise ValueError('state TTT requires Stage C and curvature gain below 2')
 
     def to_dict(self):
-        return asdict(self)
+        result = asdict(self)
+        # Keep existing checkpoints/resume identities compatible at the old default.
+        if self.local_eta_init == .01: result.pop("local_eta_init")
+        if not self.state_ttt_rank:
+            for name in ('state_ttt_rank','state_ttt_policy','state_ttt_gain'):result.pop(name)
+        return result
 
 
 class Rank2Generators(nn.Module):

@@ -163,6 +163,7 @@ def committed_anchor_stats(stats, old_psi, new_psi, grad, scale, cbase, block, p
     out = dict(stats, block=block, prefill=prefill)
     out.update(psi=matrix_scale(new_psi), psi_update=matrix_scale(new_psi - old_psi),
                controller_coefficients=matrix_scale(cbase))
+    out['psi_tanh_saturation_fraction'] = float((new_psi.tanh().abs() > .99).float().mean())
     out["per_head"] = dict(stats.get("per_head", {}),
                            inner_grad_norm=grad.norm(dim=-1).cpu().tolist(),
                            inner_grad_clipped_norm=(grad * scale).norm(dim=-1).cpu().tolist(),

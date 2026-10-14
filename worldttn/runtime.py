@@ -16,9 +16,11 @@ class TTNSystem(nn.Module):
         self.config = config
         self.generators = Rank2Generators(config)
         self.controller = TransitionController(config)
-        if config.local_update:
+        if config.local_update and not config.state_ttt_rank:
             # Constant initialization consumes no RNG and preserves inherited seeds.
-            self.local_eta_logits = nn.Parameter(torch.full((5,), math.log(math.expm1(.01))))
+            eta = config.local_eta_init
+            logit = math.log(math.expm1(eta)) if eta < 20 else eta + math.log(-math.expm1(-eta))
+            self.local_eta_logits = nn.Parameter(torch.full((5,), logit))
         self.requires_grad_(config.stage != "A")
 
 

@@ -96,10 +96,13 @@ def train_legacy_sequence(model, clean, y, camera_conditions, optimizer, loss_fn
         y=y, mask=mask, data_info=data_info, loss_mask=lm, on_prediction=on_prediction)
     runner = parallel.window if parallel else window_model or LegacySequenceTraining(model, loss_fn)
     if parallel: parallel.validate_schedule(frames, 0, len(chunk_ranges(frames)), b)
+    from .training_health import local_eta_snapshot, local_eta_update
+    eta_before = local_eta_snapshot(model)
     model.eval();optimizer.zero_grad(set_to_none=True)
     amp = torch.autocast(device_type=clean.device.type, enabled=torch.is_autocast_enabled(clean.device.type),
         dtype=torch.get_autocast_dtype(clean.device.type), cache_enabled=False)
-    with amp, activation_storage(activation_offload):
+    storage = activation_storage(activation_offload)
+    with amp, storage:
         _memory_phase(memory_callback, 'sequence_begin', frames=frames, tbptt=0)
         loss = runner(episode)
         if not torch.isfinite(loss): raise FloatingPointError('nonfinite legacy full-sequence loss')
@@ -129,6 +132,7 @@ def train_legacy_sequence(model, clean, y, camera_conditions, optimizer, loss_fn
     chunks = [dict(chunk=j, start=start, end=end, anchors=[rows[i][j+1] for i in range(5)])
               for j,(start,end) in enumerate(chunk_ranges(frames))]
     result = dict(loss=float(loss.detach()), outer_grad_norm=float(norm), runtime=runtime, chunks=chunks,
+        activation_storage=dict(getattr(storage,'storage_stats',{})),
         prediction_diagnostics=episode.measurements,
         prefill=dict(chunk=-1,start=0,end=1,anchors=[rows[i][0] for i in range(5)],live_gradient=True),
         exposure=dict(clips=b,valid_latent_frames=b*frames,predicted_latent_frames=b*(frames-1),
@@ -136,6 +140,7 @@ def train_legacy_sequence(model, clean, y, camera_conditions, optimizer, loss_fn
         sequence=dict(protocol='dual-psi-clean-fullgrad-v1',backward_calls=1,temporal_detaches=0,
                       cached_chunks=2,live_prefill=True))
     if probe is not None: result['optimizer_updates'] = probe.report(optimizer)
+    if eta_before is not None: result['local_eta_update'] = local_eta_update(model, eta_before, optimizer)
     # Episode credit has finished; release closure cycles, not temporal gradients.
     before = torch.cuda.memory_allocated(clean.device) if clean.is_cuda else 0
     context.candidates.clear()

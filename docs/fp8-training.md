@@ -3,6 +3,11 @@
 This adds native FP8 GEMMs to the existing dual-psi full-gradient model. It
 does not add QAT, truncate temporal gradients, or change the state update.
 
+For the enhanced rank64 State-TTT architecture, use
+`configs/worldttn/state_ttt_fp8.json` instead. Its additive state update is an
+explicit algorithm change; the original config still selects Cayley psi.
+See [single-H100 training and checkpoint instructions](state-ttt-h100.md).
+
 ## Precision policy
 
 - TorchAO 0.14.1, PyTorch 2.9.1+cu128, Ada SM89 or newer.

@@ -18,7 +18,9 @@ def audit_training_parameters(model, optimizer):
     if stage != "A":
         required.update(("ttn_system.generators.u", "ttn_system.generators.v"))
         required.update(f"ttn_system.controller.heads.{i}.weight" for i in range(5))
-    if model.ttn_system.config.local_update: required.add("ttn_system.local_eta_logits")
+    if model.ttn_system.config.state_ttt_rank:
+        required.update(f'blocks.{i}.attn.state_ttt.{p}' for i in ANCHORS for p in ('raw_basis','step_logits'))
+    elif model.ttn_system.config.local_update: required.add("ttn_system.local_eta_logits")
     if required - named.keys(): raise ValueError(f"missing registered TTN parameters: {sorted(required - named.keys())}")
     expected = trainable_parameter_names(model)
     actual = {name for name, p in named.items() if p.requires_grad}
@@ -33,6 +35,9 @@ def audit_training_parameters(model, optimizer):
     policy = getattr(model, "ttn_optimizer_policy", "legacy")
     if policy == "origin" and getattr(model, "ttn_train_scope", "ttn") == "dit":
         for group, names in zip(optimizer.param_groups, optimizer_parameter_names(model, optimizer)):
+            if group.get("name") == "local_eta":
+                if names != ["ttn_system.local_eta_logits"]: raise ValueError("invalid Local eta optimizer group")
+                continue
             expected_origin = {"ttn_new": True, "sana_inherited": False}.get(group.get("name"))
             if expected_origin is None or any(is_ttn_new_parameter(n) != expected_origin for n in names):
                 raise ValueError("optimizer parameter origin mismatch")
@@ -53,6 +58,24 @@ def _local_cpu(value):
     return value.detach().cpu()
 
 
+def local_eta_snapshot(model):
+    parameter = getattr(model.ttn_system, "local_eta_logits", None)
+    return None if parameter is None else _local_cpu(parameter).clone()
+
+
+def local_eta_update(model, before, optimizer):
+    """Five actual slow parameter updates; never infer shrinkage from output ratios."""
+    if before is None: return None
+    parameter = model.ttn_system.local_eta_logits
+    after = _local_cpu(parameter)
+    rate = next(g["lr"] for g in optimizer.param_groups if any(p is parameter for p in g["params"]))
+    return {"anchors": list(ANCHORS), "logits_before": before.tolist(), "logits_after": after.tolist(),
+            "eta_before": torch.nn.functional.softplus(before).tolist(),
+            "eta_after": torch.nn.functional.softplus(after).tolist(), "learning_rate": rate,
+            "logit_gradient_after_clip": None if parameter.grad is None else _local_cpu(parameter.grad).tolist(),
+            "measurement": "actual optimizer update; gradient after outer clipping; rank-local for sharded tensors"}
+
+
 class FirstUpdateProbe:
     def __init__(self, model):
         self.parameters = {n: p for n, p in model.named_parameters() if p.requires_grad}
@@ -63,6 +86,9 @@ class FirstUpdateProbe:
         backbone = {"parameters": 0, "parameters_with_grad": 0, "updated_parameters": 0,
                     "changed_elements": 0, "optimizer_state_parameters": 0}
         core = {f"blocks.{i}.attn.{group}.weight" for i in ANCHORS for group in ("qkv", "proj", "output_gate")}
+        state_parameters = {name for name in self.parameters if name.endswith(('.state_ttt.raw_basis', '.state_ttt.step_logits'))}
+        core.update(state_parameters)
+        state_signals = {}
         for name, p in self.parameters.items():
             group = ".".join(name.split(".")[:4] if name.startswith("blocks.") else name.split(".")[:2])
             row = groups.setdefault(group, {"initial_squared": 0., "delta_squared": 0., "grad_squared": 0.,
@@ -75,6 +101,9 @@ class FirstUpdateProbe:
             total["parameters"] += 1
             total["delta_squared"] += delta.square().sum().item()
             changed = int(delta.count_nonzero())
+            if name in state_parameters:
+                state_signals[name] = dict(delta_norm=float(delta.norm()), changed_elements=changed,
+                    grad_norm=None, local_shape=list(current.shape), optimizer_state=bool(optimizer.state.get(p)))
             row["initial_squared"] += initial.square().sum().item()
             row["delta_squared"] += delta.square().sum().item()
             row["changed_elements"] += changed
@@ -100,6 +129,7 @@ class FirstUpdateProbe:
                 grad = _local_cpu(p.grad).double()
                 row["grad_squared"] += grad.square().sum().item()
                 total["grad_squared"] += grad.square().sum().item()
+                if name in state_parameters: state_signals[name]['grad_norm'] = float(grad.norm())
         for total in origins.values():
             total["grad_norm"] = math.sqrt(total.pop("grad_squared"))
             total["delta_norm"] = math.sqrt(total.pop("delta_squared"))
@@ -112,4 +142,5 @@ class FirstUpdateProbe:
         self.before.clear()
         return {"scope": "actual optimizer update; gradients after clipping; rank-local shards for FSDP2",
                 "groups": groups, "by_origin": origins, "missing_core_gradients": missing,
+                "state_ttt_parameters": state_signals,
                 "backbone": {**backbone, "by_component": components}, "missing_backbone_gradients": missing_backbone}

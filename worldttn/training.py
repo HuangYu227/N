@@ -1,5 +1,7 @@
 """Causal clean-history training, one optimizer step per clip, explicit TBPTT windows."""
 from contextlib import nullcontext
+import math
+import os
 import weakref
 from dataclasses import dataclass, field
 import torch
@@ -7,12 +9,14 @@ from .session import TTNSession, carry_cache
 from .cuda_debug import trace_backward
 
 
-def activation_storage(mode, *, device=None):
+def activation_storage(mode, *, device=None, gpu_budget_bytes=None, gpu_allocation_limit_bytes=None):
     """Snapshot saved tensors before FSDP resharding; never replay TTN forwards.
 
     Native save_on_cpu copies values (including weight views) during forward,
     so backward does not retain/read freed FSDP all-gather storage. FSDP's own
     parameter hooks still unshard and reduce the actual parameter gradients.
+    Pageable mode can retain independent GPU snapshots up to a configured byte
+    budget; it never holds a live FSDP weight view or changes tensor precision.
     """
     if mode not in ("none", "cpu", "cpu-pageable"):
         raise ValueError("activation_offload must be none or cpu or cpu-pageable")
@@ -24,6 +28,18 @@ def activation_storage(mode, *, device=None):
         if mode == "cpu":
             storage = torch.autograd.graph.save_on_cpu(pin_memory=True)
         else:
+            def budget(value, env_name):
+                if value is None:
+                    gib = float(os.environ.get(env_name, '0'))
+                    if not math.isfinite(gib) or gib < 0: raise ValueError(env_name + ' must be finite and nonnegative')
+                    value = int(gib * (1 << 30))
+                if not isinstance(value, int) or value < 0: raise ValueError('activation storage budget must be nonnegative bytes')
+                return value
+            gpu_budget_bytes = budget(gpu_budget_bytes, 'TTN_ACTIVATION_GPU_CACHE_GIB')
+            gpu_allocation_limit_bytes = budget(gpu_allocation_limit_bytes, 'TTN_ACTIVATION_GPU_ALLOCATION_LIMIT_GIB')
+            counters = dict(gpu_budget_bytes=gpu_budget_bytes, gpu_allocation_limit_bytes=gpu_allocation_limit_bytes,
+                            gpu_live_bytes=0, gpu_peak_bytes=0, gpu_packs=0, cpu_packed_bytes=0)
+            def released(size): counters['gpu_live_bytes'] -= size
             snapshots = {}
             def pack_to_cpu(tensor):
                 # Frozen host-side teacher features already have stable storage.
@@ -40,15 +56,26 @@ def activation_storage(mode, *, device=None):
                         packed = cached[1]()
                         if packed is not None: return tensor.device, packed
                 # Independent contiguous snapshots survive FSDP all-gather storage release.
+                size = tensor.numel() * tensor.element_size()
+                keep_gpu = gpu_budget_bytes > 0 and tensor.is_cuda and counters['gpu_live_bytes'] + size <= gpu_budget_bytes
+                if keep_gpu and gpu_allocation_limit_bytes:
+                    keep_gpu = torch.cuda.memory_allocated(tensor.device) + size <= gpu_allocation_limit_bytes
                 packed = torch.empty(tensor.size(), dtype=tensor.dtype, layout=tensor.layout,
-                                     device="cpu", pin_memory=False)
+                                     device=tensor.device if keep_gpu else "cpu", pin_memory=False)
                 packed.copy_(tensor)
+                if keep_gpu:
+                    counters['gpu_live_bytes'] += size
+                    counters['gpu_peak_bytes'] = max(counters['gpu_peak_bytes'], counters['gpu_live_bytes'])
+                    counters['gpu_packs'] += 1
+                    weakref.finalize(packed, released, size)
+                else: counters['cpu_packed_bytes'] += size
                 if key is not None: snapshots[key] = (weakref.ref(root), weakref.ref(packed))
                 return tensor.device, packed
             def unpack_from_cpu(packed):
                 device, tensor = packed
                 return tensor.to(device, non_blocking=False)
             storage = torch.autograd.graph.saved_tensors_hooks(pack_to_cpu, unpack_from_cpu)
+            storage.storage_stats = counters
         return storage
 
 
@@ -242,6 +269,8 @@ def train_clip(model,
             tbptt=tbptt, chunk_size=chunk_size, outer_clip=outer_clip, on_prediction=on_prediction,
             window_model=window_model, parallel=parallel, activation_offload=activation_offload,
             memory_callback=memory_callback, audit_update=audit_update, cached_chunks=cached_chunks)
+    from .training_health import local_eta_snapshot, local_eta_update
+    eta_before = local_eta_snapshot(model)
     if type(tbptt) is not int or tbptt not in (0, 1, 2, 4): raise ValueError("TBPTT supports 0 (full episode),1,2,4")
     if tbptt == 0 and parallel is not None and parallel.mode == 'fsdp2':
         raise ValueError('full-gradient FSDP2 requires dual-psi-clean-fullgrad-v1 layer scan')
@@ -321,6 +350,7 @@ def train_clip(model,
               "exposure": {"clips": b, "valid_latent_frames": int(valid.sum()),
                   "predicted_latent_frames": int(loss_valid.sum()),
                   "predicted_chunks": sum(int((loss_valid[:, start:end].any(-1)).sum()) for start, end in episode.ranges)}}
+    if eta_before is not None: result["local_eta_update"] = local_eta_update(model, eta_before, optimizer)
     if tbptt == 0:
         result["sequence"] = {"protocol": "dual-psi-clean-fullgrad-v1", "backward_calls": 1,
                               "temporal_detaches": 0, "cached_chunks": cached_chunks,

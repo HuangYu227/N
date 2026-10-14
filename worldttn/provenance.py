@@ -10,7 +10,7 @@ def implementation_identity():
     files = ("worldttn/cli.py", "worldttn/anchor.py", "worldttn/core.py", "worldttn/controller.py", "worldttn/runtime.py",
              "worldttn/performance.py", "worldttn/compiled.py", "worldttn/benchmark.py",
              "worldttn/geometry.py", "worldttn/session.py", "worldttn/training.py", "worldttn/fullgradient.py", "worldttn/sana.py",
-             "worldttn/legacy_sequence.py", "worldttn/legacy_sequence_training.py", "worldttn/fp8.py",
+             "worldttn/legacy_sequence.py", "worldttn/legacy_sequence_training.py", "worldttn/fp8.py", "worldttn/state_ttt.py",
              "worldttn/evaluation.py", "worldttn/alignment.py", "worldttn/alignment_detail.py", "worldttn/stability.py",
              "worldttn/stage_evaluation.py", "worldttn/mechanism_evaluation.py", "worldttn/checkpoint.py", "worldttn/distributed.py",
              "worldttn/parallel_checkpoint.py", "worldttn/checkpoint_integrity.py", "worldttn/failure.py", "worldttn/parallel_data.py",

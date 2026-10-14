@@ -64,17 +64,24 @@ import torch, torchao, pyrallis, fla, mmcv
 from torch.distributed.fsdp import fully_shard
 from worldttn.sana import load_sana_config
 from worldttn.fp8 import _load_backend
+from worldttn.core import TTNConfig
+from worldttn.state_ttt import StateTTT
 from train_video_scripts.train_sana_wm_stage1 import _build_dataloader
 settings = json.loads(Path('configs/worldttn/dual_psi_fullgrad_fp8.json').read_text())
 assert settings['training_precision'] == 'fp8' and settings['tbptt'] == 0
 assert settings['ttn']['local_update'] and settings['ttn']['persistent_meta']
 assert 'state_ttt_rank' not in settings['ttn']
+enhanced = json.loads(Path('configs/worldttn/state_ttt_fp8.json').read_text())
+assert enhanced['training_precision'] == 'fp8' and enhanced['tbptt'] == 0
+state_config = TTNConfig(**enhanced['ttn'])
+assert state_config.state_ttt_rank == 64 and state_config.state_ttt_policy == 'curvature'
+assert state_config.state_ttt_gain == 0.5 and state_config.eta_psi == 0
 load_sana_config(settings['sana_config'])
 backend = _load_backend()
 assert backend.version == '0.14.1'
 assert torch.__version__.split('+')[0] == '2.9.1' and torch.version.cuda == '12.8'
 assert not torch.cuda.is_initialized()
-print('PASS: dual-psi FP8 configuration, model/data imports, TorchAO and FSDP2.')
+print('PASS: legacy dual-psi and enhanced State-TTT FP8 configs, model/data imports, TorchAO and FSDP2.')
 print('No GPU training or model download was started.')
 PY
 activate="$workspace_root/activate-worldttn-fp8.sh"

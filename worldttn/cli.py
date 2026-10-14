@@ -343,6 +343,12 @@ def _training_identity(args, config, settings, k):
                                 "local_objective": "weighted_v_energy_support", "persistent_objective": "raw_weighted_innovation",
                                 "support": "absolute_frame_xy_checkerboard", "local_eta_init": .01, "local_delta": 1.,
                                 "noise_gate": False}
+    if ttn.get('state_ttt_rank',0):
+        identity['meta_ttt']={'version':'additive-state-ttt-v1','rank':ttn['state_ttt_rank'],
+            'policy':ttn.get('state_ttt_policy','curvature'),'gain_init':ttn.get('state_ttt_gain',1.),
+            'basis':'learned-orthogonal-qr','local_objective':'weighted_v_energy_support',
+            'clean_objective':'raw_weighted_innovation','clean_commit':'absorbed_once_before_correct',
+            'support':'absolute_frame_xy_checkerboard','old_psi':'disabled'}
     if settings.get("training_protocol") == "dual-psi-clean-fullgrad-v1":
         identity.update(training_protocol="dual-psi-clean-fullgrad-v1",
                         training_latent_frames=settings["training_latent_frames"],
@@ -367,7 +373,7 @@ def _training_record(model, result, timing, parallel):
     if "anchor_gradients" in result: local["anchor_gradients"] = result["anchor_gradients"]
     from .distributed import gather_records
     if "parameter_update" in result: local["parameter_update"] = result["parameter_update"]
-    for key in ("optimizer_updates", "exposure", "sequence", "unconditional", "prediction_diagnostics", "lifecycle"):
+    for key in ("optimizer_updates", "exposure", "sequence", "unconditional", "prediction_diagnostics", "lifecycle", "activation_storage"):
         if key in result: local[key] = result[key]
     ranks = gather_records(local)
     return {"loss": sum(record["loss"] for record in ranks) / parallel.world,
@@ -449,7 +455,8 @@ def train_command(args):
         raise ValueError("multi-GPU resume requires optimizer shards; use --adapter without --resume for initialization")
     if payload:
         apply_checkpoint_weights(model, payload)
-        # Release copied CPU weights before constructing the training graph.
+        # load_state_dict copied the weights. Keep only initialization metadata;
+        # optimizer/RNG restoration reads its own validated checkpoint below.
         payload = {key: value for key, value in payload.items() if key not in ('adapter', 'optimizer')}
     from .fp8 import configure_training_precision
     precision = getattr(args, "train_precision", None) or settings.get("training_precision", "bf16")
@@ -527,7 +534,7 @@ def train_command(args):
                "execution": execution_report(model), "resume_execution": resume_execution, "precision": precision_audit(),
                "training_precision": precision_report,
                "camera_attention": model.ttn_system.config.camera_attention,
-               "history_protocol": {"clean_commits": "GT after current noisy loss", "camera_cache": "all previous chunks within clip",
+               "history_protocol": {"clean_commits": "GT after current noisy loss", "camera_cache": "causal history bounded by camera_cached_chunks in sequence protocol",
                                     "prefill": "initial frame once; independent GDN/FFN scratch caches", "telemetry": "detached statistics; rank/head separated",
                                     "persistent_gradient": "live inside TBPTT" if model.ttn_system.config.persistent_meta else "detached",
                                     "local_lifecycle": "ephemeral per noisy call" if model.ttn_system.config.local_update else "disabled"},
@@ -539,6 +546,10 @@ def train_command(args):
                 camera_cache=f"last {model.ttn_camera_cached_chunks} groups; retained entries live",
                 temporal_detaches=0, backward_calls=1,
                 empty_text_probability=args.empty_text_probability)
+        if model.ttn_system.config.state_ttt_rank:
+            run['history_protocol'].update(ttt='additive-state-v1',local_lifecycle='temporary support-based S update',
+                persistent_lifecycle='clean additive S update absorbed once before Correct',
+                persistent_gradient='live through committed S; old psi disabled',old_psi='disabled')
         if unfreeze:
             run["initialization"] = {"checkpoint": str(Path(args.adapter).resolve()), "step": step,
                                      "optimizer_reset": True, "rng_and_data_cursor_restored": True}

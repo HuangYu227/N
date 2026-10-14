@@ -109,7 +109,8 @@ def precision_audit():
               "scope": "Torch flags only; original GDN handwritten kernel precision is independent",
               "environment": {name: os.environ.get(name) for name in (
                   "GDN_DISABLE_COMPILE", "GDN_DISABLE_COMPLEX_COMPILE", "TORCH_LOGS",
-                  "TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR", "CUDA_LAUNCH_BLOCKING")}}
+                  "TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR", "CUDA_LAUNCH_BLOCKING",
+                  "TTN_ACTIVATION_GPU_CACHE_GIB", "TTN_ACTIVATION_GPU_ALLOCATION_LIMIT_GIB")}}
     try:
         from importlib.metadata import version, PackageNotFoundError
         result["triton"] = version("triton")
