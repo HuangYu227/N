@@ -138,11 +138,16 @@ def monitor(directory, *, entity, project, mode='online', follow=False, poll=15,
     work.mkdir(exist_ok=True)
     with monitor_lock(work / 'monitor.lock'):
         identity_path = work / 'identity.json'
-        identity = json.loads(identity_path.read_text()) if identity_path.exists() else {
+        saved_identity = json.loads(identity_path.read_text()) if identity_path.exists() else None
+        identity = saved_identity or {
             'entity': entity, 'project': project, 'mode': mode, 'id': uuid.uuid4().hex[:8]}
         if any(identity[key] != value for key, value in (('entity', entity), ('project', project), ('mode', mode))):
-            raise ValueError('Monitor entity/project/mode differs from its saved W&B identity')
-        identity_path.write_text(json.dumps(identity, indent=2), encoding='utf-8')
+            initialized = identity.get('initialized') or (work / 'run-url.txt').exists()
+            offline_run = any((work / 'sdk' / 'wandb').glob(f'offline-run-*-{identity["id"]}'))
+            if initialized or offline_run:
+                raise ValueError('Monitor entity/project/mode differs from its saved W&B identity')
+            # Older launchers saved identity before init, including failed entity lookups.
+            identity = {'entity': entity, 'project': project, 'mode': mode, 'id': uuid.uuid4().hex[:8]}
         # A shared shell may carry someone else's sweep/service/project settings.
         for key in tuple(os.environ):
             if key.startswith('WANDB_') and key != 'WANDB_API_KEY':
@@ -170,6 +175,13 @@ def monitor(directory, *, entity, project, mode='online', follow=False, poll=15,
                                console='off', x_disable_stats=True))
         exit_code = 0
         try:
+            if saved_identity is not None and saved_identity['id'] != identity['id']:
+                (work / f'identity-uninitialized-{saved_identity["id"]}.json').write_text(
+                    json.dumps(saved_identity, indent=2), encoding='utf-8')
+            identity['initialized'] = True
+            temporary = work / 'identity.json.tmp'
+            temporary.write_text(json.dumps(identity, indent=2), encoding='utf-8')
+            temporary.replace(identity_path)
             run.define_metric('train/step')
             run.define_metric('*', step_metric='train/step')
             url = run.url if mode == 'online' else None

@@ -177,3 +177,49 @@ def test_monitor_failure_finishes_failed_session_and_preserves_training_logs(tmp
         monitor(directory, entity='me', project='WorldTTN', backend=backend)
     assert backend.finished == [1]
     assert (directory / 'train.jsonl').read_bytes() == original
+
+
+def test_failed_init_does_not_pin_an_invalid_entity(tmp_path, monkeypatch):
+    directory = train_directory(tmp_path)
+    monkeypatch.setenv('WANDB_API_KEY', 'private-test-key')
+    backend = FakeBackend()
+
+    def fail(**kwargs):
+        raise RuntimeError('entity not found during upsertBucket')
+
+    monkeypatch.setattr(backend, 'init', fail)
+    with pytest.raises(RuntimeError, match='entity not found'):
+        monitor(directory, entity='3193513478', project='WorldTTN', backend=backend)
+    assert not (directory / 'wandb-monitor/identity.json').exists()
+    monitor(directory, entity='3193513478-', project='WorldTTN', backend=FakeBackend())
+    identity = json.loads((directory / 'wandb-monitor/identity.json').read_text())
+    assert identity['entity'] == '3193513478-' and identity['initialized'] is True
+
+
+def test_old_failed_entity_cache_is_archived_after_correct_entity_initializes(tmp_path, monkeypatch):
+    directory = train_directory(tmp_path)
+    work = directory / 'wandb-monitor'
+    work.mkdir()
+    old = {'entity': '3193513478', 'project': 'WorldTTN', 'mode': 'online', 'id': '69ceb4ea'}
+    (work / 'identity.json').write_text(json.dumps(old))
+    monkeypatch.setenv('WANDB_API_KEY', 'private-test-key')
+    backend = FakeBackend()
+    monitor(directory, entity='3193513478-', project='WorldTTN', backend=backend)
+    assert backend.calls[0]['entity'] == '3193513478-'
+    assert json.loads((work / 'identity-uninitialized-69ceb4ea.json').read_text()) == old
+    assert json.loads((work / 'identity.json').read_text())['initialized'] is True
+
+
+def test_existing_old_online_run_cannot_be_redirected_to_another_entity(tmp_path, monkeypatch):
+    directory = train_directory(tmp_path)
+    work = directory / 'wandb-monitor'
+    work.mkdir()
+    old = {'entity': 'me', 'project': 'WorldTTN', 'mode': 'online', 'id': 'existing'}
+    (work / 'identity.json').write_text(json.dumps(old))
+    (work / 'run-url.txt').write_text('https://example.test/existing')
+    monkeypatch.setenv('WANDB_API_KEY', 'private-test-key')
+    backend = FakeBackend()
+    with pytest.raises(ValueError, match='identity'):
+        monitor(directory, entity='other', project='WorldTTN', backend=backend)
+    assert not backend.calls
+    assert json.loads((work / 'identity.json').read_text()) == old

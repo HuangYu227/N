@@ -64,6 +64,12 @@ accounts for actual credential isolation.
 
 The website URL is printed and saved to `RUN/wandb-monitor/run-url.txt`.
 Restart the same command with the same entity/project to resume its W&B run ID.
+Identity is published only after SDK initialization succeeds. Old identity files
+from failed initialization can be corrected when there is no successful-online
+URL, initialized marker, or offline run. The previous uninitialized identity is
+archived after the corrected target initializes; successful runs cannot be
+silently redirected to another entity/project. Preserve every character in the
+entity identifier, including a trailing hyphen if your workspace name has one.
 Only one monitor can hold the directory lock. W&B's restored next history step
 controls replay, rather than a local cursor that might precede network upload.
 `Ctrl+C` finishes this monitoring session and leaves training running.
