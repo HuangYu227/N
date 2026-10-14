@@ -14,8 +14,12 @@ Only tool/docs files changed in this update; the training implementation is
 unchanged. The monitoring SDK lives in its own virtual environment so installing
 it does not change the active training environment's dependencies.
 
+The explicit Bash invocation also works when your tmux shell is zsh or ksh;
+their `read -p` option has different semantics. Prompts read from `/dev/tty`
+because standard input below contains the script.
+
 ```bash
-(
+bash <<'BASH'
 set -euo pipefail
 ROOT=/mnt/einsia/aws01-nvme/einsia-shared/homes/gaomingju/workspace/yuhuang
 PY_BIN="$ROOT/envs/worldttn-fp8/bin/python"
@@ -44,7 +48,7 @@ test -x "$WB_ENV/bin/python" || "$PY_BIN" -m venv "$WB_ENV"
   export CUDA_VISIBLE_DEVICES=''
   exec "$WB_ENV/bin/python" -u tools/ttn_wandb_monitor.py \
     "$RUN" --entity "$WB_ENTITY" --project WorldTTN --follow
-)
+BASH
 ```
 
 Do not paste your key into a chat, command argument, Git file, `.bashrc`, or a
