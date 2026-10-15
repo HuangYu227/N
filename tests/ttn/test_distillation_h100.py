@@ -203,3 +203,76 @@ def test_zero_exit_without_capacity_receipt_is_rejected(tmp_path,monkeypatch):
     with pytest.raises(RuntimeError,match='acceptance receipt'): launch_h100.execute(run)
     assert len(commands)==2
     assert json.loads((run/'status.json').read_text())['status']=='failed'
+
+
+@pytest.mark.parametrize('stage4',[False,True])
+def test_trainer_constructor_preserves_code_identity_across_teacher_config_and_stage4(tmp_path,monkeypatch,stage4):
+    """Run the real constructor; replace hardware/model IO, not identity assembly."""
+    from dataclasses import dataclass
+    import worldttn.distillation.trainer as module
+    import worldttn.distillation.evaluate as evaluation
+    @dataclass
+    class Settings:
+        origin: str = 'default'
+        inference_flow_shift: float = 9.8
+    teacher=tmp_path/'teacher.pt';teacher_file(teacher)
+    payload=torch.load(teacher,weights_only=False)
+    payload['distributed']['training_config']={name:{'origin':'teacher-'+name} for name in
+                                               ('sana_model','text_encoder','scheduler','data')}
+    torch.save(payload,teacher)
+    fingerprint=digest(teacher)
+    base=tmp_path/'base.safetensors';base.write_bytes(b'base')
+    payload['base_sha256']=digest(base)
+    torch.save(payload,teacher);fingerprint=digest(teacher)
+    config=OmegaConf.load(module.Path(__file__).resolve().parents[2]/
+                          'configs/distillation/longlive_ttn_step300_h100_8step.yaml')
+    config.update({'teacher':str(teacher),'teacher_sha256':fingerprint,
+                   'teacher_checkpoint_id':'checkpoint-300','base_weights':str(base),
+                   'dataset_root':str(tmp_path/'data'),'logdir':str(tmp_path/'training'),
+                   'code_sha256':'code-sha','disable_wandb':True})
+    if stage4:
+        stage=tmp_path/'stage8';stage.mkdir()
+        source=stage/'best-adapters.pt'
+        torch.save({'format':'TTN-DMD-adapters-v1','identity':{
+            'checkpoint_sha256':fingerprint,'base_sha256':digest(base),
+            'dataset_sha256':'dataset-sha','config':{'student_steps':8,'lora_rank':128,'cfg':4.5}},
+            'weights':{'student':{},'fake':{}},'counts':{'student':25}},source)
+        review=stage/'review.json'
+        review.write_text(json.dumps({'video_review':True,'source_sha256':digest(source)}))
+        metrics=stage/'eval-000025';metrics.mkdir()
+        (metrics/'metrics.json').write_text('{"results":[]}')
+        config.update({'student_steps':4,'stage4_source':str(source),'stage4_review':str(review)})
+        monkeypatch.setattr(evaluation,'video_review_ready',lambda *a:True)
+        monkeypatch.setattr(evaluation,'phase4_gate',lambda *a:True)
+        monkeypatch.setattr(module,'load_adapter_weights',lambda *a:None)
+    for name,value in {'WORLD_SIZE':'1','RANK':'0','LOCAL_RANK':'0','CUDA_VISIBLE_DEVICES':'5'}.items():
+        monkeypatch.setenv(name,value)
+    for name in ('set_device','set_per_process_memory_fraction','empty_cache'):
+        monkeypatch.setattr(torch.cuda,name,lambda *a:None)
+    monkeypatch.setattr(torch.cuda,'get_device_name',lambda *a:'H100-test')
+    monkeypatch.setattr(torch.cuda,'get_device_properties',lambda *a:SimpleNamespace(total_memory=80*2**30))
+    monkeypatch.setattr(torch.cuda,'memory_allocated',lambda *a:0)
+    monkeypatch.setattr(module.dist,'init_process_group',lambda *a,**k:None)
+    monkeypatch.setattr(module.dist,'new_group',lambda *a,**k:None)
+    monkeypatch.setattr(module,'code_identity',lambda root:{'sha256':'code-sha','commit':'commit-sha'})
+    monkeypatch.setattr(module,'memory_report',lambda device:{})
+    monkeypatch.setattr(module,'load_sana_config',lambda path:SimpleNamespace(**{
+        name:Settings() for name in ('model','text_encoder','scheduler','data')}))
+    monkeypatch.setattr(module,'Data',lambda *a:SimpleNamespace(identity='dataset-sha',
+        partition={'train':[0],'validation':[1]}))
+    def build(*a,**kw):
+        model=nn.Linear(2,2)
+        model.blocks=nn.ModuleList([nn.Identity()])
+        return model
+    monkeypatch.setattr(module,'build_sana',build)
+    for name in ('configure_activation_checkpointing','configure_cross_attention',
+                 'configure_execution','apply_checkpoint_weights','install','shard'):
+        monkeypatch.setattr(module,name,lambda *a,**kw:None)
+    monkeypatch.setattr(module,'read_checkpoint',lambda *a:payload)
+    trainer=module.StateTTTTrainer(config)
+    assert trainer.identity['code_sha256']=='code-sha'
+    assert trainer.sana_config.data.origin=='teacher-data'
+    recorded=json.loads((tmp_path/'training/run-config.json').read_text())
+    assert recorded['code_commit']=='commit-sha'
+    assert recorded['identity']==trainer.identity
+    assert ('stage4_source_sha256' in trainer.identity)==stage4

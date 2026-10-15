@@ -105,8 +105,8 @@ class StateTTTTrainer:
         self.checkpoint_hash=teacher['sha256']
         self.ttn_config=TTNConfig(**self.payload['config'])
         root=Path(__file__).resolve().parents[2]
-        source=code_identity(root)
-        if config.get('code_sha256') and config.code_sha256 != source['sha256']:
+        code_source=code_identity(root)
+        if config.get('code_sha256') and config.code_sha256 != code_source['sha256']:
             raise ValueError('Code changed since this run was prepared')
         self.base_path=Path(config.base_weights).resolve()
         if digest(self.base_path)!=self.payload['base_sha256']:
@@ -114,9 +114,9 @@ class StateTTTTrainer:
         self.sana_config=load_sana_config(config.sana_config)
         identity=self.payload['distributed']['training_config']
         from dataclasses import replace
-        for destination,source in (('model','sana_model'),('text_encoder','text_encoder'),
+        for destination,source_field in (('model','sana_model'),('text_encoder','text_encoder'),
                                    ('scheduler','scheduler'),('data','data')):
-            setattr(self.sana_config,destination,replace(getattr(self.sana_config,destination),**identity[source]))
+            setattr(self.sana_config,destination,replace(getattr(self.sana_config,destination),**identity[source_field]))
         data_root=Path(config.dataset_root)
         self.sana_config.data.data_dir={'sekai_game':str(data_root/'data/sekai_game_train_961frames_16fps_ovl640')}
         self.sana_config.data.vae_cache_dir=str(data_root/'data/vae_cache/LTX2VAE_diffusers_704x1280/sekai_game_train_961frames_16fps_ovl640')
@@ -128,13 +128,13 @@ class StateTTTTrainer:
         if config.get('stage4_source'):
             if config.student_steps != 4:
                 raise ValueError('Stage-4 initialization requires four solver steps')
-            source=Path(config.stage4_source).resolve()
-            source_hash=digest(source)
+            stage4_path=Path(config.stage4_source).resolve()
+            source_hash=digest(stage4_path)
             review=Path(config.stage4_review).resolve()
             approved=json.loads(review.read_text())
             if not approved.get('video_review') or approved.get('source_sha256')!=source_hash:
                 raise ValueError('Stage-4 requires video review of this exact best-8 adapter')
-            self.stage4=torch.load(source,map_location='cpu',weights_only=True)
+            self.stage4=torch.load(stage4_path,map_location='cpu',weights_only=True)
             previous=self.stage4['identity']
             if (self.stage4['format']!='TTN-DMD-adapters-v1' or
                     previous['config']['student_steps']!=8 or
@@ -145,14 +145,14 @@ class StateTTTTrainer:
                     previous['config']['cfg']!=config.cfg):
                 raise ValueError('Stage-4 source is not the validated eight-step student')
             from .evaluate import phase4_gate, video_review_ready
-            evaluated=source.parent/f'eval-{self.stage4["counts"]["student"]:06d}'/'metrics.json'
-            if (not video_review_ready(source.parent,source_hash) or
+            evaluated=stage4_path.parent/f'eval-{self.stage4["counts"]["student"]:06d}'/'metrics.json'
+            if (not video_review_ready(stage4_path.parent,source_hash) or
                     not phase4_gate(json.loads(evaluated.read_text())['results'],True)):
                 raise ValueError('Stage-4 numerical and speed gate failed')
         self.identity={'checkpoint_sha256':self.checkpoint_hash,'base_sha256':self.payload['base_sha256'],
             'dataset_sha256':self.data.identity,'config':{k:config[k] for k in
                 ('student_steps','target_updates','critic_ratio','cfg','lora_rank','lr_student','lr_fake','seed')}}
-        self.identity.update(teacher=teacher,code_sha256=source['sha256'],
+        self.identity.update(teacher=teacher,code_sha256=code_source['sha256'],
             runtime={'world_size':self.world,'gradient_accumulation':self.accumulation,
                 'effective_batch':self.world*self.accumulation,'physical_gpus':str(config.get('physical_gpus','6,7')),
                 'gpu_budget_bytes':budget,'precision':'bf16-autocast-fp32-state',
@@ -160,10 +160,10 @@ class StateTTTTrainer:
                 'cuda':torch.version.cuda,'gpu_name':torch.cuda.get_device_name(self.device),
                 'cpu_parameter_offload':True,'activation_offload':'cpu-pageable',
                 'cross_attention':'efficient','capacity_long_cycles':int(config.get('capacity_long_cycles',2))})
-        if self.rank==0:
-            atomic_json({'identity':self.identity,'code_commit':source['commit'],
-                         'resources':memory_report(self.device)},self.output/'run-config.json')
         if self.stage4 is not None:self.identity['stage4_source_sha256']=source_hash
+        if self.rank==0:
+            atomic_json({'identity':self.identity,'code_commit':code_source['commit'],
+                         'resources':memory_report(self.device)},self.output/'run-config.json')
         self.models={}
         for role in ('teacher','student','fake'):
             model=build_sana(self.sana_config,self.ttn_config,str(self.base_path),device=self.device,
