@@ -134,13 +134,12 @@ class TTNRuntimeState:
 
     @classmethod
     def create(cls, config, batch_size, device, *, ablation="full", diagnostics=False, collect_local_stats=False,
-               ffn_delta_clip=1e-5, ffn_shapes=None):
+               ffn_delta_clip=None, ffn_shapes=None):
         if ablation not in ("full", "no-ttt", "identity", "no-local", "no-persistent", "no-ffn-ttt"):
             raise ValueError("unknown TTN runtime ablation")
         if ablation == 'no-ffn-ttt' and config.ttt_backend != 'inplace-ffn':
             raise ValueError('no-ffn-ttt requires inplace-ffn')
-        if ffn_delta_clip is not None and (not math.isfinite(ffn_delta_clip) or ffn_delta_clip <= 0):
-            raise ValueError('FFN delta clip must be None or finite and positive')
+        ffn_delta_clip = config.inference_ffn_clip(ffn_delta_clip)
         if ablation in ("no-local", "no-persistent") and not (config.local_update or config.persistent_meta):
             raise ValueError("Local/Persistent contribution controls require Meta-TTT")
         if ablation != "full" and torch.is_grad_enabled():

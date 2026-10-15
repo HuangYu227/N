@@ -63,7 +63,7 @@ class TTNSession:
 
     def __init__(self, model, camera_conditions, width, height, valid_mask=None, extras=None,
                  *, ablation="full", diagnostics=False, collect_local_stats=False, live_cache=False,
-                 inplace_delta_clip=1e-5):
+                 inplace_delta_clip=None):
         if camera_conditions.ndim != 3 or camera_conditions.shape[-1] != 20:
             raise ValueError("camera_conditions must contain C2W(16) + intrinsics(4)")
         self.model = model

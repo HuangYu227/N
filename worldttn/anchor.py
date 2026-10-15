@@ -323,7 +323,8 @@ def install_ttn(model, config):
                 mlp = model.blocks[i].mlp
                 c, h = mlp.point_conv.conv.weight.shape[:2]
                 mlp.inplace_ttt = InPlaceFFNTTT(c, h, lr=config.inplace_lr,
-                    target_diag_std=config.inplace_target_diag_std).to(device=next(mlp.parameters()).device).requires_grad_(True)
+                    target_diag_std=config.inplace_target_diag_std,
+                    reduction=config.inplace_reduction).to(device=next(mlp.parameters()).device).requires_grad_(True)
                 mlp.ttn_ffn_index = i
     model.ttn_reference = True
     model.eval()  # fixed clip conditioning; gradients still flow through the frozen backbone

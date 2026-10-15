@@ -105,6 +105,57 @@ def test_mask_and_per_sample_inference_clip():
         model(z, target, delta.bfloat16())
 
 
+def test_mean_inner_objective_uses_valid_tokens_and_matches_autograd():
+    z, target, delta = inputs()
+    model = learned(); model.reduction = 'mean'
+    mask = torch.ones(2, 7, dtype=torch.bool); mask[1, :3] = False
+    _, candidate, _ = model(z, target, delta, mask)
+    conv = F.conv1d((target * mask[..., None]).transpose(1, 2), model.ttt_conv.weight,
+                    padding=2, groups=3).transpose(1, 2)
+    values = conv @ model.ttt_proj.weight
+    variable = delta.detach().requires_grad_()
+    objective = -((torch.bmm(z, variable.transpose(1, 2)) * values) * mask[..., None]).sum((1, 2)) / mask.sum(1)
+    gradient, = torch.autograd.grad(objective.sum(), variable)
+    torch.testing.assert_close(candidate, delta - model.lr * gradient)
+
+
+def test_mean_update_is_invariant_to_token_replication_and_keeps_history_gradient():
+    z, target, delta = inputs()
+    model = learned(); model.reduction = 'mean'
+    # A pointwise kernel isolates token count from convolution boundary effects.
+    with torch.no_grad():
+        model.ttt_conv.weight[:, :, :2] = 0
+        model.ttt_conv.weight[:, :, 3:] = 0
+    target.requires_grad_()
+    mask = torch.ones(2, 7, dtype=torch.bool)
+    _, state, _ = model(z, target, delta, mask)
+    _, repeated, _ = model(z.repeat(1, 4, 1), target.repeat(1, 4, 1), delta, mask.repeat(1, 4))
+    torch.testing.assert_close(state, repeated, rtol=2e-5, atol=2e-6)
+    future, _, _ = model(z.flip(1), target, state)
+    future.square().mean().backward()
+    assert target.grad.norm() > 0
+    assert model.ttt_conv.weight.grad.norm() > 0 and model.ttt_proj.weight.grad.norm() > 0
+
+
+def test_matched_clip_preserves_directional_learning_and_train_inference_equality():
+    z, target, delta = inputs()
+    model = learned(); model.reduction = 'mean'
+    mask = torch.ones(2, 7, dtype=torch.bool)
+    expected = None
+    for inference in (False, True):
+        with torch.set_grad_enabled(not inference):
+            output, state, stats = model(z, target, delta, mask, delta_clip=.01)
+            if expected is None:
+                expected = (output.detach(), state.detach())
+                (state * torch.randn_like(state)).sum().backward()
+            else:
+                torch.testing.assert_close((output, state), expected, rtol=0, atol=0)
+        assert (stats['applied_update_norm'] <= .010001).all()
+        assert (stats['clip_scale'] < 1).any()
+    for parameter in model.parameters():
+        assert torch.isfinite(parameter.grad).all() and parameter.grad.norm() > 0
+
+
 class Context:
     def __init__(self, delta, *, clean=True, prefill=False, enabled=True):
         self.ffn_fast = {3: delta}

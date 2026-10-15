@@ -110,7 +110,7 @@ def train_legacy_sequence(model, clean, y, camera_conditions, optimizer, loss_fn
         valid.repeat(3, 1), valid.repeat(3, 1), 0, id(runtime), sequence_mode=True,
         camera_cached_chunks=cached_chunks, checkpoint_cpu_inputs=clean.is_cuda and activation_offload != 'none',
         collect_local_stats=True, sequence_memory_callback=memory_callback,
-        ffn_fast=runtime.ffn_fast, ffn_delta_clip=None)
+        ffn_fast=runtime.ffn_fast, ffn_delta_clip=model.ttn_system.config.inplace_delta_clip)
     lm = valid[:, None, :, None, None].float();lm[:, :, 0] = 0
     episode = SimpleNamespace(session=session, context=context, clean=clean, timesteps=timesteps, noise=noise,
         y=y, mask=mask, data_info=data_info, loss_mask=lm, on_prediction=on_prediction)
@@ -177,7 +177,8 @@ def train_legacy_sequence(model, clean, y, camera_conditions, optimizer, loss_fn
                       cached_chunks=2,live_prefill=True))
     if inplace:
         result['sequence'].update(ffn_clean_commits=len(chunks), ffn_prefill_writes=0,
-                                  psi_updates=False, ffn_delta_clip=None)
+                                  psi_updates=False, ffn_delta_clip=model.ttn_system.config.inplace_delta_clip,
+                                  ffn_reduction=model.ttn_system.config.inplace_reduction)
     if probe is not None: result['optimizer_updates'] = probe.report(optimizer)
     if eta_before is not None: result['local_eta_update'] = local_eta_update(model, eta_before, optimizer)
     # Episode credit has finished; release closure cycles, not temporal gradients.

@@ -38,6 +38,21 @@ def test_config_identity_roundtrip_and_no_legacy_backend_activation():
             replace(cfg, **flags)
 
 
+def test_scaled_update_config_is_shared_by_train_and_inference_without_changing_old_identities():
+    system, _, _ = episode()
+    legacy = system.config
+    assert 'inplace_reduction' not in legacy.to_dict() and 'inplace_delta_clip' not in legacy.to_dict()
+    assert legacy.inference_ffn_clip() == 1e-5
+    cfg = replace(legacy, inplace_reduction='mean', inplace_delta_clip=.01)
+    assert TTNConfig(**cfg.to_dict()) == cfg
+    runtime = TTNRuntimeState.create(cfg, 2, 'cpu')
+    assert runtime.ffn_delta_clip == cfg.inplace_delta_clip == cfg.inference_ffn_clip()
+    assert TTNRuntimeState.create(cfg, 2, 'cpu', ffn_delta_clip=0).ffn_delta_clip is None
+    assert cfg.inference_ffn_clip(.02) == .02
+    for flags in ({'inplace_reduction': 'invalid'}, {'inplace_delta_clip': -1}, {'inplace_delta_clip': float('nan')}):
+        with pytest.raises(ValueError): replace(cfg, **flags)
+
+
 def test_clean_commits_ffn_atomically_and_never_calls_legacy_psi(monkeypatch):
     monkeypatch.setattr('worldttn.anchor.analytic_psi_gradient', lambda *a, **k: pytest.fail('legacy psi called'))
     system, runtime, anchors = episode()

@@ -40,9 +40,15 @@ class TTNConfig:
     inplace_layers: tuple = ANCHORS
     inplace_lr: float = 3.
     inplace_target_diag_std: float = .02
+    inplace_reduction: str = 'sum'
+    inplace_delta_clip: float | None = None
 
     def __post_init__(self):
         object.__setattr__(self, 'inplace_layers', tuple(self.inplace_layers))
+        if self.inplace_reduction not in ('sum', 'mean'):
+            raise ValueError('inplace reduction must be sum or mean')
+        if self.inplace_delta_clip is not None and (not math.isfinite(self.inplace_delta_clip) or self.inplace_delta_clip <= 0):
+            raise ValueError('inplace delta clip must be finite and positive')
         if self.ttt_backend not in ('auto', 'inplace-ffn'):
             raise ValueError('unknown TTT backend')
         if self.ttt_backend == 'inplace-ffn':
@@ -79,12 +85,22 @@ class TTNConfig:
         if self.local_eta_init == .01: result.pop("local_eta_init")
         if not self.state_ttt_rank:
             for name in ('state_ttt_rank','state_ttt_policy','state_ttt_gain'):result.pop(name)
+        if self.inplace_reduction == 'sum': result.pop('inplace_reduction')
+        if self.inplace_delta_clip is None: result.pop('inplace_delta_clip')
         if self.ttt_backend == 'auto':
             for name in ('ttt_backend', 'inplace_layers', 'inplace_lr', 'inplace_target_diag_std'):
                 result.pop(name)
         else:
             result['inplace_layers'] = list(self.inplace_layers)
         return result
+
+    def inference_ffn_clip(self, override=None):
+        """New runs share the training cap; old checkpoints retain their inference default."""
+        if override is None:
+            return self.inplace_delta_clip if self.inplace_delta_clip is not None else 1e-5
+        if not math.isfinite(override) or override < 0:
+            raise ValueError('inplace delta clip override must be finite and nonnegative')
+        return None if override == 0 else override
 
 
 class Rank2Generators(nn.Module):

@@ -51,7 +51,7 @@ def inplace_sequence_forward(model, clean, noisy, times, camera, *, cpu_inputs=F
     context = TTNChunkContext(state, state, psi, psi, model.ttn_system, ids,
         camera[:, :, :16].reshape(b, frames, 4, 4).repeat(3, 1, 1, 1),
         valid, valid, 0, id(runtime), sequence_mode=True, ffn_fast=runtime.ffn_fast,
-        ffn_delta_clip=None, checkpoint_cpu_inputs=cpu_inputs)
+        ffn_delta_clip=model.ttn_system.config.inplace_delta_clip, checkpoint_cpu_inputs=cpu_inputs)
     outputs = []
     def prediction_loss(session, clean, t, noise, y, ctx, cache, start, end, mask, info, lm, on_prediction):
         output, _ = session.forward(noisy, t, y, ctx, cache, start, end, mask, info)
@@ -65,15 +65,22 @@ def inplace_sequence_forward(model, clean, noisy, times, camera, *, cpu_inputs=F
     return outputs[0], context
 
 
-def test_inplace_layer_scan_matches_sequential_clean_transactions(inplace_sequence_model):
+@pytest.mark.parametrize('scaled', [False, True])
+def test_inplace_layer_scan_matches_sequential_clean_transactions(inplace_sequence_model, scaled):
     model = inplace_sequence_model
+    if scaled:
+        model.ttn_system.config = replace(model.ttn_system.config,
+            inplace_reduction='mean', inplace_delta_clip=.01, inplace_lr=3.)
+        for index in ANCHORS:
+            model.blocks[index].mlp.inplace_ttt.reduction = 'mean'
+            model.blocks[index].mlp.inplace_ttt.lr = 3.
     reference = copy.deepcopy(model)
     clean, noisy, times, camera = inputs()
     noisy[:, :, :1] = clean[:, :, :1]
     y, mask = torch.ones(1, 1, 2, 16), torch.ones(1, 2, dtype=torch.bool)
     session = TTNSession(reference, camera, 100, 100, live_cache=True)
     session.reset(1)
-    session.runtime.ffn_delta_clip = None
+    session.runtime.ffn_delta_clip = model.ttn_system.config.inplace_delta_clip
     session.prefill(clean[:, :, :1], y, mask)
     assert all(value.count_nonzero() == 0 for value in session.runtime.ffn_fast.values())
     cache, predictions = [[None]*10 for _ in model.blocks], []
@@ -95,7 +102,14 @@ def test_inplace_layer_scan_matches_sequential_clean_transactions(inplace_sequen
 
 
 @pytest.mark.parametrize('cpu_inputs', [False, True])
-def test_inplace_checkpoint_preserves_full_history_credit(inplace_sequence_model, cpu_inputs):
+@pytest.mark.parametrize('reduction', ['sum', 'mean'])
+def test_inplace_checkpoint_preserves_full_history_credit(inplace_sequence_model, cpu_inputs, reduction):
+    if reduction == 'mean':
+        inplace_sequence_model.ttn_system.config = replace(inplace_sequence_model.ttn_system.config,
+            inplace_reduction='mean', inplace_delta_clip=.01, inplace_lr=3.)
+        for index in ANCHORS:
+            module = inplace_sequence_model.blocks[index].mlp.inplace_ttt
+            module.reduction, module.lr = 'mean', 3.
     clean, noisy, times, camera = inputs()
     indices = torch.cat((torch.arange(13), torch.arange(1, 13)))
     clean, noisy, times, camera = clean[:, :, indices], noisy[:, :, indices], times[:, :, indices], camera[:, indices]

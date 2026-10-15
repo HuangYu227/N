@@ -36,6 +36,12 @@ def test_two_gpu_inplace_fullgrad_fp8_exact_resume(inplace_sequence_model):
     try:
         assert dist.get_world_size() == 2
         template = copy.deepcopy(inplace_sequence_model)
+        from dataclasses import replace
+        template.ttn_system.config = replace(template.ttn_system.config,
+            inplace_reduction='mean', inplace_delta_clip=.01, inplace_lr=3.)
+        for index in ANCHORS:
+            template.blocks[index].mlp.inplace_ttt.reduction = 'mean'
+            template.blocks[index].mlp.inplace_ttt.lr = 3.
         def build():
             model = configure_train_scope(copy.deepcopy(template).to(device), 'dit')
             for block in model.blocks:

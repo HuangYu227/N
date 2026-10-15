@@ -10,13 +10,16 @@ from torch.nn import functional as F
 
 
 class InPlaceFFNTTT(nn.Module):
-    def __init__(self, in_features, hidden_features, *, lr=3.0, target_diag_std=.02):
+    def __init__(self, in_features, hidden_features, *, lr=3.0, target_diag_std=.02, reduction='sum'):
         super().__init__()
         if in_features < 1 or hidden_features < 1:
             raise ValueError('In-Place TTT requires positive FFN dimensions')
         if not math.isfinite(lr) or lr <= 0 or not math.isfinite(target_diag_std) or target_diag_std <= 0:
             raise ValueError('In-Place TTT learning rate and target initialization must be finite and positive')
+        if reduction not in ('sum', 'mean'):
+            raise ValueError('In-Place TTT reduction must be sum or mean')
         self.in_features, self.hidden_features, self.lr = in_features, hidden_features, lr
+        self.reduction = reduction
         self.ttt_conv = nn.Conv1d(in_features, in_features, 5, padding=2,
                                   groups=in_features, bias=False, dtype=torch.float32)
         self.ttt_proj = nn.Linear(in_features, in_features, bias=False, dtype=torch.float32)
@@ -54,6 +57,9 @@ class InPlaceFFNTTT(nn.Module):
                 # Author's contraction is T @ P (not F.linear(T, P), which transposes P).
                 values = convolved @ self.ttt_proj.weight.float()
                 update = self.lr * torch.bmm(values.transpose(1, 2), z32 * write_mask[..., None])
+                # Mean inner loss removes dependence on the number of valid spatial tokens.
+                if self.reduction == 'mean':
+                    update = update / write_mask.sum(1).clamp_min(1)[:, None, None]
                 raw_norm = torch.linalg.vector_norm(update, dim=(1, 2))
                 if delta_clip is not None:
                     scale = (delta_clip / raw_norm.clamp_min(torch.finfo(torch.float32).tiny)).clamp(max=1)

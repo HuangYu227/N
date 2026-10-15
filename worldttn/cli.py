@@ -195,7 +195,7 @@ def train_update(model, config, batch, optimizer, k, parallel=None, *, activatio
 @torch.no_grad()
 def rollout(model, config, batch, steps=4, cfg_scale=4.5, cached_blocks=-1, *, initial_noise=None, on_chunk=None,
             ttn_ablation="full", state_diagnostics=False, history_reference=None, on_state=None,
-            inplace_delta_clip=1e-5):
+            inplace_delta_clip=None):
     from diffusion.scheduler.self_forcing_flow_euler_sampler import SelfForcingFlowEulerCamCtrl
     initial = batch.get("initial_latent")
     if initial is None: initial = batch["clean_latents"][:, :, :1]
@@ -370,6 +370,11 @@ def _training_identity(args, config, settings, k):
             'conv_axis': 'flattened T/H/W', 'read_write': 'read old delta; clean commits once for next chunk',
             'prefill_write': False, 'state_ttt': 'disabled', 'old_psi': 'disabled',
             'fast_state_dtype': 'float32', 'output_merge': 'FP32 correction; cast to original projection dtype'}
+        if ttn.get('inplace_reduction', 'sum') != 'sum' or ttn.get('inplace_delta_clip') is not None:
+            identity['meta_ttt'].update(version='inplace-ffn-v2', reduction=ttn.get('inplace_reduction', 'sum'),
+                objective='negative inner product per-valid-token mean; eta*V^T*H/N',
+                training_delta_clip=ttn.get('inplace_delta_clip'),
+                inference_delta_clip=ttn.get('inplace_delta_clip'))
     precision = getattr(args, "train_precision", None) or settings.get("training_precision", "bf16")
     if precision != "bf16":
         from .fp8 import precision_identity
@@ -674,9 +679,9 @@ def infer_command(args):
     model, config, settings = build(args)
     if args.adapter: load_checkpoint(args.adapter, model)
     batch = load_bundle(args.batch_file, args.device)
-    clip = None if args.inplace_delta_clip == 0 else args.inplace_delta_clip
+    clip = model.ttn_system.config.inference_ffn_clip(args.inplace_delta_clip)
     result, timing = timed_cuda(lambda: rollout(model, config, batch, args.steps, args.cfg_scale, args.cached_blocks,
-                                               inplace_delta_clip=clip))
+                                               inplace_delta_clip=0 if clip is None else clip))
     latents, runtime, records = result
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
@@ -962,8 +967,8 @@ def main():
     parser.add_argument("--empty-text-probability", type=float)
     parser.add_argument("--steps", type=int, help="default 4 for smoke; evaluate requires an explicit quality schedule")
     parser.add_argument("--cfg-scale", type=float, default=4.5)
-    parser.add_argument('--inplace-delta-clip', type=float, default=1e-5,
-                        help='inference/evaluation FFN update Frobenius cap; 0 disables clipping')
+    parser.add_argument('--inplace-delta-clip', type=float,
+                        help='inference/evaluation cap override; default uses training config, 0 disables clipping')
     parser.add_argument("--cached-blocks", type=int, default=-1)
     parser.add_argument("--stages", nargs="+", choices=("A", "B", "C"), default=["A", "B", "C"])
     parser.add_argument("--frames", type=int, default=13)
@@ -976,9 +981,9 @@ def main():
         parser.error(str(error))
     if args.benchmark_save_checkpoint and (args.command != "train" or not benchmark_run(args)):
         parser.error("--benchmark-save-checkpoint requires a train benchmark/profiler/layout run")
-    if not math.isfinite(args.inplace_delta_clip) or args.inplace_delta_clip < 0:
+    if args.inplace_delta_clip is not None and (not math.isfinite(args.inplace_delta_clip) or args.inplace_delta_clip < 0):
         parser.error('--inplace-delta-clip must be finite and nonnegative')
-    if args.command not in ('infer', 'evaluate') and args.inplace_delta_clip != 1e-5:
+    if args.command not in ('infer', 'evaluate') and args.inplace_delta_clip is not None:
         parser.error('--inplace-delta-clip is inference/evaluation only')
     if args.command != "evaluate" and (args.ttn_ablation != "full" or args.history_source != "generated"
             or args.state_diagnostics or args.eval_methods != ["sana", "ttn"]):

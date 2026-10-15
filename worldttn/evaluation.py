@@ -333,8 +333,7 @@ def evaluate_command(args):
     history = getattr(args, "history_source", "generated")
     methods = getattr(args, "eval_methods", ("sana", "ttn"))
     diagnostics = getattr(args, "state_diagnostics", False)
-    delta_clip = getattr(args, 'inplace_delta_clip', 1e-5)
-    delta_clip = None if delta_clip == 0 else delta_clip
+    delta_clip = ttn.inference_ffn_clip(getattr(args, 'inplace_delta_clip', None))
     if ablation != "full" and ttn.stage != "C": raise ValueError("mechanism ablations require a Stage C checkpoint")
     if getattr(args, "ttn_compare_reference", False):
         if tuple(methods) != ("sana", "ttn") or ablation != "full" or diagnostics:
@@ -446,7 +445,7 @@ def evaluate_command(args):
                            output / f"case-{index:03d}-{method}-state-{chunk:03d}.pt")
             runtime_options = {"on_state": save_state} if getattr(args, "ttn_compare_reference", False) else {}
             if ttn.ttt_backend == 'inplace-ffn' and method != 'sana':
-                runtime_options['inplace_delta_clip'] = delta_clip
+                runtime_options['inplace_delta_clip'] = 0 if delta_clip is None else delta_clip
             if method == "ttn" and (ablation != "full" or diagnostics):
                 runtime_options.update(ttn_ablation=ablation, state_diagnostics=diagnostics)
             if history == "gt": runtime_options["history_reference"] = gt
