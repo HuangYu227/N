@@ -55,6 +55,9 @@ def config_for(run):
 
 
 def prepare(args):
+    import imageio.v2
+    import imageio_ffmpeg
+    imageio_ffmpeg.get_ffmpeg_exe()  # Refuse a missing video encoder before expensive sampling.
     from worldttn.evaluation import select_cases, diagnostic_noise
     from worldttn.cli import seed_everything
     from diffusion.data.datasets.video.sana_wm_zip_latent_data import SanaWMZipLatentDataset
@@ -297,6 +300,8 @@ def main():
     args.training_run, args.output = args.training_run.resolve(), args.output.resolve()
     if len(set(args.milestones)) != len(args.milestones) or min(args.milestones) < 1:
         parser.error('Milestones must be positive and distinct')
+    if args.phase == 'generate' and args.step not in args.milestones:
+        parser.error('Generation step must be one of the fixed milestones')
     if args.phase:
         guard = args.output / f'memory-{args.phase}-{args.step or "shared"}'
         guard.mkdir()
