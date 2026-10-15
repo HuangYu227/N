@@ -196,6 +196,8 @@ class GLUMBConv(nn.Module):
         B = x.shape[0] // T
         _, write = context.token_masks(T * H * W)
         write = write if context.clean_mode and not context.prefill_mode else None
+        # Capturing context retains every dense history matrix despite CPU input offload.
+        delta_clip = context.ffn_delta_clip
 
         def spatial(value, old_delta, selected):
             target = value.reshape(B, T, value.shape[1], H * W).permute(0, 1, 3, 2).reshape(B, T * H * W, -1)
@@ -206,7 +208,7 @@ class GLUMBConv(nn.Module):
                 hidden = self.point_conv.dropout(hidden)
             base = self.point_conv.conv(hidden)
             z = hidden.reshape(B, T, hidden.shape[1], H * W).permute(0, 1, 3, 2).reshape(B, T * H * W, -1)
-            correction, candidate, stats = self.inplace_ttt(z, target, old_delta, selected, context.ffn_delta_clip)
+            correction, candidate, stats = self.inplace_ttt(z, target, old_delta, selected, delta_clip)
             correction = correction.reshape(B, T, H * W, -1).permute(0, 1, 3, 2).reshape_as(base)
             combined = (base.float() + correction).to(base.dtype)
             with torch.no_grad():

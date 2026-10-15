@@ -120,6 +120,27 @@ class Context:
         self.staged.append(values)
 
 
+def test_checkpoint_closure_does_not_retain_chunk_context_or_dense_history(cached_ffn, monkeypatch):
+    namespace = cached_ffn._apply_spatial_inplace.__globals__
+    ffn = cached_ffn(3, 5, norm=(None, None, None))
+    ffn.inplace_ttt = InPlaceFFNTTT(3, 5)
+    ffn.ttn_ffn_index = 3
+    ffn.ttn_activation_checkpointing = True
+    seen = []
+
+    def checkpoint(function, *args):
+        captured = [cell.cell_contents for cell in function.__closure__ or ()]
+        assert not any(isinstance(value, Context) for value in captured)
+        assert not any(isinstance(value, torch.Tensor) for value in captured)
+        seen.append(True)
+        return function(*args)
+
+    monkeypatch.setitem(namespace, 'checkpoint_preserving_strides', checkpoint)
+    ctx = Context(torch.zeros(1, 3, 5))
+    ffn(torch.randn(1, 8, 3, requires_grad=True), HW=(2, 2, 2), ttn_chunk_context=ctx)
+    assert seen and len(ctx.staged) == 1
+
+
 @pytest.mark.parametrize('checkpointed', [False, True])
 def test_cached_ffn_old_behavior_and_checkpoint_single_stage(cached_ffn, checkpointed):
     torch.manual_seed(9)
