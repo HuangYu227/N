@@ -193,10 +193,11 @@ def test_upstream_dmd_direction_mask_and_nonfinite(sequence_model):
 
 def test_adapter_only_resume_exact_next_update(sequence_model,tmp_path):
     m,batch,noise=make_case(sequence_model); install(m,2)
-    models={'student':m,'fake':copy.deepcopy(m)}
-    opts={n:optimizer(v,1e-5) for n,v in models.items()}; ema=EMA(m)
+    models={'student':m,'fake':copy.deepcopy(m),'teacher':copy.deepcopy(m).requires_grad_(False)}
+    opts={n:optimizer(models[n],1e-5) for n in ('student','fake')}; ema=EMA(m)
     def update():
         for role,model in models.items():
+            if role not in opts: continue
             opts[role].zero_grad(set_to_none=True)
             output,_=Transactions(model,batch,checkpointed=False).generate(noise,2,9.8,4.5)
             output.square().mean().backward(); clip_grad(model); opts[role].step()

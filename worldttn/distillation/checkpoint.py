@@ -108,6 +108,8 @@ def restore(folder, models, optimizers, ema, identity):
             expected = parameters(model)
             if expected.keys()!=state['parameters'][role].keys(): raise ValueError('Adapter schema mismatch')
             for name,p in expected.items(): local(p).copy_(state['parameters'][role][name])
+            if role not in optimizers:
+                continue  # The frozen teacher has neither trainable tensors nor optimizer.
             opt = optimizers[role]
             saved = state['optimizer'][role]
             for group,stored in zip(opt.param_groups,saved['param_groups']):
