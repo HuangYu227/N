@@ -1,0 +1,66 @@
+# Step-200 StateTTT / LongLive 2.0 distillation
+
+This backend keeps the H100 step-200 TLA and StateTTT state equations. LongLive
+2.0 supplies the alternating DMD objective and score-distillation schedule;
+`sampler.py` is the TTN-specific causal, differentiable rollout. Teacher,
+student and fake-score models own separate state and camera caches. The teacher
+is frozen; student and fake-score train independent rank-128 LoRA adapters and
+the ten StateTTT basis/gain tensors. The first observed latent is fixed and
+excluded from both losses. The student graph spans the whole episode, with no
+TBPTT or detached generated history in its update path.
+
+The pinned teacher SHA256 is
+`aa8bfc12706ee0890bd94b7fc1227396fee0e62e169cc19f9b7280b87d967f56`
+(step 200, ID `11199e5c315b44e69eb381953e31f484`). The SANA base SHA256 is
+`00699330c5e88325704470f13b974d6c1a184222d4bba5d1d197275fe37f1553`.
+LongLive 2.0 is fixed at `e5fa48cc5b1f995637b987195d25b5bd16e26086`;
+`longlive2/UPSTREAM.json` records upstream file hashes. The launch records
+code hashes; teacher, base, data and role identities are checked before update.
+
+On L20, `python tools/distillation/launch_l20.py` starts a unique `wm` tmux
+window on physical GPUs 6 and 7. It first runs actual 25/61/121-latent
+student and fake-score backward/optimizer acceptance. Only a passing capacity
+receipt allows the formal 500-student/2500-fake update run to start. The formal
+startup also compares the next update on both ranks before and after a saved
+recovery bundle. The enclosing cgroup caps total RAM at 360GiB and disables
+swap; PyTorch is capped near 40GiB per card. Saved activations use uncompressed
+pageable CPU storage. All failures leave a terminal status and log, and never
+advance to the next phase silently.
+
+The active run is recorded in
+`/home/newuser001/huangyu/.worldttt-experiment/current.json`. Within its
+`output` directory, `capacity.log`, `train.log`, `metrics-rank*.jsonl`,
+`capacity-passed.json` and `status.json` distinguish readiness from actual
+training progress. Every 25 student updates, two most recent adapter-only
+recovery bundles are kept; EMA-based validation selects `best-adapters.pt` by
+LPIPS then late latent MSE. The frozen 10GB teacher is referenced, not copied
+into every bundle. A held-out original-video group is only unseen by this
+distillation split; teacher training exposure is unknown.
+
+After the eight-step run completes, generate fixed 30/60-second teacher-20,
+undistilled-8, best-student-8 and student-8 TTT-off videos on the same held-out
+case and per-duration noise. Run this in a separate two-rank GPU 6/7 allocation
+after formal training has released those cards:
+
+```bash
+CUDA_VISIBLE_DEVICES=6,7 python -m torch.distributed.run --standalone --nproc_per_node=2 \
+  -m tools.distillation.review_videos --run /path/to/completed-eight-step-run
+```
+
+MP4s and a manifest are written to `<run>/review-videos/`; this is a
+qualitative comparison, not a teacher-unseen claim. Review both durations
+before recording the result. A
+review file containing `{"source_sha256":"<best-adapters.pt SHA256>",
+"video_review":true}` permits
+`python tools/distillation/prepare_stage4.py --eight-run <run> --review-file <file>`
+to prepare a four-step config only if per-case LPIPS and late MSE are within 5%
+of teacher-20 and measured FPS is higher. It does not launch stage four.
+`python tools/distillation/launch_l20.py --config <prepared-stage4.yaml>`
+then starts a separate guarded run, transferring student EMA and fake-score
+adapters while resetting both optimizers, EMA and update counts. Video review
+must reflect real visual inspection; the numerical gate alone is insufficient.
+
+Current L20 validation is recorded in the run logs. CPU unit tests establish
+the sigma/CFG math, DMD direction/mask, LoRA initialization, temporal gradient,
+recomputation and single-rank exact restore. A separate two-rank capacity and
+resume acceptance is required before any claim about full-length training.

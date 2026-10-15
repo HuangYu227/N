@@ -1,0 +1,16 @@
+backend: ttn_state_ttt
+teacher: /home/newuser001/huangyu/WorldTLA/checkpoints/h100-state-ttt/last.pt
+base_weights: /home/newuser001/.cache/huggingface/hub/models--Efficient-Large-Model--SANA-WM_chunk_causal/snapshots/ef7ea10f5e5213e5e1af41587961cb7293369e83/dit/sana_wm_chunk_causal_1600m_720p.safetensors
+sana_config: configs/worldttn/sana_teacher_single_gpu.yaml
+dataset_root: /home/newuser001/huangyu/WorldTTT/datasets/sana-wm-example
+seed: 3407
+student_steps: 8
+target_updates: 500
+critic_ratio: 5
+cfg: 4.5
+lora_rank: 128
+lr_student: 1e-5
+lr_fake: 2e-6
+validation_cases: 1
+wandb_entity: 3193513478-
+wandb_project: WorldTTN-Distill

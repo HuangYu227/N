@@ -1,0 +1,348 @@
+{
+  "repository": "https://github.com/NVlabs/LongLive",
+  "commit": "e5fa48cc5b1f995637b987195d25b5bd16e26086",
+  "subdirectory": "LongLive2.0",
+  "changes": "Qualified package imports; TTN entry dispatch and lazy Wan imports. Upstream file hashes below.",
+  "files": [
+    {
+      "path": "model/base.py",
+      "sha256": "f55c9e36d38a07eb9120aefba8a357ceea0e1bab1980b63d8a975fab9c108f91"
+    },
+    {
+      "path": "model/diffusion.py",
+      "sha256": "41200bcaeb0eb44d4570b7a44709a1d68e9d43e3d316be840cbda524c7736843"
+    },
+    {
+      "path": "model/dmd.py",
+      "sha256": "bc3bc45edf15bbff8a1435ee30a5d4aeef469799b63383fae27300d7c03ffb1c"
+    },
+    {
+      "path": "model/__init__.py",
+      "sha256": "0c54c6c6dd8ab08055b9d610d7cb118208903cd5415128fc830439e401baf81c"
+    },
+    {
+      "path": "trainer/diffusion.py",
+      "sha256": "cff55a7eedc805759cb78fb275370dcb85763afefa2944b36c3ab8c159705523"
+    },
+    {
+      "path": "trainer/distillation.py",
+      "sha256": "c99e848744681404950eb03055eb1818bffbb4b49a94c9afbc51b2dacbdcc453"
+    },
+    {
+      "path": "trainer/sp_helper.py",
+      "sha256": "4ed84cea8c41337862e9a82d5d062da4ac2b782efe937dbfde5187332e12b573"
+    },
+    {
+      "path": "trainer/__init__.py",
+      "sha256": "516317cc2baac846a4a60fc42731390532e84114490d0877c8eb4c072aef67d5"
+    },
+    {
+      "path": "utils/adaln_triton.py",
+      "sha256": "48bfb8d7f9be28cd6f3e78d54e3ac25a5517370719aa591132f7e95ed18b63b3"
+    },
+    {
+      "path": "utils/config.py",
+      "sha256": "aee0206c78521e44ac69c800e219468db2aa1b4dbd7c7f4f1fea28c9e7f5fae6"
+    },
+    {
+      "path": "utils/dataset.py",
+      "sha256": "3b08a0bd833bf82cef6ec9c7eebdd4650bb807234833b6cf510f9e9b6977bb54"
+    },
+    {
+      "path": "utils/distributed.py",
+      "sha256": "b4a09d580ecd63d56bbd2a6463ee70e759118a3852c0e8a7deccee30a67d58f3"
+    },
+    {
+      "path": "utils/error_buffer.py",
+      "sha256": "aa5b6a7cf2898e5e523a36567f6dc8378a9e93448419a6404c1f73ab829b54f7"
+    },
+    {
+      "path": "utils/fp8.py",
+      "sha256": "9718ba8dd796f2d04042026efdb56c6393d7c5534ae508f1e0bac52e66acf7b1"
+    },
+    {
+      "path": "utils/i2v_conditioning.py",
+      "sha256": "c4d03b40c4bca6fb4bbeb86c878b39d7636e42c0ad3205fc34ef991a3bdd6867"
+    },
+    {
+      "path": "utils/inference_utils.py",
+      "sha256": "762f55c767c87ea580f5b2a0fb4b482a2719eec5ad88fad0169100d12d356c5d"
+    },
+    {
+      "path": "utils/lightvae_5b_wrapper.py",
+      "sha256": "9d1aa4dcae666622aa049512b6a62aaec204edece39e2090667465f02ffa0d86"
+    },
+    {
+      "path": "utils/lora_utils.py",
+      "sha256": "b7d517184fe44bca3bc99ddf7a14643b294800cd83965cfbdc28c91606e68124"
+    },
+    {
+      "path": "utils/loss.py",
+      "sha256": "3ed7364d7099176c67b5c799baff84bcb46082fa2f9bd0e8320d9ca3d3780a5b"
+    },
+    {
+      "path": "utils/memory.py",
+      "sha256": "9175f66a933c38f21898b97f1bd8fb6508808f1ccdd823f23702f918853993fb"
+    },
+    {
+      "path": "utils/misc.py",
+      "sha256": "c94cce2fa93f98b5e95a77ad236cabdd97c7de2aaea03ecec0cda9cfbcd44672"
+    },
+    {
+      "path": "utils/nvfp4_checkpoint.py",
+      "sha256": "e1e1142fe6a4f2b12bf0ab2540d6dacaa5aa71e4b3b3ed921a8766616be6f6ae"
+    },
+    {
+      "path": "utils/nvfp4_kernel.py",
+      "sha256": "2ec7ba158a0f663fcbf8f13799451532ad846d0497da40a981f1ce8d33f2530d"
+    },
+    {
+      "path": "utils/position_embedding_utils.py",
+      "sha256": "c38c453795dcae817e9639d135fa6242d85d08cad01fc2945ba6d21d1b8aa231"
+    },
+    {
+      "path": "utils/prompt_conditioning.py",
+      "sha256": "f711b4ea5e9dcf669a2df500531544193cb5b01033c9ba5ae216ee706a171adc"
+    },
+    {
+      "path": "utils/quant.py",
+      "sha256": "964ad0cd1342f7319eebf557797d115b134fe1793346aea16e9c4e498c52d1dc"
+    },
+    {
+      "path": "utils/rope_triton.py",
+      "sha256": "7e11cc993b52116a06ccbebb35e346da7ca3d29f5a29c4f98754f50cc8929677"
+    },
+    {
+      "path": "utils/sampler.py",
+      "sha256": "f2f7330575c91c3bfec9adae681d6c8c3d9c64797e7598c253f905a31d9c9a58"
+    },
+    {
+      "path": "utils/scheduler.py",
+      "sha256": "e216563c3896703dad68ce66eb967d5b0f754a9ee6c94050ab97ba8b57d0f8c3"
+    },
+    {
+      "path": "utils/torch_compile_utils.py",
+      "sha256": "0a04d724fb1c70c2afedf33620dfcb98fa01e3fd37147a3fb9b7d4678c626df6"
+    },
+    {
+      "path": "utils/wan_5b_wrapper.py",
+      "sha256": "80780fb31e331cc203173f7f28020ee2fdbb68c61c77bac08fcfdc801b04154d"
+    },
+    {
+      "path": "utils/__init__.py",
+      "sha256": "b6d2a5bd7c1040d05ab5571f462d25c3f61c11b32008f1675d0575105b32fac2"
+    },
+    {
+      "path": "utils/kernel/kv_dequant.py",
+      "sha256": "a1a5bf6910f49edf39634123a1d013d3acea000178f1e7a25a63045c28672815"
+    },
+    {
+      "path": "utils/kernel/setup.py",
+      "sha256": "ee8285d5f45c144223f3f13f3bf0ab42022848196a7c2a8e324d1779b2aa9e3f"
+    },
+    {
+      "path": "utils/kernel/__init__.py",
+      "sha256": "d94ac9bf29f8d4dee7f0ad843b69eada9a264f1089dcfe595c0ace4d0641380f"
+    },
+    {
+      "path": "pipeline/causal_diffusion_inference.py",
+      "sha256": "e361c458b5a56643a25b54b21ead890cf0985984e7520b75b4a5e36a24284cb0"
+    },
+    {
+      "path": "pipeline/causal_diffusion_inference_sp.py",
+      "sha256": "72113b056fb1b7cb003a354608c72b3e6c9452bfc091e7baeeb12ebda879d766"
+    },
+    {
+      "path": "pipeline/self_forcing_training.py",
+      "sha256": "016698945693c6eca5766577e7ea7293030802599f4e7f899789ae52bb3f9a9a"
+    },
+    {
+      "path": "pipeline/__init__.py",
+      "sha256": "4249fcda4be7c336a8b3ee51c8d69df145f4e5e4472961fa60b345f9e2590c91"
+    },
+    {
+      "path": "wan_5b/image2video.py",
+      "sha256": "8067a3f66edb193a16aa1e9aa6d6905de82efa9649d6a32e3a85d7cebe657b2d"
+    },
+    {
+      "path": "wan_5b/text2video.py",
+      "sha256": "d04243d52da55a33a6a431b7eeb1b3230dcb8ff1c651a2cbe47fa7f3cb40679d"
+    },
+    {
+      "path": "wan_5b/textimage2video.py",
+      "sha256": "dfc7a1620c792202090366bdf676f59d64ed27d17123db15860ed05c9e3f9b88"
+    },
+    {
+      "path": "wan_5b/__init__.py",
+      "sha256": "60b638ec7532d8b74cdd2437e7b8ff8d7ccec0610b0664b10172c6b988018de2"
+    },
+    {
+      "path": "wan_5b/configs/shared_config.py",
+      "sha256": "153aa508bea1ac56509ec074eb38b70c03e215360a7212c9316dc2b9e991eeed"
+    },
+    {
+      "path": "wan_5b/configs/wan_i2v_A14B.py",
+      "sha256": "e343666da8bfb42e9296d90907b278d46e2e19c6ac45dedaf872a982692ff4b6"
+    },
+    {
+      "path": "wan_5b/configs/wan_t2v_A14B.py",
+      "sha256": "d7badbfd1175d77d13b685107d55c133efc9770fdaf2db298b2f1c568ffec629"
+    },
+    {
+      "path": "wan_5b/configs/wan_ti2v_5B.py",
+      "sha256": "9d9a8bd08764c3cfa6337f9b8ff99df4b149ba7c8b94557b2d7d2e277e861f10"
+    },
+    {
+      "path": "wan_5b/configs/__init__.py",
+      "sha256": "6d6807c1e0c9eba2ed3fd65465326a5638211de3a02c7c38a738a01906603add"
+    },
+    {
+      "path": "wan_5b/distributed/fsdp.py",
+      "sha256": "6a982cc5f0a518c1c4b057a522acc930f85e91ad30a6ac26d2caa7de4dc6b316"
+    },
+    {
+      "path": "wan_5b/distributed/sequence_parallel.py",
+      "sha256": "74726e9e05ebc6339fe8f7683e11f827dc42c5c87171a2b3ccc090584d91a46e"
+    },
+    {
+      "path": "wan_5b/distributed/sp_training.py",
+      "sha256": "120831ba3c42c3fc1b11ccb9e56c916d72cc585c9ccab63b83f99586209d873c"
+    },
+    {
+      "path": "wan_5b/distributed/sp_ulysses_inference.py",
+      "sha256": "a96d9250e1010d6a80573fcff75905fe4fc34dccb3b202262e9b7966468825fd"
+    },
+    {
+      "path": "wan_5b/distributed/ulysses.py",
+      "sha256": "7b206a5e7f46d8a6b08457f3d8266513a3def6312a20804cb1bd65c2c7919a34"
+    },
+    {
+      "path": "wan_5b/distributed/util.py",
+      "sha256": "a00f3f67d0327f432471a459b279374aaf29001a8333405117b69996f749a312"
+    },
+    {
+      "path": "wan_5b/distributed/__init__.py",
+      "sha256": "7d12487ebd06c0005bde870f7c42db957296b218fdb17816fdc26779d2bf8623"
+    },
+    {
+      "path": "wan_5b/modules/attention.py",
+      "sha256": "2d037be526599fd602894c5bff60c9af1177387583fb51dec56e9d84487badea"
+    },
+    {
+      "path": "wan_5b/modules/causal_model.py",
+      "sha256": "84b6ad166cff857c7846cae7e5ea94b88c87dd6c135f059fbe246dc1e36dc8df"
+    },
+    {
+      "path": "wan_5b/modules/causal_model_sp_ulysses.py",
+      "sha256": "b9d48668a5bad072d65327befc2ba0ecbe4ff0f5b4d54851f848f1033cad13f0"
+    },
+    {
+      "path": "wan_5b/modules/model.py",
+      "sha256": "2bd3bd40a1caa6615c8d645f374366036615c952c0b31a876d6e394f908748e6"
+    },
+    {
+      "path": "wan_5b/modules/t5.py",
+      "sha256": "0aa40c5f960016aecf987a92f491e1c93b2c7b2b6cdc10f09aef86b20aa072e6"
+    },
+    {
+      "path": "wan_5b/modules/tokenizers.py",
+      "sha256": "2e7974b8e0f19af5863613d2eff40e90f97919f3d12e72a3ba61e13f60b075e7"
+    },
+    {
+      "path": "wan_5b/modules/vae2_1.py",
+      "sha256": "56667edffd367087d3dcc53077f45025488db4098116f4b40fcd6a87b0f64cb1"
+    },
+    {
+      "path": "wan_5b/modules/vae2_2.py",
+      "sha256": "d1d4fda2753506b69f20bb9a34b67325d8f5aab705553cf2e67ca2b177e29699"
+    },
+    {
+      "path": "wan_5b/modules/__init__.py",
+      "sha256": "d1cf0c606351cba859a731ebbc8c4267c0e5ded05d10ae4af80fc65ac781b3f6"
+    },
+    {
+      "path": "wan_5b/utils/fm_solvers.py",
+      "sha256": "b95e894ea21eac123cfef147693520ae9330c1b5e2e2ad847d6a7ae731e6f40c"
+    },
+    {
+      "path": "wan_5b/utils/fm_solvers_unipc.py",
+      "sha256": "41c29ab344cb7ef8e5ba735dee0d4aa66f0e8f50e52b280ec71f9af63763d513"
+    },
+    {
+      "path": "wan_5b/utils/prompt_extend.py",
+      "sha256": "6e51302b6a4436e3e3329849e3e1699a982eb4ce90aae212826ae769cd771495"
+    },
+    {
+      "path": "wan_5b/utils/qwen_vl_utils.py",
+      "sha256": "3c6a070c1cd118c3b970242d88f703d541868c337f2e1c3ce5c0e41cb78f7aa1"
+    },
+    {
+      "path": "wan_5b/utils/system_prompt.py",
+      "sha256": "f5cab5868a0a88c9e6ca26a439910b26c29ac289e8b93afb761f7c383c8a7de9"
+    },
+    {
+      "path": "wan_5b/utils/utils.py",
+      "sha256": "25b3bf8c755e37496c3eb172428fa03435c56cc77339ba12a17bf2e690c5928c"
+    },
+    {
+      "path": "wan_5b/utils/__init__.py",
+      "sha256": "60bfc379d0a945df7fe52cdf1219099ae8306a44034c6c349caebe96f7b9d58d"
+    },
+    {
+      "path": "configs/inference.yaml",
+      "sha256": "51a69d8d40e03e0fbf5065a04b57181fc129d68cc524480828f7f4561ec8ae5b"
+    },
+    {
+      "path": "configs/inference_i2v.yaml",
+      "sha256": "d30819fc8e011b984c2824b3e2fdc39e2c59498d6f5e8ccf0d5bd15b023e6ed7"
+    },
+    {
+      "path": "configs/inference_sp.yaml",
+      "sha256": "ea3813f296dc28804f4d6407b3491336a280b4415846cc8f9a5c8f6490380296"
+    },
+    {
+      "path": "configs/train_ar.yaml",
+      "sha256": "c9f5e4b881a0e5c833ba4a138373cb40b17c1d4fe81bcb13ab6dcb21c1e9efdc"
+    },
+    {
+      "path": "configs/train_dmd.yaml",
+      "sha256": "8214d9691e447c85b95be6fe84dba4dc09d39f3c92f7cc3b7bd27a7c108b9c81"
+    },
+    {
+      "path": "configs/train_i2v_ar.yaml",
+      "sha256": "107ee4612c3e036adbf2a5898f5130fa22bb7fefada6156866296916268ddf12"
+    },
+    {
+      "path": "configs/train_i2v_dmd.yaml",
+      "sha256": "242df9a3aacf702391a90ab22e5c123d9efb71e518d5ce8fefe926d2da89c707"
+    },
+    {
+      "path": "configs/fp8/inference_fp8.yaml",
+      "sha256": "64ca0b35254bbde1d0065ad1ddb2a1032839b72b602d280668f0c4f4f61f5084"
+    },
+    {
+      "path": "configs/nvfp4/inference_i2v_nvfp4.yaml",
+      "sha256": "cf3ee53629389b5319e8ff03773cbf9845745c8a3055fe0316bc5b4fb8f1d274"
+    },
+    {
+      "path": "configs/nvfp4/inference_nvfp4.yaml",
+      "sha256": "3ed6a560f0be01c3a7fcda3a03ef6052f62bfb37b1bce5eb47d36e2bd7ee1a5f"
+    },
+    {
+      "path": "configs/nvfp4/train_ar_nvfp4.yaml",
+      "sha256": "2149df661e7f81038abce66c18422973b68aa9387a80bef67be5434331f21f8b"
+    },
+    {
+      "path": "configs/nvfp4/train_dmd_nvfp4_step4.yaml",
+      "sha256": "2695b3171b1d64f1053e5e288d23c73bd41d6d47366ce746ba732e30fc03bce1"
+    },
+    {
+      "path": "configs/nvfp4/train_i2v_ar_nvfp4.yaml",
+      "sha256": "4162871eb4f13130a01e3dc7c0bcd5d921efda8120c5253ecba86ca06c863cd1"
+    },
+    {
+      "path": "configs/nvfp4/train_i2v_dmd_nvfp4_step4.yaml",
+      "sha256": "75476d144902bbef43e79e90d74a8cce185b9a2318f8f8049f141cf1e3be39b6"
+    }
+  ]
+}

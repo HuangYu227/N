@@ -43,7 +43,12 @@ def find_model(model_name):
     assert os.path.isfile(model_name), f"Could not find Sana checkpoint at {model_name}"
     if log_master:
         print(colored(f"[Sana] Loaded model from {model_name}", attrs=["bold"]))
-    if model_name.endswith(".safetensors"):
+    # Hugging Face's blob cache uses a SHA256 filename without a suffix. Detect
+    # the safetensors header so that its weights are never passed to torch.load.
+    with open(model_name, "rb") as checkpoint:
+        checkpoint.seek(8)
+        is_safetensors = checkpoint.read(1) == b"{"
+    if model_name.endswith(".safetensors") or is_safetensors:
         import safetensors
 
         return {"state_dict": safetensors.torch.load_file(model_name, device="cpu")}
