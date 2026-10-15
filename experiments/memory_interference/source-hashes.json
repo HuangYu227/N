@@ -1,0 +1,9 @@
+{
+  "worldttn/anchor.py": "c0fc49e9f295c7cc675340f3ba00b1705b9a6d931d4126e874d8be4d61615cb4",
+  "worldttn/state_ttt.py": "695bdd3cba82cf30a026d428ca7e76e0d282ab5d3cb84d9990bb7847240b4c35",
+  "worldttn/runtime.py": "10c31b52c1dafbf482169aac8bee959c954634e5ba3c16877e35e29e3c014870",
+  "worldttn/session.py": "457ee37a4d892ed005d5775a8fdc6e1f18baa18a116c7693c2124195b83acb8d",
+  "worldttn/training.py": "8117d90462942f0845f2e4849eb5ef2033d7cee4f1f7388100ac45320b0060c1",
+  "worldttn/core.py": "7e4ffdda8fffa019b905f00d0f0493f2954e5b5ef34f148275bc67dc9ca34b6d",
+  "worldttn/evaluation.py": "8dd73eee47cfd567597dbc6614bb180606420ecfbe5f76b5b7edf372669c5fb1"
+}

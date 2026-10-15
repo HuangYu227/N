@@ -52,7 +52,7 @@ def latent_metrics(generated, reference, revisit_pairs, *, training_frames=None)
     if training_frames is not None:
         if training_frames < 1: raise ValueError("training horizon must be positive")
         tail = errors[training_frames:]
-        indices = torch.arange(training_frames, frames, dtype=torch.float32)
+        indices = torch.arange(min(training_frames, frames), frames, dtype=torch.float32)
         indices -= indices.mean() if indices.numel() else 0
         result.update(after_training_horizon_frame_count=tail.numel(),
             after_training_horizon_mean_latent_mse=tail.mean().item() if tail.numel() else None,
