@@ -1,0 +1,20 @@
+{
+  "scope": "FP64 small-matrix algebra only; no trained-model or rollout result",
+  "rotation_orthogonality_error": 2.3592239273284576e-16,
+  "value_axis_transport_read_error": 4.440892098500626e-16,
+  "immutable_sink_unchanged": true,
+  "normalized_inner_loss_before": 1.296571864077778,
+  "normalized_inner_loss_after": 1.2442123280072421,
+  "inner_meta_gradient_finite": true,
+  "constant_value_error_before_arbitrary_correction": 4.440892098500626e-16,
+  "leave_one_out_error_fixed_sink_coefficient": 3.3306690738754696e-16,
+  "dense_projector_disjoint_address_interference": 0.4999999999999999,
+  "diagonal_projector_disjoint_address_interference": 0.0,
+  "pair_lift_rope_equivariance_error": 2.7755575615628914e-16,
+  "pair_lift_kernel_minimum": 0.0,
+  "pair_lift_common_rope_shift_kernel_error": 6.661338147750939e-16,
+  "pair_lift_feature_dim": 12,
+  "compressed_sink_rephase_content_error": 3.9968028886505635e-15,
+  "compressed_sink_rephase_support_error": 5.329070518200751e-15,
+  "unrestricted_state_can_exceed_value_range": true
+}
