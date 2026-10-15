@@ -32,7 +32,17 @@ PyTorch2.9.1+cu128). Missing imports stop preflight; the launcher does not
 install packages or alter public login settings. If needed, install these
 in that environment before running:
 
-  python -m pip install peft==0.17.1 omegaconf==2.3.0 lpips==0.1.4 wandb pytest
+  python -m pip install peft==0.18.0 omegaconf==2.3.0 lpips==0.1.4 wandb pytest
+
+Keep SANA's pyproject.toml PEFT pin (0.18.0); do not downgrade it to0.17.1.
+If an earlier command already downgraded it, restore only that package:
+
+  python -m pip install --no-deps peft==0.18.0
+
+TorchAO0.14.1 may warn that its C++ extensions are incompatible with Torch2.9.1.
+This BF16 distillation path does not call TorchAO FP8/quantization kernels;
+the warning alone does not establish a failed run. Do not upgrade/downgrade
+Torch or CUDA just to suppress it; inspect any subsequent traceback/exit code.
 
 Default start:
 
