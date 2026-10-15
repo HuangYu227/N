@@ -55,6 +55,10 @@ class TTNChunkContext:
     checkpoint_cpu_inputs: bool = False
     measure_psi_output: bool = False
     sequence_memory_callback: object = None
+    ffn_fast: dict = field(default_factory=dict)
+    ffn_candidates: dict = field(default_factory=dict)
+    ffn_delta_clip: float | None = None
+    ffn_enabled: bool = True
 
     def for_clean(self):
         return TTNChunkContext(self.predicted, self.previous, self.psi, self.cbase, self.system, self.frame_ids,
@@ -62,7 +66,8 @@ class TTNChunkContext:
                                self.prefill_mode, begin_id=self.begin_id, psi_snapshot=self.psi_snapshot,
                                write_history=self.write_history, live_factors=self.live_factors,
                                local_stats=self.local_stats, ablation=self.ablation,
-                               collect_local_stats=self.collect_local_stats, local_trajectory=self.local_trajectory)
+                               collect_local_stats=self.collect_local_stats, local_trajectory=self.local_trajectory,
+                               ffn_fast=self.ffn_fast, ffn_delta_clip=self.ffn_delta_clip, ffn_enabled=self.ffn_enabled)
 
     def token_masks(self, n):
         f = self.frame_ids.shape[-1]
@@ -85,6 +90,15 @@ class TTNChunkContext:
         if not self.clean_mode: raise RuntimeError("temporary contexts cannot stage commits")
         if index in self.candidates: raise RuntimeError("anchor executed twice in clean transaction")
         self.candidates[index] = (state, gradient if self.system.config.persistent_meta else gradient.detach(), stats)
+
+    def stage_ffn(self, index, state, stats):
+        if not self.clean_mode or index not in self.ffn_fast:
+            raise RuntimeError('FFN update requires a clean transaction and registered layer')
+        if index in self.ffn_candidates:
+            raise RuntimeError('FFN executed twice in clean transaction')
+        if state.shape != self.ffn_fast[index].shape or state.dtype != torch.float32:
+            raise ValueError('FFN candidate dimensions/dtype mismatch')
+        self.ffn_candidates[index] = (state, stats)
 
 
 @dataclass
@@ -114,11 +128,19 @@ class TTNRuntimeState:
     collect_local_stats: bool = False
     # Diagnostic-only detached writes, never persistent learned state or checkpoint content.
     write_history: tuple = ()
+    ffn_fast: dict = field(default_factory=dict)
+    ffn_delta_clip: float | None = 1e-5
+    ffn_commit_count: int = 0
 
     @classmethod
-    def create(cls, config, batch_size, device, *, ablation="full", diagnostics=False, collect_local_stats=False):
-        if ablation not in ("full", "no-ttt", "identity", "no-local", "no-persistent"):
+    def create(cls, config, batch_size, device, *, ablation="full", diagnostics=False, collect_local_stats=False,
+               ffn_delta_clip=1e-5, ffn_shapes=None):
+        if ablation not in ("full", "no-ttt", "identity", "no-local", "no-persistent", "no-ffn-ttt"):
             raise ValueError("unknown TTN runtime ablation")
+        if ablation == 'no-ffn-ttt' and config.ttt_backend != 'inplace-ffn':
+            raise ValueError('no-ffn-ttt requires inplace-ffn')
+        if ffn_delta_clip is not None and (not math.isfinite(ffn_delta_clip) or ffn_delta_clip <= 0):
+            raise ValueError('FFN delta clip must be None or finite and positive')
         if ablation in ("no-local", "no-persistent") and not (config.local_update or config.persistent_meta):
             raise ValueError("Local/Persistent contribution controls require Meta-TTT")
         if ablation != "full" and torch.is_grad_enabled():
@@ -132,8 +154,18 @@ class TTNRuntimeState:
                         dtype=torch.float32)
         psi = torch.zeros(batch_size, 5, config.heads, config.generators, device=device, dtype=torch.float32)
         pose = torch.eye(4, device=device).expand(batch_size, 4, 4).clone()
+        c = config.heads * config.head_dim
+        ffn = {}
+        if config.ttt_backend == 'inplace-ffn':
+            shapes = ffn_shapes if ffn_shapes is not None else {i: (c, 3*c) for i in config.inplace_layers}
+            if set(shapes) != set(config.inplace_layers) or any(
+                    len(shape) != 2 or shape[0] != c or any(type(v) is not int or v < 1 for v in shape)
+                    for shape in shapes.values()):
+                raise ValueError('FFN state shapes disagree with registered layers')
+            ffn = {i: torch.zeros(batch_size, *shape, device=device, dtype=torch.float32) for i, shape in shapes.items()}
         return cls(config, s, psi, pose, [set() for _ in range(batch_size)],
-                   ablation=ablation, diagnostics=diagnostics, collect_local_stats=collect_local_stats)
+                   ablation=ablation, diagnostics=diagnostics, collect_local_stats=collect_local_stats,
+                   ffn_fast=ffn, ffn_delta_clip=ffn_delta_clip)
 
     def reset(self):
         self.world_state = torch.zeros_like(self.world_state)
@@ -147,6 +179,8 @@ class TTNRuntimeState:
         self.prefilled = False
         self.last_stats = {}
         self.write_history = ()
+        self.ffn_fast = {i: torch.zeros_like(value) for i, value in self.ffn_fast.items()}
+        self.ffn_commit_count = 0
 
     def begin_chunk(self, system, poses, intrinsics, frame_ids, valid_mask, width, height, prefill=False):
         if system.config != self.config: raise ValueError("runtime/system configurations differ")
@@ -164,7 +198,8 @@ class TTNRuntimeState:
         previous_pose = poses[:, 0] if prefill else self.previous_committed_pose
         options = getattr(system, "ttn_execution", DEFAULT_EXECUTION)
         meta = self.config.local_update or self.config.persistent_meta
-        validate_execution(options, self.config.stage, self.ablation, self.diagnostics, meta=meta)
+        validate_execution(options, self.config.stage, self.ablation, self.diagnostics,
+                           meta=meta or self.config.ttt_backend == 'inplace-ffn')
         snapshot = None
         live_factors = None
         history = self.write_history
@@ -197,7 +232,9 @@ class TTNRuntimeState:
                                id(self),
                                prefill_mode=prefill, begin_id=self.predict_count, psi_snapshot=snapshot,
                                write_history=history, live_factors=live_factors if meta else None,
-                               ablation=self.ablation, collect_local_stats=self.collect_local_stats or self.diagnostics)
+                               ablation=self.ablation, collect_local_stats=self.collect_local_stats or self.diagnostics,
+                               ffn_fast=self.ffn_fast, ffn_delta_clip=self.ffn_delta_clip,
+                               ffn_enabled=self.ablation not in ('no-ttt', 'no-ffn-ttt'))
 
     def prefill(self, context):
         if self.prefilled or self.commit_count: raise RuntimeError("initial image can only be prefilled once")
@@ -207,10 +244,19 @@ class TTNRuntimeState:
     def commit_chunk(self, context):
         if not context.clean_mode or context.revision != self.revision or context.runtime_id != id(self):
             raise RuntimeError("not a current clean transaction")
+        if self.ffn_fast and context.begin_id != self.predict_count:
+            raise RuntimeError('FFN candidate belongs to a superseded begin_chunk')
         if context.psi_snapshot is not None:
             context.psi_snapshot.validate(id(self), self.revision, self.predict_count)
         if set(context.candidates) != set(range(5)):
             raise RuntimeError("all five anchors must finish before committing")
+        if set(context.ffn_candidates) != set(self.ffn_fast):
+            raise RuntimeError('all registered FFNs must finish before committing')
+        new_ffn = {}
+        for i, (value, _) in context.ffn_candidates.items():
+            if value.shape != self.ffn_fast[i].shape or value.dtype != torch.float32 or not torch.isfinite(value).all():
+                raise ValueError('invalid FFN candidate; transaction not committed')
+            new_ffn[i] = value
         states = []
         gradients = []
         for i in range(5):
@@ -225,7 +271,7 @@ class TTNRuntimeState:
         grad = torch.stack(gradients, 1)
         clipped, scale = clip_inner_gradient(grad, self.config.inner_clip, self.config.eps)
         psi = (self.transition_fast - self.config.eta_psi * clipped
-               if self.config.stage == "C" and self.ablation in ("full", "no-local") else torch.zeros_like(self.transition_fast))
+               if self.config.ttt_backend != 'inplace-ffn' and self.config.stage == "C" and self.ablation in ("full", "no-local") else torch.zeros_like(self.transition_fast))
         if not self.config.persistent_meta: psi = psi.detach()
         if psi.dtype != torch.float32 or not torch.isfinite(psi).all():
             raise ValueError("nonfinite or non-FP32 Persistent psi; transaction not committed")
@@ -261,7 +307,7 @@ class TTNRuntimeState:
             for i, stats in enumerate(anchor_stats):
                 stats.update(state_dynamics(context.previous[:, i], context.predicted[:, i],
                                             new_state[:, i], self.config.eps),
-                             inner_update_applied=self.config.stage == "C" and self.ablation in ("full", "no-local") and not context.prefill_mode)
+                             inner_update_applied=self.config.ttt_backend != 'inplace-ffn' and self.config.stage == "C" and self.ablation in ("full", "no-local") and not context.prefill_mode)
         previous_pose = self.previous_committed_pose.clone()
         committed = [set(s) for s in self.committed_frame_ids]
         for b in range(new_state.shape[0]):
@@ -274,6 +320,8 @@ class TTNRuntimeState:
         self.world_state = new_state
         self.write_history = history
         self.transition_fast = psi
+        self.ffn_fast = new_ffn
+        self.ffn_commit_count += int(bool(new_ffn) and not context.prefill_mode)
         self.previous_committed_pose = previous_pose
         self.committed_frame_ids = committed
         self.commit_count += 1
@@ -290,7 +338,22 @@ class TTNRuntimeState:
             "anchors": anchor_stats
         }
         if self.diagnostics or self.ablation != "full": self.last_stats["ablation"] = self.ablation
+        if new_ffn:
+            self.last_stats['ffn_ttt'] = [dict(block=i, **_ffn_json(context.ffn_candidates[i][1])) for i in new_ffn]
+            self.last_stats['ffn_commit_count'] = self.ffn_commit_count
+            self.last_stats['psi_update_enabled'] = False
 
     def detach(self):
         self.world_state = self.world_state.detach()
         self.transition_fast = self.transition_fast.detach()
+        self.ffn_fast = {i: value.detach() for i, value in self.ffn_fast.items()}
+
+
+def _ffn_json(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().tolist()
+    if isinstance(value, dict):
+        return {key: _ffn_json(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_ffn_json(item) for item in value]
+    return value

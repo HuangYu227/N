@@ -178,7 +178,7 @@ class TTNAnchor(nn.Module):
                 diagnostic("memory", (predicted, state, k, v, beta, w, write))
             if ctx.clean_mode:
                 gradient = torch.zeros_like(ctx.psi[:, self.index])
-                if cfg.stage == "C" and not ctx.prefill_mode and not cfg.state_ttt_rank:
+                if cfg.stage == "C" and not ctx.prefill_mode and not cfg.state_ttt_rank and cfg.ttt_backend != 'inplace-ffn':
                     with annotation(execution, "Psi"):
                         if cfg.persistent_meta:
                             if ctx.ablation in ("full", "no-local"):
@@ -259,7 +259,7 @@ class TTNAnchor(nn.Module):
                     'relative_delta':float((out.detach().float()-reference.float()).norm()/reference.float().norm().clamp_min(cfg.eps)),
                     'changed_fraction':float((out.detach()!=reference).float().mean()),
                     'measurement':'paired same features/camera after Correct/gate/projection; no quality claim'}
-        if (not cfg.state_ttt_rank and ctx.measure_psi_output and ctx.collect_local_stats and not ctx.clean_mode
+        if (cfg.ttt_backend != 'inplace-ffn' and not cfg.state_ttt_rank and ctx.measure_psi_output and ctx.collect_local_stats and not ctx.clean_mode
                 and not ctx.prefill_mode and not _RECOMPUTING.get()):
             with torch.no_grad(), torch.autocast(device_type=x.device.type, enabled=False):
                 base = CayleyFactors(ctx.system.generators.u[self.index].float(),
@@ -305,10 +305,26 @@ def install_ttn(model, config):
         a = model.blocks[i].attn
         if isinstance(a, TTNAnchor) or a.heads != config.heads or a.dim != config.head_dim:
             raise ValueError(f"invalid anchor {i}")
+    if config.ttt_backend == 'inplace-ffn':
+        for i in config.inplace_layers:
+            mlp = model.blocks[i].mlp
+            projection = getattr(getattr(mlp, 'point_conv', None), 'conv', None)
+            if projection is None or projection.weight.ndim != 4 or projection.weight.shape[0] != config.heads*config.head_dim or tuple(projection.weight.shape[2:]) != (1, 1):
+                raise ValueError(f'inplace-ffn requires the original GLUMBConv point projection at block {i}')
     model.requires_grad_(False)
     for index, i in enumerate(ANCHORS):
         model.blocks[i].attn = TTNAnchor(model.blocks[i].attn, index, config).requires_grad_(True)
     model.ttn_system = TTNSystem(config).to(device=next(model.parameters()).device).float()
+    if config.ttt_backend == 'inplace-ffn':
+        from .inplace_ttt import InPlaceFFNTTT
+        # New target initialization must not perturb inherited/data RNG streams.
+        with torch.random.fork_rng(devices=[]):
+            for i in config.inplace_layers:
+                mlp = model.blocks[i].mlp
+                c, h = mlp.point_conv.conv.weight.shape[:2]
+                mlp.inplace_ttt = InPlaceFFNTTT(c, h, lr=config.inplace_lr,
+                    target_diag_std=config.inplace_target_diag_std).to(device=next(mlp.parameters()).device).requires_grad_(True)
+                mlp.ttn_ffn_index = i
     model.ttn_reference = True
     model.eval()  # fixed clip conditioning; gradients still flow through the frozen backbone
     return model
@@ -318,17 +334,18 @@ def adapter_state_dict(model):
     return {
         name: tensor
         for name, tensor in model.state_dict().items()
-        if name.startswith("ttn_system.") or any(name.startswith(f"blocks.{i}.attn.") for i in ANCHORS)
+        if is_ttn_parameter(name)
     }
 
 
 def is_ttn_parameter(name):
-    return name.startswith("ttn_system.") or any(name.startswith(f"blocks.{i}.attn.") for i in ANCHORS)
+    return (name.startswith("ttn_system.") or any(name.startswith(f"blocks.{i}.attn.") for i in ANCHORS)
+            or any(name.startswith(f'blocks.{i}.mlp.inplace_ttt.') for i in ANCHORS))
 
 
 def is_ttn_new_parameter(name):
     """Parameter origin, independent of the replacement module's ownership."""
-    return name == "ttn_system.local_eta_logits" or any(name.startswith(f'blocks.{i}.attn.state_ttt.') for i in ANCHORS) or name.startswith(("ttn_system.controller.", "ttn_system.generators.")) or any(
+    return any(name.startswith(f'blocks.{i}.mlp.inplace_ttt.') for i in ANCHORS) or name == "ttn_system.local_eta_logits" or any(name.startswith(f'blocks.{i}.attn.state_ttt.') for i in ANCHORS) or name.startswith(("ttn_system.controller.", "ttn_system.generators.")) or any(
         name.startswith(f"blocks.{i}.attn.beta_proj.") for i in ANCHORS)
 
 

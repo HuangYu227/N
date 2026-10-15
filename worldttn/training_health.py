@@ -21,6 +21,9 @@ def audit_training_parameters(model, optimizer):
     if model.ttn_system.config.state_ttt_rank:
         required.update(f'blocks.{i}.attn.state_ttt.{p}' for i in ANCHORS for p in ('raw_basis','step_logits'))
     elif model.ttn_system.config.local_update: required.add("ttn_system.local_eta_logits")
+    if model.ttn_system.config.ttt_backend == 'inplace-ffn':
+        required.update(f'blocks.{i}.mlp.inplace_ttt.{p}.weight'
+                        for i in model.ttn_system.config.inplace_layers for p in ('ttt_conv', 'ttt_proj'))
     if required - named.keys(): raise ValueError(f"missing registered TTN parameters: {sorted(required - named.keys())}")
     expected = trainable_parameter_names(model)
     actual = {name for name, p in named.items() if p.requires_grad}
@@ -86,7 +89,8 @@ class FirstUpdateProbe:
         backbone = {"parameters": 0, "parameters_with_grad": 0, "updated_parameters": 0,
                     "changed_elements": 0, "optimizer_state_parameters": 0}
         core = {f"blocks.{i}.attn.{group}.weight" for i in ANCHORS for group in ("qkv", "proj", "output_gate")}
-        state_parameters = {name for name in self.parameters if name.endswith(('.state_ttt.raw_basis', '.state_ttt.step_logits'))}
+        state_parameters = {name for name in self.parameters if name.endswith(('.state_ttt.raw_basis', '.state_ttt.step_logits'))
+                            or '.mlp.inplace_ttt.' in name}
         core.update(state_parameters)
         state_signals = {}
         for name, p in self.parameters.items():

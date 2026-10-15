@@ -31,7 +31,7 @@ def record_noise(context, timestep, noise_sigma=None, sampled_timestep=None):
     """Detached noisy-call metadata shared by training and the native sampler."""
     config = context.system.config
     if (context.sequence_mode or not context.collect_local_stats or context.clean_mode or context.prefill_mode
-            or not (config.local_update or config.persistent_meta)): return
+            or not (config.local_update or config.persistent_meta or config.ttt_backend == 'inplace-ffn')): return
     sigma = timestep.float()/1000 if noise_sigma is None else noise_sigma
     context.noise_info = {"noise_timestep": timestep.detach().float().cpu().tolist(),
                           "noise_sigma": sigma.detach().float().cpu().tolist()}
@@ -62,7 +62,8 @@ def carry_cache(cache, camera_attention="linear", previous=None):
 class TTNSession:
 
     def __init__(self, model, camera_conditions, width, height, valid_mask=None, extras=None,
-                 *, ablation="full", diagnostics=False, collect_local_stats=False, live_cache=False):
+                 *, ablation="full", diagnostics=False, collect_local_stats=False, live_cache=False,
+                 inplace_delta_clip=1e-5):
         if camera_conditions.ndim != 3 or camera_conditions.shape[-1] != 20:
             raise ValueError("camera_conditions must contain C2W(16) + intrinsics(4)")
         self.model = model
@@ -75,12 +76,17 @@ class TTNSession:
         self.ablation, self.diagnostics = ablation, diagnostics
         self.collect_local_stats = collect_local_stats
         self.live_cache = live_cache
+        self.inplace_delta_clip = inplace_delta_clip
 
     def reset(self, batch_size):
         self.camera_cache_lengths = {index: [] for index in ANCHORS}
+        config = self.model.ttn_system.config
+        shapes = {i: tuple(self.model.blocks[i].mlp.point_conv.conv.weight.shape[:2])
+                  for i in config.inplace_layers} if config.ttt_backend == 'inplace-ffn' else None
         self.runtime = TTNRuntimeState.create(self.model.ttn_system.config, batch_size, self.camera.device,
                                              ablation=self.ablation, diagnostics=self.diagnostics,
-                                             collect_local_stats=self.collect_local_stats)
+                                             collect_local_stats=self.collect_local_stats,
+                                             ffn_delta_clip=self.inplace_delta_clip, ffn_shapes=shapes)
         return self.runtime
 
     def begin_chunk(self, start, end, prefill=False):

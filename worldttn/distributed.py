@@ -28,10 +28,15 @@ def _expose_clean_state(module, args, kwargs, output):
     if context is None:
         context = next((arg for arg in args if isinstance(arg, TTNChunkContext)), None)
     state = gradient = None
-    if context is not None and context.clean_mode:
+    if context is not None and context.clean_mode and isinstance(module.attn, TTNAnchor):
         candidate = context.candidates.get(module.attn.index)
         if candidate is not None: state, gradient = candidate[:2]
-    return output, state, gradient
+    ffn = ()
+    if context is not None and context.clean_mode:
+        index = getattr(getattr(module, 'mlp', None), 'ttn_ffn_index', None)
+        candidate = context.ffn_candidates.get(index)
+        if candidate is not None: ffn = (candidate[0],)
+    return (output, state, gradient, ffn) if ffn else (output, state, gradient)
 
 
 def _restore_block_output(module, args, output):
@@ -209,7 +214,7 @@ class ParallelTraining:
         self.memory_trace = memory_trace
         self.rank, self.world = rank_world()
         self.window = TTNTrainingWindow(model, loss_fn)
-        if getattr(model, 'ttn_training_protocol', '') == 'dual-psi-clean-fullgrad-v1':
+        if getattr(model, 'ttn_training_protocol', '') in ('dual-psi-clean-fullgrad-v1', 'inplace-ffn-clean-fullgrad-v1'):
             from .legacy_sequence_training import LegacySequenceTraining
             self.window = LegacySequenceTraining(model, loss_fn)
         if mode == "ddp":
@@ -229,10 +234,10 @@ class ParallelTraining:
             # beta/controller weights. FP32 reductions preserve clipping precision.
             policy = MixedPrecisionPolicy(param_dtype=None, reduce_dtype=torch.float32, cast_forward_inputs=False)
             for block in model.blocks:
-                anchor = isinstance(block.attn, TTNAnchor)
-                if anchor: block.register_forward_hook(_expose_clean_state, with_kwargs=True)
+                recurrent = isinstance(block.attn, TTNAnchor) or hasattr(getattr(block, 'mlp', None), 'inplace_ttt')
+                if recurrent: block.register_forward_hook(_expose_clean_state, with_kwargs=True)
                 fully_shard(block, mesh=mesh, mp_policy=policy, reshard_after_forward=True)
-                if anchor: block.register_forward_hook(_restore_block_output)
+                if recurrent: block.register_forward_hook(_restore_block_output)
             # Root owns the small controller/generators plus non-block parameters.
             # Keep these unsharded during the entire window: Stage C's analytic
             # update reads generators directly inside the anchors' clean forward.

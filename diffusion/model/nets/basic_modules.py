@@ -182,6 +182,54 @@ class GLUMBConv(nn.Module):
             return spatial(x)
         return torch.cat([spatial(x[s : s + max_bt]) for s in range(0, BT, max_bt)], dim=0)
 
+    def _apply_spatial_inplace(self, x: torch.Tensor, HW, context) -> torch.Tensor:
+        """Keep the dynamic projection separate from the quantized base weight."""
+        if context is None:
+            raise ValueError('In-Place FFN requires an explicit TTN chunk context')
+        index = self.ttn_ffn_index
+        delta = context.ffn_fast[index]
+        if not context.ffn_enabled:
+            if context.clean_mode:
+                context.stage_ffn(index, delta, {})
+            return self._apply_spatial_autochunked(x)
+        T, H, W = HW
+        B = x.shape[0] // T
+        _, write = context.token_masks(T * H * W)
+        write = write if context.clean_mode and not context.prefill_mode else None
+
+        def spatial(value, old_delta, selected):
+            target = value.reshape(B, T, value.shape[1], H * W).permute(0, 1, 3, 2).reshape(B, T * H * W, -1)
+            hidden = self.depth_conv(self.inverted_conv(value))
+            a, g = torch.chunk(hidden, 2, dim=1)
+            hidden = a * self.glu_act(g)
+            if self.point_conv.dropout is not None:
+                hidden = self.point_conv.dropout(hidden)
+            base = self.point_conv.conv(hidden)
+            z = hidden.reshape(B, T, hidden.shape[1], H * W).permute(0, 1, 3, 2).reshape(B, T * H * W, -1)
+            correction, candidate, stats = self.inplace_ttt(z, target, old_delta, selected, context.ffn_delta_clip)
+            correction = correction.reshape(B, T, H * W, -1).permute(0, 1, 3, 2).reshape_as(base)
+            combined = (base.float() + correction).to(base.dtype)
+            with torch.no_grad():
+                dims = (1, 2, 3, 4)
+                base_norm = torch.linalg.vector_norm(base.detach().reshape(B, T, *base.shape[1:]).float(), dim=dims)
+                actual = (combined.detach().float() - base.detach().float()).reshape(B, -1)
+                stats['base_output_norm'] = base_norm
+                stats['relative_correction'] = torch.linalg.vector_norm(actual, dim=1) / base_norm.clamp_min(1e-30)
+                stats['changed_fraction_after_cast'] = (actual != 0).float().mean(1)
+            if self.point_conv.norm:
+                combined = self.point_conv.norm(combined)
+            if self.point_conv.act:
+                combined = self.point_conv.act(combined)
+            return combined, candidate, stats
+
+        if getattr(self, 'ttn_activation_checkpointing', False) and torch.is_grad_enabled():
+            output, candidate, stats = checkpoint_preserving_strides(spatial, x, delta, write)
+        else:
+            output, candidate, stats = spatial(x, delta, write)
+        if context.clean_mode:
+            context.stage_ffn(index, candidate, stats)
+        return output
+
     def forward(self, x: torch.Tensor, HW=None) -> torch.Tensor:
         B, N, C = x.shape
         if HW is None:
@@ -372,7 +420,10 @@ class CachedGLUMBConvTemp(GLUMBConvTemp):
         T, H, W = HW
         x = x.reshape(B * T, H, W, C).permute(0, 3, 1, 2)
 
-        x = self._apply_spatial_autochunked(x)
+        if hasattr(self, 'inplace_ttt'):
+            x = self._apply_spatial_inplace(x, HW, kwargs.get('ttn_chunk_context'))
+        else:
+            x = self._apply_spatial_autochunked(x)
 
         # Temporal aggregation
         x_reshaped = x.view(B, T, C, H * W).permute(0, 2, 1, 3)  # B,C,T,HW

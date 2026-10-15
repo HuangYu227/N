@@ -411,6 +411,7 @@ class SanaVideoMSCamCtrlBlock(nn.Module):
             "HW": THW,
             "frame_valid_mask": frame_valid_mask,
             "ttn_live_cache": kwargs.get("ttn_live_cache", False),
+            "ttn_chunk_context": kwargs.get("ttn_chunk_context"),
         }
         if chunk_index is not None:
             mlp_kwargs["chunk_index"] = chunk_index[:]  # NOTE: important, copy the list
@@ -570,6 +571,7 @@ class SanaVideoMSCamCtrlBlock(nn.Module):
             "HW": THW,
             "frame_valid_mask": frame_valid_mask,
             "ttn_live_cache": kwargs.get("ttn_live_cache", False),
+            "ttn_chunk_context": kwargs.get("ttn_chunk_context"),
         }
         if chunk_index is not None:
             mlp_kwargs["chunk_index"] = chunk_index[:]  # NOTE: important, copy the list

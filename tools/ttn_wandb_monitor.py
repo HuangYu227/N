@@ -4,6 +4,7 @@ from collections import defaultdict
 from contextlib import contextmanager
 import json
 import math
+import netrc
 import os
 from pathlib import Path
 import time
@@ -68,6 +69,13 @@ def step_metrics(record):
         for segment, selected in (('all', chunks), ('tail5_chunks', chunks[-5:])):
             samples = defaultdict(list)
             for chunk in selected:
+                for layer in chunk.get('ffn_ttt', []):
+                    fields = {key: value for key, value in layer.items() if key != 'block'}
+                    for name, value in numeric_leaves(fields):
+                        if math.isfinite(value):
+                            samples[f'ffn{layer["block"]}/{prefix}/{segment}/{name}'].append(value)
+                        else:
+                            skipped += 1
                 for anchor in chunk.get('anchors', []):
                     block = anchor['block']
                     fields = {key: anchor[key] for key in (
@@ -126,7 +134,7 @@ def monitor_lock(path):
         yield  # Closing the descriptor releases the lock even after a crash.
 
 
-def monitor(directory, *, entity, project, mode='online', follow=False, poll=15, backend=None):
+def monitor(directory, *, entity, project, mode='online', follow=False, poll=15, stop_file=None, backend=None):
     directory = Path(directory).resolve(strict=True)
     if not directory.is_dir() or not (directory / 'run_config.json').is_file():
         raise ValueError('Select the running training directory containing run_config.json')
@@ -167,7 +175,7 @@ def monitor(directory, *, entity, project, mode='online', follow=False, poll=15,
         config['aggregation'] = 'per rank; anchor mean/max across chunks/heads; observed prefill excluded'
         training = source.get('training', {})
         config['training'] = {key: training[key] for key in ('tbptt', 'seed', 'per_rank_batch', 'meta_ttt',
-                                                           'compute_precision') if key in training}
+            'compute_precision', 'training_protocol', 'ttt_backend', 'inplace_ttt') if key in training}
         run = backend.init(entity=entity, project=project, id=identity['id'], resume='allow',
                            name=directory.name, job_type='metrics-monitor', dir=str(work / 'sdk'),
                            mode=mode, config=config, settings=backend.Settings(
@@ -195,7 +203,7 @@ def monitor(directory, *, entity, project, mode='online', follow=False, poll=15,
                         continue  # W&B restored its next history step, not a local enqueue cursor.
                     run.log(step_metrics(record), step=int(record['step']), commit=True)
                     print(f'[TTN W&B] recorded training step {record["step"]}', flush=True)
-                if not follow:
+                if not follow or (stop_file is not None and Path(stop_file).exists()):
                     break
                 time.sleep(poll)
         except KeyboardInterrupt:
@@ -212,12 +220,29 @@ def main():
     parser.add_argument('training_directory', type=Path)
     parser.add_argument('--entity', required=True)
     parser.add_argument('--project', default='WorldTTN')
-    parser.add_argument('--mode', choices=('online', 'offline'), default='online')
+    parser.add_argument('--mode', choices=('online', 'offline', 'auto'), default='online')
     parser.add_argument('--follow', action='store_true', help='Wait for new completed steps until Ctrl+C')
     parser.add_argument('--poll', type=float, default=15)
+    parser.add_argument('--stop-file', type=Path, help='Finish after consuming completed records when this file appears')
     args = parser.parse_args()
+    if args.mode == 'auto':
+        # Read only the signed-in W&B entry in this child; never change shared login.
+        if not os.environ.get('WANDB_API_KEY'):
+            try:
+                credentials = netrc.netrc().authenticators('api.wandb.ai')
+            except (OSError, netrc.NetrcParseError):
+                credentials = None
+            if credentials and credentials[2]:
+                os.environ['WANDB_API_KEY'] = credentials[2]
+        args.mode = 'online' if os.environ.get('WANDB_API_KEY') else 'offline'
+        identity = args.training_directory / 'wandb-monitor/identity.json'
+        if identity.is_file():
+            args.mode = json.loads(identity.read_text(encoding='utf-8'))['mode']
+        status = f'mode={args.mode}; credential available={bool(os.environ.get("WANDB_API_KEY"))}; shared login unchanged\n'
+        (args.training_directory / 'wandb-status.txt').write_text(status, encoding='utf-8')
+        print('[TTN W&B] ' + status.strip(), flush=True)
     monitor(args.training_directory, entity=args.entity, project=args.project,
-            mode=args.mode, follow=args.follow, poll=args.poll)
+            mode=args.mode, follow=args.follow, poll=args.poll, stop_file=args.stop_file)
 
 
 if __name__ == '__main__':

@@ -1,0 +1,23 @@
+{
+  "sana_config": "configs/worldttn/sana_teacher_single_gpu.yaml",
+  "ttn": {
+    "heads": 20, "head_dim": 112, "generators": 16,
+    "alpha_s": 0.5, "eps": 0.000001, "delta_psi": 1,
+    "eta_psi": 0, "inner_clip": 1, "stage": "C", "camera_attention": "sana",
+    "local_update": false, "persistent_meta": false, "state_ttt_rank": 0,
+    "ttt_backend": "inplace-ffn", "inplace_layers": [3, 7, 11, 15, 19],
+    "inplace_lr": 3, "inplace_target_diag_std": 0.02,
+    "base_id": "hf://Efficient-Large-Model/SANA-WM_chunk_causal/dit/sana_wm_chunk_causal_1600m_720p.safetensors"
+  },
+  "training_protocol": "inplace-ffn-clean-fullgrad-v1",
+  "training_latent_frames": 121,
+  "training_precision": "fp8",
+  "tbptt": 0,
+  "camera_cached_chunks": 2,
+  "empty_text_probability": 0.1,
+  "fullgrad_checkpoint": true,
+  "keep_model_steps": [25, 50, 100, 250, 500],
+  "startup_checkpoint_steps": [5, 10],
+  "activation_checkpointing": "ffn-cross-attn",
+  "learning_rate": 0.00001
+}

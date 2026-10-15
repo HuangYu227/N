@@ -86,12 +86,17 @@ def build(args, stage=None, sana_path=None):
     if not source.is_absolute(): source = ROOT / source
     config = load_sana_config(source)
     protocol = settings.get("training_protocol", "clean-tbptt")
-    if protocol not in ("clean-tbptt", "dual-psi-clean-fullgrad-v1"):
+    if protocol not in ("clean-tbptt", "dual-psi-clean-fullgrad-v1", "inplace-ffn-clean-fullgrad-v1"):
         raise ValueError("unknown training protocol")
     if protocol == "dual-psi-clean-fullgrad-v1":
         if not (ttn.local_update and ttn.persistent_meta) or settings.get("tbptt") != 0:
             raise ValueError("dual-psi fullgrad requires live Local/Persistent meta and tbptt=0")
         if getattr(args, "tbptt", None) not in (None, 0): raise ValueError("fullgrad forbids TBPTT windows")
+    if (ttn.ttt_backend == 'inplace-ffn') != (protocol == 'inplace-ffn-clean-fullgrad-v1'):
+        raise ValueError('inplace-ffn requires its full-gradient sequence protocol')
+    if protocol == 'inplace-ffn-clean-fullgrad-v1':
+        if settings.get('tbptt') != 0 or getattr(args, 'tbptt', None) not in (None, 0):
+            raise ValueError('inplace-ffn requires TBPTT=0')
     frames = settings.get("training_latent_frames")
     if frames is not None:
         if type(frames) is not int or frames < 4 or frames % 3 != 1: raise ValueError("training_latent_frames must be 1+3n")
@@ -102,7 +107,7 @@ def build(args, stage=None, sana_path=None):
     if not isinstance(probability, (int, float)) or not 0 <= probability <= 1:
         raise ValueError("empty text probability must be 0..1")
     args.empty_text_probability = probability
-    if probability and (getattr(args, "batch_file", None) or config.data.load_text_feat):
+    if getattr(args, 'command', None) == 'train' and probability and (getattr(args, "batch_file", None) or config.data.load_text_feat):
         raise ValueError("empty text sampling requires raw prompts and frozen text encoder")
     root = getattr(args, "dataset_root", None)
     if root:
@@ -189,7 +194,8 @@ def train_update(model, config, batch, optimizer, k, parallel=None, *, activatio
 
 @torch.no_grad()
 def rollout(model, config, batch, steps=4, cfg_scale=4.5, cached_blocks=-1, *, initial_noise=None, on_chunk=None,
-            ttn_ablation="full", state_diagnostics=False, history_reference=None, on_state=None):
+            ttn_ablation="full", state_diagnostics=False, history_reference=None, on_state=None,
+            inplace_delta_clip=1e-5):
     from diffusion.scheduler.self_forcing_flow_euler_sampler import SelfForcingFlowEulerCamCtrl
     initial = batch.get("initial_latent")
     if initial is None: initial = batch["clean_latents"][:, :, :1]
@@ -213,7 +219,7 @@ def rollout(model, config, batch, steps=4, cfg_scale=4.5, cached_blocks=-1, *, i
     extras = {"chunk_plucker": batch["chunk_plucker"]} if "chunk_plucker" in batch else {}
     session = TTNSession(model, batch["camera_conditions"], batch["width"], batch["height"],
                          batch.get("frame_valid_mask"), extras, ablation=ttn_ablation,
-                         diagnostics=state_diagnostics) if hasattr(model, "ttn_system") else None
+                         diagnostics=state_diagnostics, inplace_delta_clip=inplace_delta_clip) if hasattr(model, "ttn_system") else None
     from .session import repeat_batch
     cfg_batch = initial.shape[0] * (2 if cfg_scale > 1 else 1)
     camera = repeat_batch(batch["camera_conditions"], cfg_batch).clone()
@@ -349,13 +355,21 @@ def _training_identity(args, config, settings, k):
             'basis':'learned-orthogonal-qr','local_objective':'weighted_v_energy_support',
             'clean_objective':'raw_weighted_innovation','clean_commit':'absorbed_once_before_correct',
             'support':'absolute_frame_xy_checkerboard','old_psi':'disabled'}
-    if settings.get("training_protocol") == "dual-psi-clean-fullgrad-v1":
-        identity.update(training_protocol="dual-psi-clean-fullgrad-v1",
+    if settings.get("training_protocol") in ("dual-psi-clean-fullgrad-v1", "inplace-ffn-clean-fullgrad-v1"):
+        identity.update(training_protocol=settings['training_protocol'],
                         training_latent_frames=settings["training_latent_frames"],
                         empty_text_probability=getattr(args, "empty_text_probability", .1),
                         camera_cached_chunks=settings.get("camera_cached_chunks", 2))
         identity["execution"].update(activation_checkpointing=settings.get("activation_checkpointing", "none"),
                                      fullgrad_checkpoint=settings.get("fullgrad_checkpoint", True))
+    if ttn.get('ttt_backend') == 'inplace-ffn':
+        identity['meta_ttt'] = {'version': 'inplace-ffn-v1', 'layers': ttn['inplace_layers'],
+            'lr': ttn.get('inplace_lr', 3.), 'target_diag_std': ttn.get('inplace_target_diag_std', .02),
+            'target': 'clean post-norm/modulation FFN input; chunk-local DWConv5 pad2 then T@P',
+            'objective': 'negative inner product sum; eta*V^T*H', 'training_delta_clip': None,
+            'conv_axis': 'flattened T/H/W', 'read_write': 'read old delta; clean commits once for next chunk',
+            'prefill_write': False, 'state_ttt': 'disabled', 'old_psi': 'disabled',
+            'fast_state_dtype': 'float32', 'output_merge': 'FP32 correction; cast to original projection dtype'}
     precision = getattr(args, "train_precision", None) or settings.get("training_precision", "bf16")
     if precision != "bf16":
         from .fp8 import precision_identity
@@ -541,7 +555,7 @@ def train_command(args):
                "implementation": {name: {"path": str(path.resolve()), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
                                   for name, path in sources.items()}}
         if k == 0:
-            run["history_protocol"].update(training_protocol="dual-psi-clean-fullgrad-v1",
+            run["history_protocol"].update(training_protocol=model.ttn_training_protocol,
                 persistent_gradient="live entire episode including observed prefill; no temporal detach",
                 camera_cache=f"last {model.ttn_camera_cached_chunks} groups; retained entries live",
                 temporal_detaches=0, backward_calls=1,
@@ -550,6 +564,11 @@ def train_command(args):
             run['history_protocol'].update(ttt='additive-state-v1',local_lifecycle='temporary support-based S update',
                 persistent_lifecycle='clean additive S update absorbed once before Correct',
                 persistent_gradient='live through committed S; old psi disabled',old_psi='disabled')
+        if model.ttn_system.config.ttt_backend == 'inplace-ffn':
+            run['history_protocol'].update(ttt='inplace-ffn-v1', local_lifecycle='disabled', old_psi='disabled',
+                persistent_lifecycle='FFN delta committed once after clean; prefill read-only',
+                persistent_gradient='live through all FFN deltas and S; no temporal detach',
+                training_delta_clip=None, ffn_layers=list(model.ttn_system.config.inplace_layers))
         if unfreeze:
             run["initialization"] = {"checkpoint": str(Path(args.adapter).resolve()), "step": step,
                                      "optimizer_reset": True, "rng_and_data_cursor_restored": True}
@@ -561,7 +580,7 @@ def train_command(args):
             run["initialization"] = {"source": "pretrained SANA + fresh TTN", "step": 0,
                 "sana_inherited": "original base SHA256; visual/camera mappings preserved",
                 "ttn_new": "beta/controller heads zero; controller body random; normalized random generators",
-                "episode_state": "S/psi zero; never optimizer parameters", "seed": args.seed}
+                "episode_state": "S/psi and FFN deltas zero; never optimizer parameters", "seed": args.seed}
         (output / "run_config.json").write_text(json.dumps(run, indent=2), encoding="utf-8")
         json_record(output / "implementations.jsonl", {"next_step": step + 1, "train_scope": args.train_scope if hasattr(args, "train_scope") else "ttn",
                                                      **run["provenance"]})
@@ -655,13 +674,16 @@ def infer_command(args):
     model, config, settings = build(args)
     if args.adapter: load_checkpoint(args.adapter, model)
     batch = load_bundle(args.batch_file, args.device)
-    result, timing = timed_cuda(lambda: rollout(model, config, batch, args.steps, args.cfg_scale, args.cached_blocks))
+    clip = None if args.inplace_delta_clip == 0 else args.inplace_delta_clip
+    result, timing = timed_cuda(lambda: rollout(model, config, batch, args.steps, args.cfg_scale, args.cached_blocks,
+                                               inplace_delta_clip=clip))
     latents, runtime, records = result
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
     torch.save({"latents": latents.cpu()}, output / "rollout.pt")
     report = {
         "mode": "inference",
+        "inplace_delta_clip": clip,
         "execution": execution_report(model), "precision": precision_audit(),
         "stage": model.ttn_system.config.stage,
         "config": model.ttn_system.config.to_dict(),
@@ -865,7 +887,7 @@ def main():
                         help="align-chunk: read-only autograd.grad probe at this index; no optimizer step")
     parser.add_argument("--eval-cases", type=int, default=1, help="deterministic unique example clips, diagnostic only")
     parser.add_argument("--fixed-cases", help="immutable CPU case bundle pinned by stage evaluation (shared full horizon)")
-    parser.add_argument("--ttn-ablation", choices=("full", "no-ttt", "identity", "no-local", "no-persistent"), default="full",
+    parser.add_argument("--ttn-ablation", choices=("full", "no-ttt", "identity", "no-local", "no-persistent", "no-ffn-ttt"), default="full",
                         help="evaluate only: runtime intervention on the same C checkpoint, without changing stage/weights")
     parser.add_argument("--history-source", choices=("generated", "gt"), default="generated",
                         help="evaluate only: gt commits current GT after prediction to ALL caches; output stays generated")
@@ -940,6 +962,8 @@ def main():
     parser.add_argument("--empty-text-probability", type=float)
     parser.add_argument("--steps", type=int, help="default 4 for smoke; evaluate requires an explicit quality schedule")
     parser.add_argument("--cfg-scale", type=float, default=4.5)
+    parser.add_argument('--inplace-delta-clip', type=float, default=1e-5,
+                        help='inference/evaluation FFN update Frobenius cap; 0 disables clipping')
     parser.add_argument("--cached-blocks", type=int, default=-1)
     parser.add_argument("--stages", nargs="+", choices=("A", "B", "C"), default=["A", "B", "C"])
     parser.add_argument("--frames", type=int, default=13)
@@ -952,6 +976,10 @@ def main():
         parser.error(str(error))
     if args.benchmark_save_checkpoint and (args.command != "train" or not benchmark_run(args)):
         parser.error("--benchmark-save-checkpoint requires a train benchmark/profiler/layout run")
+    if not math.isfinite(args.inplace_delta_clip) or args.inplace_delta_clip < 0:
+        parser.error('--inplace-delta-clip must be finite and nonnegative')
+    if args.command not in ('infer', 'evaluate') and args.inplace_delta_clip != 1e-5:
+        parser.error('--inplace-delta-clip is inference/evaluation only')
     if args.command != "evaluate" and (args.ttn_ablation != "full" or args.history_source != "generated"
             or args.state_diagnostics or args.eval_methods != ["sana", "ttn"]):
         parser.error("mechanism interventions are evaluate-only; training semantics are unchanged")

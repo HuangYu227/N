@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tools.ttn_wandb_monitor import StepLog, monitor, monitor_lock, step_metrics
+from tools.ttn_wandb_monitor import StepLog, main, monitor, monitor_lock, step_metrics
 
 
 def record(step=1):
@@ -49,6 +49,20 @@ def test_nonfinite_values_are_flagged_and_missing_values_are_not_zero():
     assert 'train/loss' not in metrics
     assert metrics['monitor/skipped_nonfinite_values'] > 0
     assert all(isinstance(value, (int, float)) for value in metrics.values())
+
+
+def test_ffn_metrics_keep_rank_layer_and_tail_without_uploading_raw_vectors():
+    sample = record()
+    for index, chunk in enumerate(sample['ranks'][0]['chunks']):
+        chunk['ffn_ttt'] = [{'block': 3, 'applied_update_norm': [index, index + 2],
+                             'clip_scale': [1., 0.5], 'changed_fraction_after_cast': [0.2, 0.4],
+                             'measurement': 'not an independent quality sample', 'per_head': {'bad': 999}}]
+    metrics = step_metrics(sample)
+    assert metrics['ffn3/rank0/all/applied_update_norm/mean'] == 4.5
+    assert metrics['ffn3/rank0/tail5_chunks/applied_update_norm/mean'] == 6.
+    assert metrics['ffn3/rank0/all/clip_scale/mean'] == 0.75
+    assert metrics['ffn3/rank0/tail5_chunks/changed_fraction_after_cast/max'] == 0.4
+    assert not any('per_head' in key or 'measurement' in key for key in metrics)
 
 
 def test_partial_jsonl_is_retried_without_losing_a_training_step(tmp_path):
@@ -151,6 +165,46 @@ def test_follow_reads_appended_step_and_interrupts_only_monitor(tmp_path, monkey
     monitor(directory, entity='me', project='WorldTTN', backend=backend, follow=True)
     assert [row['train/step'] for row in backend.logged] == [1, 2]
     assert backend.finished == [0]
+
+
+def test_stop_file_consumes_final_records_and_finishes_offline_monitor(tmp_path, monkeypatch):
+    directory = train_directory(tmp_path)
+    (directory / 'train.exit-code').write_text('0\n')
+    backend = FakeBackend()
+    monkeypatch.delenv('WANDB_API_KEY', raising=False)
+    monkeypatch.setattr('tools.ttn_wandb_monitor.time.sleep', lambda _: pytest.fail('already complete'))
+    monitor(directory, entity='me', project='WorldTTN', mode='offline', follow=True,
+            stop_file=directory / 'train.exit-code', backend=backend)
+    assert [row['train/step'] for row in backend.logged] == [1]
+    assert backend.finished == [0] and backend.calls[0]['mode'] == 'offline'
+
+
+def test_auto_mode_reads_existing_wandb_credential_only_in_monitor_process(tmp_path, monkeypatch):
+    directory = train_directory(tmp_path)
+    monkeypatch.delenv('WANDB_API_KEY', raising=False)
+    monkeypatch.setattr('tools.ttn_wandb_monitor.netrc.netrc',
+                        lambda: SimpleNamespace(authenticators=lambda host: ('me', None, 'private-existing-key')
+                                                if host == 'api.wandb.ai' else None))
+    monkeypatch.setattr('sys.argv', ['monitor', str(directory), '--entity', '3193513478-', '--mode', 'auto'])
+    calls = []
+    monkeypatch.setattr('tools.ttn_wandb_monitor.monitor', lambda *args, **kwargs: calls.append(kwargs))
+    main()
+    assert calls[0]['mode'] == 'online'
+    assert os.environ['WANDB_API_KEY'] == 'private-existing-key'
+    assert 'private-existing-key' not in (directory / 'wandb-status.txt').read_text()
+
+
+def test_auto_mode_without_a_credential_uses_offline(tmp_path, monkeypatch):
+    directory = train_directory(tmp_path)
+    monkeypatch.delenv('WANDB_API_KEY', raising=False)
+    monkeypatch.setattr('tools.ttn_wandb_monitor.netrc.netrc',
+                        lambda: SimpleNamespace(authenticators=lambda host: None))
+    monkeypatch.setattr('sys.argv', ['monitor', str(directory), '--entity', '3193513478-', '--mode', 'auto'])
+    calls = []
+    monkeypatch.setattr('tools.ttn_wandb_monitor.monitor', lambda *args, **kwargs: calls.append(kwargs))
+    main()
+    assert calls[0]['mode'] == 'offline'
+    assert 'credential available=False' in (directory / 'wandb-status.txt').read_text()
 
 
 def test_explicit_key_required_and_duplicate_monitor_rejected(tmp_path, monkeypatch):

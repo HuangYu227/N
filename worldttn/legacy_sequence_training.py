@@ -7,7 +7,26 @@ from torch import nn
 
 from .session import TTNSession, repeat_batch, record_noise
 from .runtime import TTNChunkContext
+from .core import ANCHORS
 from .training import chunk_ranges, activation_storage, _memory_phase
+
+
+def _ffn_record_rows(candidates, chunk_count):
+    """Move detached per-layer diagnostics once, outside all replay regions."""
+    rows = [[] for _ in range(chunk_count)]
+    for index, (_, records) in sorted(candidates.items()):
+        if len(records) != chunk_count + 1 or any(record is None for record in records[1:]):
+            raise RuntimeError('missing full-sequence FFN diagnostics')
+        keys = [key for key, value in records[1].items() if isinstance(value, torch.Tensor)]
+        values = (torch.stack([torch.stack([record[key] for key in keys], -1)
+                               for record in records[1:]]).detach().cpu().tolist() if keys else None)
+        for chunk, record in enumerate(records[1:]):
+            converted = {key: value for key, value in record.items() if key not in keys}
+            if keys:
+                converted.update({key: [sample[column] for sample in values[chunk]]
+                                  for column, key in enumerate(keys)})
+            rows[chunk].append(dict(block=index, **converted))
+    return rows
 
 
 class LegacySequenceSession(TTNSession):
@@ -90,7 +109,8 @@ def train_legacy_sequence(model, clean, y, camera_conditions, optimizer, loss_fn
         camera_conditions[:, :, :16].reshape(b, frames, 4, 4).repeat(3, 1, 1, 1),
         valid.repeat(3, 1), valid.repeat(3, 1), 0, id(runtime), sequence_mode=True,
         camera_cached_chunks=cached_chunks, checkpoint_cpu_inputs=clean.is_cuda and activation_offload != 'none',
-        collect_local_stats=True, sequence_memory_callback=memory_callback)
+        collect_local_stats=True, sequence_memory_callback=memory_callback,
+        ffn_fast=runtime.ffn_fast, ffn_delta_clip=None)
     lm = valid[:, None, :, None, None].float();lm[:, :, 0] = 0
     episode = SimpleNamespace(session=session, context=context, clean=clean, timesteps=timesteps, noise=noise,
         y=y, mask=mask, data_info=data_info, loss_mask=lm, on_prediction=on_prediction)
@@ -109,6 +129,17 @@ def train_legacy_sequence(model, clean, y, camera_conditions, optimizer, loss_fn
         if set(context.candidates) != set(range(5)): raise RuntimeError('missing sequence anchors')
         if not all(torch.isfinite(value).all() for row in context.candidates.values() for value in row[:2]):
             raise FloatingPointError('nonfinite full-sequence S/psi; optimizer not updated')
+        inplace = model.ttn_system.config.ttt_backend == 'inplace-ffn'
+        if inplace:
+            if set(context.ffn_candidates) != set(ANCHORS):
+                raise RuntimeError('missing full-sequence FFN candidates')
+            if any(value.shape != runtime.ffn_fast[index].shape
+                   for index, (value, _) in context.ffn_candidates.items()):
+                raise ValueError('full-sequence FFN candidate dimensions mismatch; optimizer not updated')
+            if any(value.dtype != torch.float32 or not torch.isfinite(value).all()
+                   for value, _ in context.ffn_candidates.values()):
+                raise FloatingPointError('nonfinite or non-FP32 full-sequence FFN state; optimizer not updated')
+            ffn_rows = _ffn_record_rows(context.ffn_candidates, len(chunk_ranges(frames)))
         _memory_phase(memory_callback, 'backward_begin')
         loss.backward()
         _memory_phase(memory_callback, 'backward_end')
@@ -124,6 +155,9 @@ def train_legacy_sequence(model, clean, y, camera_conditions, optimizer, loss_fn
     if set(context.candidates) != set(range(5)): raise RuntimeError('missing sequence anchors')
     runtime.world_state = torch.stack([context.candidates[i][0].detach() for i in range(5)], 1)
     runtime.transition_fast = torch.stack([context.candidates[i][1].detach() for i in range(5)], 1)
+    if inplace:
+        runtime.ffn_fast = {index: value.detach() for index, (value, _) in context.ffn_candidates.items()}
+        runtime.ffn_commit_count = len(chunk_ranges(frames))
     runtime.commit_count = runtime.predict_count = len(chunk_ranges(frames))+1
     runtime.previous_committed_pose = camera_conditions[:, -1, :16].reshape(b,4,4)
     runtime.committed_frame_ids = [set(range(frames)) for _ in range(b)]
@@ -131,19 +165,26 @@ def train_legacy_sequence(model, clean, y, camera_conditions, optimizer, loss_fn
     rows = [context.candidates[i][2] for i in range(5)]
     chunks = [dict(chunk=j, start=start, end=end, anchors=[rows[i][j+1] for i in range(5)])
               for j,(start,end) in enumerate(chunk_ranges(frames))]
+    if inplace:
+        for chunk, ffn in zip(chunks, ffn_rows): chunk['ffn_ttt'] = ffn
     result = dict(loss=float(loss.detach()), outer_grad_norm=float(norm), runtime=runtime, chunks=chunks,
         activation_storage=dict(getattr(storage,'storage_stats',{})),
         prediction_diagnostics=episode.measurements,
         prefill=dict(chunk=-1,start=0,end=1,anchors=[rows[i][0] for i in range(5)],live_gradient=True),
         exposure=dict(clips=b,valid_latent_frames=b*frames,predicted_latent_frames=b*(frames-1),
                       predicted_chunks=b*len(chunks),model_forwards=1),
-        sequence=dict(protocol='dual-psi-clean-fullgrad-v1',backward_calls=1,temporal_detaches=0,
+        sequence=dict(protocol=model.ttn_training_protocol,backward_calls=1,temporal_detaches=0,
                       cached_chunks=2,live_prefill=True))
+    if inplace:
+        result['sequence'].update(ffn_clean_commits=len(chunks), ffn_prefill_writes=0,
+                                  psi_updates=False, ffn_delta_clip=None)
     if probe is not None: result['optimizer_updates'] = probe.report(optimizer)
     if eta_before is not None: result['local_eta_update'] = local_eta_update(model, eta_before, optimizer)
     # Episode credit has finished; release closure cycles, not temporal gradients.
     before = torch.cuda.memory_allocated(clean.device) if clean.is_cuda else 0
     context.candidates.clear()
+    context.ffn_candidates.clear()
+    context.ffn_fast.clear()
     context.sequence_coefficients = ()
     context.sequence_memory_callback = None
     session.clean = None

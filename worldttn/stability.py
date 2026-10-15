@@ -206,7 +206,8 @@ def anchor_gradient_scales(model):
     from .core import ANCHORS
     groups = {}
     for name, p in model.named_parameters():
-        if not any(name.startswith(f"blocks.{i}.attn.") for i in ANCHORS) and not name.startswith("ttn_system."):
+        if (not any(name.startswith((f"blocks.{i}.attn.", f"blocks.{i}.mlp.inplace_ttt.")) for i in ANCHORS)
+                and not name.startswith("ttn_system.")):
             continue
         group = name.rsplit(".", 1)[0]
         row = groups.setdefault(group, {"grad_squared": 0., "parameter_squared": 0., "missing_gradients": 0,

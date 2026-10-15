@@ -36,8 +36,22 @@ class TTNConfig:
     state_ttt_rank: int = 0
     state_ttt_policy: str = 'curvature'
     state_ttt_gain: float = 1.
+    ttt_backend: str = 'auto'
+    inplace_layers: tuple = ANCHORS
+    inplace_lr: float = 3.
+    inplace_target_diag_std: float = .02
 
     def __post_init__(self):
+        object.__setattr__(self, 'inplace_layers', tuple(self.inplace_layers))
+        if self.ttt_backend not in ('auto', 'inplace-ffn'):
+            raise ValueError('unknown TTT backend')
+        if self.ttt_backend == 'inplace-ffn':
+            if self.stage != 'C' or self.state_ttt_rank or self.local_update or self.persistent_meta or self.eta_psi:
+                raise ValueError('inplace-ffn replaces StateTTT and legacy psi; require stage C, rank0, no local/persistent psi')
+            if self.inplace_layers != ANCHORS:
+                raise ValueError('inplace-ffn v1 requires FFN layers 3/7/11/15/19')
+            if not all(math.isfinite(v) and v > 0 for v in (self.inplace_lr, self.inplace_target_diag_std)):
+                raise ValueError('inplace learning rate and target initialization must be finite and positive')
         if self.stage not in ("A", "B", "C"):
             raise ValueError("stage must be A, B or C")
         if not isinstance(self.local_update, bool) or not isinstance(self.persistent_meta, bool):
@@ -65,6 +79,11 @@ class TTNConfig:
         if self.local_eta_init == .01: result.pop("local_eta_init")
         if not self.state_ttt_rank:
             for name in ('state_ttt_rank','state_ttt_policy','state_ttt_gain'):result.pop(name)
+        if self.ttt_backend == 'auto':
+            for name in ('ttt_backend', 'inplace_layers', 'inplace_lr', 'inplace_target_diag_std'):
+                result.pop(name)
+        else:
+            result['inplace_layers'] = list(self.inplace_layers)
         return result
 
 

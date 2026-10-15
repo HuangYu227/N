@@ -262,7 +262,7 @@ def train_clip(model,
                memory_callback=None,
                audit_update=False,
                cached_chunks=-1):
-    if getattr(model, 'ttn_training_protocol', '') == 'dual-psi-clean-fullgrad-v1':
+    if getattr(model, 'ttn_training_protocol', '') in ('dual-psi-clean-fullgrad-v1', 'inplace-ffn-clean-fullgrad-v1'):
         from .legacy_sequence_training import train_legacy_sequence
         return train_legacy_sequence(model, clean, y, camera_conditions, optimizer, loss_fn, timesteps, noise,
             width=width, height=height, mask=mask, data_info=data_info, extras=extras, valid_mask=valid_mask,
