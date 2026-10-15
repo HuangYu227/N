@@ -325,6 +325,9 @@ class GDN(Attention_):
     def _apply_output_gate(self, out: torch.Tensor, gate_x: torch.Tensor) -> torch.Tensor:
         if not (self.use_output_gate and self.output_gate is not None):
             return out
+        if type(self.output_gate) is not nn.Linear:
+            # Calling adapter wrappers preserves their low-rank contribution.
+            return out * F.silu(self.output_gate(gate_x).to(torch.float32))
         return _apply_output_gate(out, gate_x, self.output_gate.weight, self.output_gate.bias)
 
     @staticmethod
@@ -467,6 +470,13 @@ class GDN(Attention_):
         """
         T, H, W = hw
         S = H * W
+        if type(self.beta_proj) is not nn.Linear or type(self.gate_proj) is not nn.Linear:
+            B, _, C = x.shape
+            beta = self.beta_proj(x).sigmoid().reshape(B,T,S,self.heads).permute(0,3,1,2)
+            a_out = self.gate_proj(x.reshape(B,T,S,C).mean(dim=2)).float()
+            decay = (-self.A_log.float().exp().view(1,1,-1) *
+                     F.softplus(a_out+self.dt_bias.float().view(1,1,-1))).exp().transpose(1,2)
+            return beta, decay
         return _compute_frame_gates(
             x,
             T,

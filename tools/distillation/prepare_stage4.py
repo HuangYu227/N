@@ -34,10 +34,20 @@ def prepare(eight_run, review_file):
     metrics = json.loads((eight_run/f'eval-{step:06d}'/'metrics.json').read_text())
     if not phase4_gate(metrics['results'], True):
         raise ValueError('Best-8 student did not pass both quality gates and speed gate')
-    config = OmegaConf.load(ROOT/'configs/distillation/longlive_ttn_step200_8step.yaml')
+    launch=eight_run/'launch.json'
+    if not launch.is_file() and eight_run.name=='training': launch=eight_run.parent/'launch.json'
+    if launch.exists():
+        from worldttn.distillation.checkpoint import digest
+        identity=json.loads(launch.read_text())
+        config_path=Path(identity['config'])
+        if digest(config_path)!=identity['config_sha256']: raise ValueError('Eight-step config changed')
+    else:
+        config_path=ROOT/'configs/distillation/longlive_ttn_step200_8step.yaml'
+    config = OmegaConf.load(config_path)
     config.student_steps = 4
     config.stage4_source = str(best)
     config.stage4_review = str(review_file)
+    if 'capacity_proof' in config: del config['capacity_proof']
     output = ROOT/'output'/'stage4-configs'/datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
     output.mkdir(parents=True, exist_ok=False)
     path = output/'stage4.yaml'

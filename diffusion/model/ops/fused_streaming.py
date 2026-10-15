@@ -660,10 +660,14 @@ def _cam_prep_triton(
     D_head = layer.cam_head_dim
 
     # ---- 1. QKV linear (fused via cat) + cam-K short conv ----
-    qkv_w = torch.cat([layer.q_proj_cam.weight, layer.k_proj_cam.weight, layer.v_proj_cam.weight])
-    qkv_b = torch.cat([layer.q_proj_cam.bias, layer.k_proj_cam.bias, layer.v_proj_cam.bias])
-    qkv_cam = F.linear(x, qkv_w, qkv_b)
-    q_raw, k_raw, v_raw = qkv_cam.chunk(3, dim=-1)
+    projections = (layer.q_proj_cam, layer.k_proj_cam, layer.v_proj_cam)
+    if all(type(projection) is torch.nn.Linear for projection in projections):
+        qkv_w = torch.cat([projection.weight for projection in projections])
+        qkv_b = torch.cat([projection.bias for projection in projections])
+        q_raw, k_raw, v_raw = F.linear(x, qkv_w, qkv_b).chunk(3, dim=-1)
+    else:
+        # Preserve adapter gradients instead of bypassing their forward methods.
+        q_raw, k_raw, v_raw = (projection(x) for projection in projections)
 
     new_conv_cache = None
     if layer.conv_k_cam is not None:

@@ -80,6 +80,8 @@ def main():
         tracked.extend((ROOT/folder).rglob('*.yaml'))
         tracked.extend((ROOT/folder).rglob('*.sh'))
     tracked.append(ROOT/'tools/download.py')
+    tracked.extend(ROOT/path for path in ('diffusion/model/nets/sana_gdn_camctrl_blocks.py',
+                                          'diffusion/model/ops/fused_streaming.py'))
     files={str(p.relative_to(ROOT)):hashlib.sha256(p.read_bytes()).hexdigest()
            for p in tracked if '__pycache__' not in p.parts}
     record={'experiment_id':run.name,'mode':'campaign','status':'capacity',

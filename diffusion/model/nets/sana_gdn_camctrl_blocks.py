@@ -409,10 +409,14 @@ def _prepare_cam_qkv_softmax(
     if token_valid_mask is not None:
         x = x * token_valid_mask.view(B, N, 1)
 
-    qkv_w = torch.cat([self.q_proj_cam.weight, self.k_proj_cam.weight, self.v_proj_cam.weight])
-    qkv_b = torch.cat([self.q_proj_cam.bias, self.k_proj_cam.bias, self.v_proj_cam.bias])
-    qkv_cam = F.linear(x, qkv_w, qkv_b)
-    q_cam, k_cam, v_cam = qkv_cam.chunk(3, dim=-1)
+    projections = (self.q_proj_cam, self.k_proj_cam, self.v_proj_cam)
+    if all(type(projection) is torch.nn.Linear for projection in projections):
+        qkv_w = torch.cat([projection.weight for projection in projections])
+        qkv_b = torch.cat([projection.bias for projection in projections])
+        q_cam, k_cam, v_cam = F.linear(x, qkv_w, qkv_b).chunk(3, dim=-1)
+    else:
+        # Adapter/quantized wrappers must run forward; .weight is only the base.
+        q_cam, k_cam, v_cam = (projection(x) for projection in projections)
 
     if token_valid_mask is not None:
         m = token_valid_mask.view(B, N, 1)

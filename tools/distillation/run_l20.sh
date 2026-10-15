@@ -45,12 +45,14 @@ with socket.socket() as sock:
 PY
 )"
 set +e
+export TTN_DMD_MEMORY_TRACE=1
 systemd-run --user --scope -p MemoryMax=360G -p MemorySwapMax=0 \
   "$WM_PYTHON" -m torch.distributed.run --nnodes=1 --nproc_per_node=2 \
   --master_addr=127.0.0.1 --master_port="$PORT" -m longlive2.train \
   --config_path "$CONFIG" --logdir "$RUN" --capacity-only \
   > "$RUN/capacity.log" 2>&1
 CAPACITY_EXIT=$?
+unset TTN_DMD_MEMORY_TRACE
 set -e
 printf '%s\n' "$CAPACITY_EXIT" > "$RUN/capacity.exit"
 if (( CAPACITY_EXIT != 0 )); then

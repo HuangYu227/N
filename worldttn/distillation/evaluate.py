@@ -40,27 +40,30 @@ def evaluate(trainer):
     root = t.output/f'eval-{t.counts["student"]:06d}'
     root.mkdir(exist_ok=True)
     results = []
+    student_name=f'student{t.config.student_steps}'
+    baseline_name=f'undistilled{t.config.student_steps}'
     for index in t.data.validation(t.config.validation_cases):
         batch,reference = t.data.batch(index,121)
         generator = torch.Generator(device=t.device).manual_seed(t.config.seed+index)
         noise = torch.randn(reference.shape,generator=generator,device=t.device)
         outputs, times = {},{}
-        for name,model,steps in [('teacher20',t.teacher,20),('undistilled8',t.teacher,8),
-                                  ('student8',t.models['student'],t.config.student_steps)]:
+        for name,model,steps in [('teacher20',t.teacher,20),(baseline_name,t.teacher,t.config.student_steps),
+                                  (student_name,t.models['student'],t.config.student_steps)]:
             cache = t.output/f'baseline-{index}-{name}.pt'
-            cached = [name!='student8' and cache.is_file() if t.rank==0 else None]
+            cached = [name!=student_name and cache.is_file() if t.rank==0 else None]
             dist.broadcast_object_list(cached,src=0,group=t.control)
             if cached[0]:
                 saved = torch.load(cache,map_location='cpu',weights_only=True)
                 outputs[name],times[name] = saved['latent'],saved['seconds']
             else:
                 torch.cuda.synchronize(); started = time.monotonic()
-                value,_ = Transactions(model,batch,checkpointed=False).generate(
-                    noise,steps,t.shift,t.config.cfg)
+                with torch.autocast('cuda',dtype=torch.bfloat16):
+                    value,_ = Transactions(model,batch,checkpointed=False).generate(
+                        noise,steps,t.shift,t.config.cfg)
                 torch.cuda.synchronize()
                 times[name] = time.monotonic()-started
                 outputs[name] = value.cpu()
-                if t.rank==0 and name!='student8':
+                if t.rank==0 and name!=student_name:
                     atomic_save({'latent':outputs[name],'seconds':times[name]},cache)
                 del value
             dist.barrier(group=t.control)
@@ -75,10 +78,11 @@ def evaluate(trainer):
                 vae.tile_sample_stride_num_frames = t.sana_config.vae.tile_sample_stride_num_frames
                 vae.tile_sample_min_num_frames = t.sana_config.vae.tile_sample_min_num_frames
             target = pixels(vae_decode(t.sana_config.vae.vae_type,vae,reference.to(t.device,dtype)))
+            reference_cpu=reference.cpu()
             for name,value in outputs.items():
                 decoded = pixels(vae_decode(t.sana_config.vae.vae_type,vae,value.to(t.device,dtype)))
                 metrics = image_metrics(decoded,target,t.device)
-                errors = (value-reference).square().mean((0,1,3,4)).numpy()
+                errors = (value-reference_cpu).square().mean((0,1,3,4)).numpy()
                 for segment,ids in segments(121).items(): metrics[segment]['latent_mse'] = float(errors[ids].mean())
                 metrics.update(seconds=times[name],fps=len(decoded)/times[name])
                 results.append({'case':t.data.dataset.dataset[index]['key'],'method':name,'metrics':metrics})
@@ -88,12 +92,15 @@ def evaluate(trainer):
         dist.barrier(group=t.control)
     result = [results if t.rank==0 else None]
     dist.broadcast_object_list(result,src=0,group=t.control)
-    current = [r['metrics'] for r in result[0] if r['method']=='student8']
+    current = [r['metrics'] for r in result[0] if r['method']==student_name]
     score = (sum(r['lpips'] for r in current)/len(current),
              sum(r['tail']['latent_mse'] for r in current)/len(current))
     if t.rank==0:
         atomic_json({'student_step':t.counts['student'],'score':score,
-                     'results':result[0]},root/'metrics.json')
+                     'results':result[0],
+                     'excluded_observed_latent_indices':[0],
+                     'excluded_observed_rgb_indices':[0],
+                     'raw_frames_per_episode':961},root/'metrics.json')
     return score,result[0]
 
 

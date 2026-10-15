@@ -1,0 +1,26 @@
+backend: ttn_state_ttt
+teacher: null  # launch_h100 pins an independently copied step300 snapshot.
+teacher_step: 300
+teacher_checkpoint_id: null
+teacher_sha256: null
+base_weights: null
+sana_config: configs/worldttn/sana_teacher_single_gpu.yaml
+dataset_root: null
+world_size: 1
+physical_gpus: '5'
+required_gpu: H100
+gradient_accumulation: 2
+gpu_budget_gib: 70
+gpu_headroom_gib: 8
+capacity_long_cycles: 2
+seed: 3407
+student_steps: 8
+target_updates: 500
+critic_ratio: 5
+cfg: 4.5
+lora_rank: 128
+lr_student: 1e-5
+lr_fake: 2e-6
+validation_cases: 1
+wandb_entity: 3193513478-
+wandb_project: WorldTTN-Distill

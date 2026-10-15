@@ -1,4 +1,13 @@
-# Step-200 StateTTT / LongLive 2.0 distillation
+# StateTTT / LongLive 2.0 distillation: L20 step200 and H100 step300
+
+The H100 single-GPU5 recipe and complete launch/recovery instructions are in
+tools/distillation/H100_README.txt. It pins step300, uses effective batch2 via
+two sequential full-episode microbatches, and requires single-rank CUDA tests
+and independent 25/61/121-latent capacity acceptance before its formal500/2500
+updates. The teacher step/hash, GPU mapping, world size, actual byte budget,
+accumulation and code identity are configuration-bound, not L20 constants.
+Capacity and formal outputs are separate; initial capacity updates are discarded.
+The existing step200 two-GPU L20 configuration remains available below.
 
 This backend keeps the H100 step-200 TLA and StateTTT state equations. LongLive
 2.0 supplies the alternating DMD objective and score-distillation schedule;
@@ -26,6 +35,27 @@ recovery bundle. The enclosing cgroup caps total RAM at 360GiB and disables
 swap; PyTorch is capped near 40GiB per card. Saved activations use uncompressed
 pageable CPU storage. All failures leave a terminal status and log, and never
 advance to the next phase silently.
+
+All three roles use native FSDP2 pageable CPU parameter offload; student and
+fake-score optimizer states also reside on CPU. Clipping reduces a CUDA scalar
+under NCCL, and adapter export stages one tensor at a time for the CUDA gather.
+Fake-score noisy prediction and clean writes use separate
+checkpoints, so rebuilding clean history does not also replay an unused noisy
+prediction. Both retain the original history gradients. Replayed FSDP2 modules explicitly call the public
+`unshard()` API before their normal forward hooks: recurrent reuse can revisit
+a resharded module while FSDP2 still marks it as pre-backward. No internal FSDP
+state, parameter dtype, state equation or gradient is changed.
+
+Camera Q/K/V projections preserve their original fused fast path for plain
+Linear modules. Adapter wrappers run their own forwards so the base-weight
+fusion cannot bypass LoRA. Capacity acceptance rejects missing camera LoRA
+gradients as well as missing StateTTT gradients.
+
+GDN beta, decay and output gate methods also preserve adapter forwards rather
+than reading only base weights in their compiled helpers. Plain Linear paths
+are unchanged. Acceptance now rejects every missing selected LoRA gradient,
+including these 90 tensors across the15 GDN blocks. The frozen full-DiT
+teacher is unaffected; this correction applies to the distillation adapters.
 
 The active run is recorded in
 `/home/newuser001/huangyu/.worldttt-experiment/current.json`. Within its
@@ -64,3 +94,15 @@ Current L20 validation is recorded in the run logs. CPU unit tests establish
 the sigma/CFG math, DMD direction/mask, LoRA initialization, temporal gradient,
 recomputation and single-rank exact restore. A separate two-rank capacity and
 resume acceptance is required before any claim about full-length training.
+
+`tests/ttn/test_distillation_fsdp.py` runs under two CUDA torchrun ranks. It
+reproduces the recurrent nested-checkpoint failure, compares outputs, averaged
+gradients and consecutive updates with an unsharded model, checks CPU-offload
+clipping, adapter export and exact next-update recovery, and tests real tiny TTN blocks with LoRA, all ten
+StateTTT tensors, clean-state hooks and pageable activation snapshots:
+
+```bash
+CUDA_VISIBLE_DEVICES=6,7 OMP_NUM_THREADS=1 python -m torch.distributed.run \
+  --nnodes=1 --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=39821 \
+  -m pytest -q tests/ttn/test_distillation_fsdp.py
+```

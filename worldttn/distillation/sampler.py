@@ -1,5 +1,6 @@
 """Pure chunk transactions: every solver step and clean write remains differentiable."""
 from dataclasses import dataclass
+import os
 import torch
 
 from worldttn.core import ANCHORS
@@ -134,14 +135,15 @@ class Transactions:
                     if start == 0:
                         latent = torch.cat((self.batch['initial_latent'],latent[:,:,1:]),2)
                 outgoing,stats = self.commit(session,context,latent,incoming.cache,start,end)
-                if not _RECOMPUTING.get():
+                if self.collect and not _RECOMPUTING.get():
                     local_records = [dict(chunk=index,start=start,end=end,anchors=stats,
                                           local=query_records[-1] if query_records else {},
-                                          state=outgoing.state.detach())]
+                                          state=outgoing.state.detach().cpu())]
                 return latent,outgoing,local_records
             latent,snapshot,records = checkpoint_tree(chunk,(noise[:,:,start:end],snapshot),
                 enabled=self.checkpointed,cpu_inputs=(1,) if noise.is_cuda else ())
             outputs.append(latent);self.records.extend(records)
+            self.records=self.records[-5:]
         result = torch.cat(outputs,2)
         if not torch.equal(result[:,:,:1],self.batch['initial_latent']):
             raise RuntimeError('Observed initial latent changed')
@@ -155,18 +157,43 @@ class Transactions:
         snapshot = self.prefill()
         predictions = []
         for start,end in chunk_ranges(self.frames):
-            def chunk(x,clean,incoming,*,start=start,end=end):
+            def predict(x,incoming,*,start=start,end=end):
+                trace = _RECOMPUTING.get() and os.environ.get('TTN_DMD_MEMORY_TRACE') == '1'
+                if trace:
+                    print(f'[TTN DMD memory] rank={os.environ.get("RANK")} chunk={start}:{end} '
+                          f'phase=predict_begin allocated_gib={torch.cuda.memory_allocated(x.device)/2**30:.3f}',
+                          flush=True)
                 session = self.session(incoming,start)
                 context = session.begin_chunk(start,end)
                 t = sigma[:,None,start:end]*1000
                 if start == 0:
                     x = torch.cat((self.batch['initial_latent'],x[:,:,1:]),2)
                     t = t.clone();t[:,:,0] = 0
-                v,_ = session.forward(x,t,self.y,context,incoming.cache,start,end,
+                v,_=session.forward(x,t,self.y,context,incoming.cache,start,end,
                     self.mask,self.batch.get('data_info'),noise_sigma=t/1000)
+                if trace:
+                    print(f'[TTN DMD memory] rank={os.environ.get("RANK")} chunk={start}:{end} '
+                          f'phase=predict_end allocated_gib={torch.cuda.memory_allocated(x.device)/2**30:.3f}',
+                          flush=True)
+                return v
+            def commit_clean(clean,incoming,*,start=start,end=end):
+                trace = _RECOMPUTING.get() and os.environ.get('TTN_DMD_MEMORY_TRACE') == '1'
+                if trace:
+                    print(f'[TTN DMD memory] rank={os.environ.get("RANK")} chunk={start}:{end} '
+                          f'phase=commit_begin allocated_gib={torch.cuda.memory_allocated(clean.device)/2**30:.3f}',
+                          flush=True)
+                session=self.session(incoming,start)
+                context=session.begin_chunk(start,end)
                 outgoing,_ = self.commit(session,context,clean,incoming.cache,start,end)
-                return v,outgoing
-            value,snapshot = checkpoint_tree(chunk,(noisy[:,:,start:end],history[:,:,start:end],snapshot),
-                enabled=self.checkpointed,cpu_inputs=(2,) if noisy.is_cuda else ())
+                if trace:
+                    print(f'[TTN DMD memory] rank={os.environ.get("RANK")} chunk={start}:{end} '
+                          f'phase=commit_end allocated_gib={torch.cuda.memory_allocated(clean.device)/2**30:.3f}',
+                          flush=True)
+                return outgoing
+            incoming=snapshot
+            value=checkpoint_tree(predict,(noisy[:,:,start:end],incoming),
+                enabled=self.checkpointed,cpu_inputs=(1,) if noisy.is_cuda else ())
+            snapshot=checkpoint_tree(commit_clean,(history[:,:,start:end],incoming),
+                enabled=self.checkpointed,cpu_inputs=(1,) if noisy.is_cuda else ())
             predictions.append(value)
         return torch.cat(predictions,2)

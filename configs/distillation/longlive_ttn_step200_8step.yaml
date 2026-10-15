@@ -1,5 +1,13 @@
 backend: ttn_state_ttt
 teacher: /home/newuser001/huangyu/WorldTLA/checkpoints/h100-state-ttt/last.pt
+teacher_step: 200
+teacher_checkpoint_id: 11199e5c315b44e69eb381953e31f484
+teacher_sha256: aa8bfc12706ee0890bd94b7fc1227396fee0e62e169cc19f9b7280b87d967f56
+world_size: 2
+physical_gpus: '6,7'
+gradient_accumulation: 1
+gpu_budget_gib: 40
+gpu_headroom_gib: 4
 base_weights: /home/newuser001/.cache/huggingface/hub/models--Efficient-Large-Model--SANA-WM_chunk_causal/snapshots/ef7ea10f5e5213e5e1af41587961cb7293369e83/dit/sana_wm_chunk_causal_1600m_720p.safetensors
 sana_config: configs/worldttn/sana_teacher_single_gpu.yaml
 dataset_root: /home/newuser001/huangyu/WorldTTT/datasets/sana-wm-example

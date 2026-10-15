@@ -17,6 +17,13 @@ def local(value):
     return value.to_local() if hasattr(value, 'to_local') else value
 
 
+def tensor_bytes(value):
+    if isinstance(value,torch.Tensor): return value.numel()*value.element_size()
+    if isinstance(value,dict): return sum(tensor_bytes(item) for item in value.values())
+    if isinstance(value,(tuple,list)): return sum(tensor_bytes(item) for item in value)
+    return 0
+
+
 class EMA:
     """LongLive's FP32 EMA rule, restricted to FSDP2 trainable local shards."""
     def __init__(self, model, decay=.99):
@@ -64,6 +71,9 @@ def save(folder, models, optimizers, ema, counts, identity, control=None):
     path = bundle/f'rank-{rank:02d}.pt'
     error = None
     try:
+        required=int(1.2*tensor_bytes(state))+2*2**30
+        if shutil.disk_usage(bundle).free < required:
+            raise RuntimeError(f'Insufficient checkpoint space: need {required} free bytes')
         atomic_save(state,path)
         receipt = {'name':path.name, 'sha256':digest(path), 'bytes':path.stat().st_size}
     except Exception as exc:
@@ -133,7 +143,12 @@ def export_best(path, models, identity, counts, metrics):
     for role, model in models.items():
         weights[role] = {}
         for name,param in parameters(model).items():
-            full = param.full_tensor() if hasattr(param,'full_tensor') else param
+            if hasattr(param,'full_tensor'):
+                # NCCL gathers require CUDA even when parameter shards are offloaded.
+                staged = param.to(torch.device('cuda',torch.cuda.current_device())) if param.device.type == 'cpu' else param
+                full = staged.full_tensor()
+            else:
+                full = param
             if rank==0: weights[role][name] = full.detach().cpu()
     if rank==0:
         atomic_save({'format':'TTN-DMD-adapters-v1','identity':identity,'counts':counts,

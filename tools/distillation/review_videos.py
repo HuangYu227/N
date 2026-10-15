@@ -1,4 +1,4 @@
-"""Two-rank, fixed-input 30/60-second review of a completed eight-step run."""
+"""Fixed-input 30/60-second review using the run's one/two-rank recipe."""
 import argparse
 from dataclasses import replace
 from datetime import timedelta
@@ -19,6 +19,7 @@ from worldttn.distillation.adapters import install, load_adapter_weights, shard
 from worldttn.distillation.checkpoint import digest
 from worldttn.distillation.data import Data
 from worldttn.distillation.sampler import Transactions
+from worldttn.distillation.recipe import teacher_identity, allocation_budget
 from worldttn.performance import configure_execution
 from worldttn.sana import build_sana, configure_cross_attention, load_sana_config
 
@@ -53,7 +54,7 @@ def build_role(sana, ttn, base, teacher_path, weights, rank):
         install(model, 128)
         load_adapter_weights(model, weights)
     model.eval().requires_grad_(False)
-    shard(model)
+    shard(model,cpu_offload=True)
     return model
 
 
@@ -91,25 +92,31 @@ def render(videos, sana, root, rank):
 
 
 def review(run):
-    if os.environ.get('CUDA_VISIBLE_DEVICES') != '6,7' or int(os.environ.get('WORLD_SIZE', '0')) != 2:
-        raise ValueError('Review requires two FSDP2 ranks on physical GPU 6 and 7')
     run = Path(run).resolve()
-    if json.loads((run/'status.json').read_text())['status'] != 'completed':
+    deployment=run if (run/'launch.json').is_file() else run.parent
+    if json.loads((deployment/'status.json').read_text())['status'] != 'completed':
         raise ValueError('Complete the eight-step training before video review')
-    launch = json.loads((run/'launch.json').read_text())
+    launch = json.loads((deployment/'launch.json').read_text())
+    if not (run/'best-adapters.pt').is_file() and (run/'training/best-adapters.pt').is_file():
+        run=run/'training'
     config_path = Path(launch['config'])
     if digest(config_path) != launch['config_sha256']:
         raise ValueError('Training config changed after launch')
     config = OmegaConf.load(config_path)
+    if (int(os.environ.get('WORLD_SIZE','0'))!=config.get('world_size',2)
+            or os.environ.get('CUDA_VISIBLE_DEVICES')!=str(config.get('physical_gpus','6,7'))):
+        raise ValueError('Review GPU mapping and rank count must match training')
     if config.student_steps != 8:
         raise ValueError('Review expects the completed eight-step stage')
     rank = int(os.environ['LOCAL_RANK'])
     torch.cuda.set_device(rank)
-    if torch.cuda.mem_get_info(rank)[0] < 43*(1 << 30):
-        raise RuntimeError(f'GPU {6+rank} needs at least 43GiB free before video review')
+    total=torch.cuda.get_device_properties(rank).total_memory
+    budget=allocation_budget(total,config.get('gpu_budget_gib',40),config.get('gpu_headroom_gib',4))
+    if torch.cuda.mem_get_info(rank)[0] < budget+3*2**30:
+        raise RuntimeError('GPU needs its configured budget plus 3GiB free before review')
     dist.init_process_group('nccl', timeout=timedelta(hours=6))
     control = dist.new_group(backend='gloo', timeout=timedelta(hours=6))
-    torch.cuda.set_per_process_memory_fraction(40*1024/46068, rank)
+    torch.cuda.set_per_process_memory_fraction(budget/total, rank)
     root = run/'review-videos'
     root.mkdir(exist_ok=True)
     best_path = run/'best-adapters.pt'
@@ -122,9 +129,8 @@ def review(run):
     base = Path(config.base_weights)
     if best['format'] != 'TTN-DMD-adapters-v1' or best['identity']['checkpoint_sha256'] != digest(teacher_path):
         raise ValueError('Best adapter and teacher identity disagree')
-    checkpoint = torch.load(teacher_path, map_location='cpu', weights_only=False, mmap=True)
-    if checkpoint['step'] != 200 or checkpoint['distributed']['checkpoint_id'] != '11199e5c315b44e69eb381953e31f484':
-        raise ValueError('Expected fixed H100 step200 teacher')
+    checkpoint,_=teacher_identity(teacher_path,config.teacher_step,
+                                  config.teacher_sha256,config.teacher_checkpoint_id)
     if checkpoint['base_sha256'] != digest(base) or best['identity']['base_sha256'] != checkpoint['base_sha256']:
         raise ValueError('SANA base identity changed')
     sana = training_config(config, checkpoint, config.dataset_root)

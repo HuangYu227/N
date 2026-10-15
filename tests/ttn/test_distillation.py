@@ -12,6 +12,7 @@ from worldttn.distillation.data import split, video_id
 from worldttn.distillation.adapters import install, optimizer, parameters, clip_grad, load_adapter_weights
 from worldttn.distillation.checkpoint import EMA, save, restore
 from worldttn.distillation.evaluate import phase4_gate, video_review_ready
+from worldttn.training import chunk_ranges, activation_storage
 
 
 def test_extensionless_hf_safetensors_blob(tmp_path):
@@ -34,7 +35,8 @@ def test_stage4_requires_video_review_and_both_quality_gates():
     assert not phase4_gate(rows[:-1]+[dict(rows[-1],metrics={**student,'fps':1.})],True)
 
 
-def test_stage4_preparation_checks_review_and_metrics(tmp_path, monkeypatch):
+@pytest.mark.parametrize('recorded_config',[False,True])
+def test_stage4_preparation_checks_review_and_metrics(tmp_path, monkeypatch,recorded_config):
     import json
     from omegaconf import OmegaConf
     from tools.distillation import prepare_stage4
@@ -44,6 +46,11 @@ def test_stage4_preparation_checks_review_and_metrics(tmp_path, monkeypatch):
     config.write_text('backend: ttn_state_ttt\nstudent_steps: 8\n')
     monkeypatch.setattr(prepare_stage4,'ROOT',root)
     eight = tmp_path/'eight'; eight.mkdir()
+    if recorded_config:
+        deployed=eight/'config.yaml'
+        deployed.write_text('backend: ttn_state_ttt\nstudent_steps: 8\nteacher_step: 300\nworld_size: 1\ncapacity_proof: /old/proof\n')
+        (eight/'launch.json').write_text(json.dumps({'config':str(deployed),
+            'config_sha256':prepare_stage4.sha256(deployed)}))
     best = eight/'best-adapters.pt'
     torch.save({'counts':{'student':25}},best)
     review = tmp_path/'review.json'
@@ -72,6 +79,10 @@ def test_stage4_preparation_checks_review_and_metrics(tmp_path, monkeypatch):
     staged = prepare_stage4.prepare(eight,review)
     assert OmegaConf.load(staged).student_steps == 4
     assert OmegaConf.load(staged).stage4_source == str(best)
+    if recorded_config:
+        assert OmegaConf.load(staged).teacher_step==300
+        assert OmegaConf.load(staged).world_size==1
+        assert 'capacity_proof' not in OmegaConf.load(staged)
 
 
 def make_case(model):
@@ -132,12 +143,61 @@ def test_lora_zero_and_temporal_credit(sequence_model):
     assert written[0].grad is not None and written[0].grad.norm()>0
     assert all(p.grad is not None and p.grad.norm()>0 for n,p in parameters(model).items() if '.state_ttt.' in n)
     assert any(p.grad is not None and p.grad.norm()>0 for n,p in parameters(model).items() if 'lora_B' in n)
+    camera_adapters = [p for n,p in parameters(model).items()
+                       if any(part in n for part in ('q_proj_cam.', 'k_proj_cam.', 'v_proj_cam.'))
+                       and 'lora_B' in n]
+    assert camera_adapters and all(p.grad is not None and p.grad.norm()>0 for p in camera_adapters)
     handle.remove()
     # A separate role cannot retain or mutate the generator's S/cache.
     before = state.state.detach().clone()
     other = copy.deepcopy(model)
     Transactions(other,batch,checkpointed=False).score(output.detach(),torch.full((1,7),.5),output.detach())
     torch.testing.assert_close(state.state,before,rtol=0,atol=0)
+
+
+@pytest.mark.parametrize('device', ['cpu', 'cuda'])
+def test_split_score_checkpoint_matches_reference_and_gradients(sequence_model, device):
+    if device == 'cuda' and not torch.cuda.is_available():
+        pytest.skip('requires CUDA')
+    model,batch,noise=make_case(sequence_model)
+    model=model.to(device)
+    batch={key:value.to(device) if isinstance(value,torch.Tensor) else value for key,value in batch.items()}
+    noise=noise.to(device)
+    install(model,2)
+    reference=copy.deepcopy(model)
+    history=noise.detach().clone()
+    sigma=torch.full((1,7),.5,device=device)
+    sigma[:,0]=0
+
+    # Separate noisy/clean checkpoints must preserve the fused reference
+    # transaction's outputs and cross-chunk credit.
+    fused=Transactions(reference,batch,checkpointed=False)
+    fused.y=batch['y']
+    snapshot=fused.prefill()
+    expected=[]
+    for start,end in chunk_ranges(7):
+        session=fused.session(snapshot,start)
+        context=session.begin_chunk(start,end)
+        x=noise[:,:,start:end]
+        t=sigma[:,None,start:end]*1000
+        if start==0:
+            x=torch.cat((batch['initial_latent'],x[:,:,1:]),2)
+            t=t.clone();t[:,:,0]=0
+        velocity,_=session.forward(x,t,fused.y,context,snapshot.cache,start,end,
+            fused.mask,batch.get('data_info'),noise_sigma=t/1000)
+        snapshot,_=fused.commit(session,context,history[:,:,start:end],snapshot.cache,start,end)
+        expected.append(velocity)
+    expected=torch.cat(expected,2)
+    with activation_storage('cpu-pageable',device=device):
+        actual=Transactions(model,batch,checkpointed=True).score(noise,sigma,history)
+    torch.testing.assert_close(actual,expected,rtol=0,atol=0)
+    expected.square().mean().backward()
+    with activation_storage('cpu-pageable',device=device):
+        actual.square().mean().backward()
+    for name,p in parameters(model).items():
+        q=parameters(reference)[name]
+        if p.grad is None: assert q.grad is None
+        else: torch.testing.assert_close(p.grad,q.grad,rtol=1e-5,atol=1e-8)
 
 
 def test_stage4_transfers_lora_and_state_ttt_weights(sequence_model):
