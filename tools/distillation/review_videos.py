@@ -24,7 +24,10 @@ from worldttn.sana import build_sana, configure_cross_attention, load_sana_confi
 
 
 def training_config(config, checkpoint, dataset_root):
-    sana = load_sana_config(config.sana_config)
+    source = Path(config.sana_config)
+    if not source.is_absolute():
+        source = Path(__file__).resolve().parents[2]/source
+    sana = load_sana_config(str(source))
     original = checkpoint['distributed']['training_config']
     for destination, source in (('model', 'sana_model'), ('text_encoder', 'text_encoder'),
                                 ('scheduler', 'scheduler'), ('data', 'data')):

@@ -112,7 +112,11 @@ def restore(folder, models, optimizers, ema, identity):
                 continue  # The frozen teacher has neither trainable tensors nor optimizer.
             opt = optimizers[role]
             saved = state['optimizer'][role]
+            if len(opt.param_groups) != len(saved['param_groups']):
+                raise ValueError('Optimizer group count changed')
             for group,stored in zip(opt.param_groups,saved['param_groups']):
+                if group['name'] != stored['name'] or len(group['params']) != len(stored['params']):
+                    raise ValueError('Optimizer group schema changed')
                 for p,index in zip(group['params'],stored['params']):
                     if index in saved['state']:
                         saved['state'][index] = _unpack(saved['state'][index],p)
