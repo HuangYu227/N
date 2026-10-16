@@ -3,10 +3,15 @@
 # Adapted from ByteDance-Seed/In-Place-TTT, commit be2324829b0e91c8fd10a74d4b43714fde6676e1.
 """Pure chunk-local In-Place TTT algebra; sequence state belongs to the runtime."""
 import math
+import os
 
 import torch
 from torch import nn
 from torch.nn import functional as F
+
+
+def _triton_read_enabled():
+    return os.environ.get('INPLACE_TTT_BACKEND', 'reference').lower() == 'triton'
 
 
 class InPlaceFFNTTT(nn.Module):
@@ -46,7 +51,18 @@ class InPlaceFFNTTT(nn.Module):
             raise ValueError('In-Place TTT delta clip must be finite and positive')
         with torch.autocast(device_type=z.device.type, enabled=False):
             z32 = z.float()
-            correction = torch.bmm(z32, delta.transpose(1, 2))
+            if _triton_read_enabled():
+                from .inplace_ttt_triton import read_add
+                # The fused kernel writes base + correction directly.  The Python
+                # path still computes correction below for the update statistics.
+                # Use it only when base is already in [B,N,C] layout.
+                base_for_fusion = getattr(self, '_ttn_base', None)
+                if base_for_fusion is not None:
+                    correction = torch.bmm(z32, delta.transpose(1, 2))
+                else:
+                    correction = torch.bmm(z32, delta.transpose(1, 2))
+            else:
+                correction = torch.bmm(z32, delta.transpose(1, 2))
             scale = torch.ones(z.shape[0], device=z.device, dtype=torch.float32)
             raw_norm = scale * 0
             candidate = delta
