@@ -27,7 +27,7 @@ if triton is not None:
                         mask=(n < N)[:, None] & (h < H)[None, :], other=0.0)
             d = tl.load(delta_ptr + b * sdb + c[:, None] * sdc + h[None, :] * sdh,
                         mask=(c < C)[:, None] & (h < H)[None, :], other=0.0)
-            acc += tl.dot(z, tl.trans(d))
+            acc += tl.sum(z.to(tl.float32) * d.to(tl.float32)[None, :], axis=1)
         base = tl.load(base_ptr + b * sbb + n[:, None] * sbn + c[None, :] * sbc,
                        mask=(n < N)[:, None] & (c < C)[None, :], other=0.0).to(tl.float32)
         tl.store(out_ptr + b * sob + n[:, None] * son + c[None, :] * soc,
