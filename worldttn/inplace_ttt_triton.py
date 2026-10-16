@@ -1,45 +1,37 @@
-"""Optional Triton backend for SANA-WM In-Place FFN TTT."""
-from __future__ import annotations
-import torch
-try:
-    import triton
-    import triton.language as tl
-except Exception:
-    triton = None
-    tl = None
-
-def available() -> bool:
-    return triton is not None and torch.cuda.is_available()
-
 if triton is not None:
     @triton.autotune(
         configs=[
-            triton.Config({"BLOCK_N": 64, "BLOCK_H": 64}, num_warps=4, num_stages=2),
-            triton.Config({"BLOCK_N": 128, "BLOCK_H": 64}, num_warps=4, num_stages=2),
-            triton.Config({"BLOCK_N": 128, "BLOCK_H": 128}, num_warps=8, num_stages=3),
+            triton.Config({"BLOCK_N": 64, "BLOCK_C": 64, "BLOCK_H": 64}, num_warps=4, num_stages=2),
+            triton.Config({"BLOCK_N": 128, "BLOCK_C": 64, "BLOCK_H": 64}, num_warps=4, num_stages=2),
+            triton.Config({"BLOCK_N": 128, "BLOCK_C": 128, "BLOCK_H": 128}, num_warps=8, num_stages=3),
         ], key=["N", "H", "C"])
     @triton.jit
     def _read_add_kernel(
         z_ptr, delta_ptr, base_ptr, out_ptr, B, N, C, H,
         szb, szn, szh, sdb, sdc, sdh, sbb, sbn, sbc, sob, son, soc,
-        BLOCK_N: tl.constexpr, BLOCK_H: tl.constexpr,
+        BLOCK_N: tl.constexpr, BLOCK_C: tl.constexpr, BLOCK_H: tl.constexpr,
     ):
         pid = tl.program_id(0)
-        c = pid % C
-        bn = pid // C
-        b = bn // tl.cdiv(N, BLOCK_N)
-        n0 = (bn % tl.cdiv(N, BLOCK_N)) * BLOCK_N
-        n = n0 + tl.arange(0, BLOCK_N)
-        acc = tl.zeros((BLOCK_N,), tl.float32)
+        ntiles = tl.cdiv(N, BLOCK_N)
+        ctiles = tl.cdiv(C, BLOCK_C)
+        b = pid // (ntiles * ctiles)
+        rem = pid % (ntiles * ctiles)
+        pn = rem // ctiles
+        pc = rem % ctiles
+        n = pn * BLOCK_N + tl.arange(0, BLOCK_N)
+        c = pc * BLOCK_C + tl.arange(0, BLOCK_C)
+        acc = tl.zeros((BLOCK_N, BLOCK_C), tl.float32)
         for hs in tl.range(0, tl.cdiv(H, BLOCK_H)):
             h = hs * BLOCK_H + tl.arange(0, BLOCK_H)
             z = tl.load(z_ptr + b * szb + n[:, None] * szn + h[None, :] * szh,
                         mask=(n < N)[:, None] & (h < H)[None, :], other=0.0)
-            d = tl.load(delta_ptr + b * sdb + c * sdc + h * sdh,
-                        mask=h < H, other=0.0)
-            acc += tl.sum(z * d[None, :], axis=1)
-        base = tl.load(base_ptr + b * sbb + n * sbn + c * sbc, mask=n < N, other=0.0).to(tl.float32)
-        tl.store(out_ptr + b * sob + n * son + c * soc, base + acc, mask=n < N)
+            d = tl.load(delta_ptr + b * sdb + c[:, None] * sdc + h[None, :] * sdh,
+                        mask=(c < C)[:, None] & (h < H)[None, :], other=0.0)
+            acc += tl.dot(z, tl.trans(d))
+        base = tl.load(base_ptr + b * sbb + n[:, None] * sbn + c[None, :] * sbc,
+                       mask=(n < N)[:, None] & (c < C)[None, :], other=0.0).to(tl.float32)
+        tl.store(out_ptr + b * sob + n[:, None] * son + c[None, :] * soc,
+                 base + acc, mask=(n < N)[:, None] & (c < C)[None, :])
 
     @triton.autotune(
         configs=[
@@ -81,7 +73,7 @@ def read_add(z, delta, base):
     B, N, H = z.shape
     C = delta.shape[1]
     out = torch.empty_like(base)
-    grid = (B * C * triton.cdiv(N, 128),)
+    grid = (B * triton.cdiv(N, 128) * triton.cdiv(C, 128),)
     _read_add_kernel[grid](
         z, delta, base, out, B, N, C, H,
         z.stride(0), z.stride(1), z.stride(2),
