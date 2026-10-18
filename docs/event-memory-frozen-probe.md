@@ -31,18 +31,20 @@ confound but do not equalize each head's effect after gating/projection. A laten
 MSE benefit is not proof of improved RGB or long-video quality. The mismatched
 control still uses valid history from the same forest.
 
-The protocol needs one capture plus twelve truncated rollouts. Two worker
-processes reuse their loaded model: GPU4 handles content/initial, GPU5 handles
-recent/shuffled. Each sees one GPU, uses a 32GiB PyTorch allocation cap, and checks
-at least40GiB free before loading. This is not a driver-level memory partition.
-Main training on GPUs6/7 is outside this diagnostic.
+The protocol needs one capture plus twelve truncated rollouts. In the current
+deployment, both workers share physical GPU5: workerA handles content/initial,
+workerB handles recent/shuffled. Each reuses its loaded model, sees one GPU,
+uses a 32GiB PyTorch allocation cap and checks at least40GiB free before loading.
+The launcher waits for capture to release memory and requires72GiB free before
+starting both workers. This is not a driver-level memory partition. GPU4 is
+reserved for another task; main training on GPUs6/7 is outside this diagnostic.
 
 Example after CPU/CUDA checks, with physical GPU restrictions set by the launcher:
 
 ```bash
-CUDA_VISIBLE_DEVICES=4 python tools/ttn_event_memory_probe.py capture \
+CUDA_VISIBLE_DEVICES=5 python tools/ttn_event_memory_probe.py capture \
   --reference-root /path/to/original/completed/forest-protocol --output /new/probe
-CUDA_VISIBLE_DEVICES=4 python tools/ttn_event_memory_probe.py worker \
+CUDA_VISIBLE_DEVICES=5 python tools/ttn_event_memory_probe.py worker \
   --output /new/probe --policies content initial
 CUDA_VISIBLE_DEVICES=5 python tools/ttn_event_memory_probe.py worker \
   --output /new/probe --policies recent shuffled
