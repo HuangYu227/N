@@ -39,19 +39,23 @@ The launcher waits for capture to release memory and requires72GiB free before
 starting both workers. This is not a driver-level memory partition. GPU4 is
 reserved for another task; main training on GPUs6/7 is outside this diagnostic.
 
+Measured on this run, two concurrent GPU5 workers each took about18.7s/chunk;
+a brief single-worker interval took about5.85s/chunk. Therefore the deployment
+staggers their compute, preserving both loaded models and progress. A dedicated
+controller resumes workerB near workerA's last chunk, with exit/timeout/error
+release paths. Two resident models do not imply a throughput advantage.
+
 Example after CPU/CUDA checks, with physical GPU restrictions set by the launcher:
 
 ```bash
 CUDA_VISIBLE_DEVICES=5 python tools/ttn_event_memory_probe.py capture \
   --reference-root /path/to/original/completed/forest-protocol --output /new/probe
 CUDA_VISIBLE_DEVICES=5 python tools/ttn_event_memory_probe.py worker \
-  --output /new/probe --policies content initial
-CUDA_VISIBLE_DEVICES=5 python tools/ttn_event_memory_probe.py worker \
-  --output /new/probe --policies recent shuffled
+  --output /new/probe --policies content initial recent shuffled
 python tools/ttn_event_memory_probe.py summarize --output /new/probe
 ```
 
-The two worker commands may run in parallel after capture passes. The output must
-be new; existing probe results are never overwritten. Source, checkpoint, input,
+The portable example uses one GPU5 worker for all policies after capture passes.
+The output must be new; existing probe results are never overwritten. Source, checkpoint, input,
 noise and frozen-direction hashes are pinned. Capture and individual probes write
 status files; successful capture alone does not mean all twelve probes finished.
