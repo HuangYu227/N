@@ -189,7 +189,10 @@ def train_update(model, config, batch, optimizer, k, parallel=None, *, activatio
 
 @torch.no_grad()
 def rollout(model, config, batch, steps=4, cfg_scale=4.5, cached_blocks=-1, *, initial_noise=None, on_chunk=None,
-            ttn_ablation="full", state_diagnostics=False, history_reference=None, on_state=None):
+            ttn_ablation="full", state_diagnostics=False, history_reference=None, on_state=None,
+            memory_options=None):
+    if memory_options is not None and memory_options.active and history_reference is not None:
+        raise ValueError("event memory requires generated history; ground-truth history is unsupported")
     from diffusion.scheduler.self_forcing_flow_euler_sampler import SelfForcingFlowEulerCamCtrl
     initial = batch.get("initial_latent")
     if initial is None: initial = batch["clean_latents"][:, :, :1]
@@ -213,7 +216,7 @@ def rollout(model, config, batch, steps=4, cfg_scale=4.5, cached_blocks=-1, *, i
     extras = {"chunk_plucker": batch["chunk_plucker"]} if "chunk_plucker" in batch else {}
     session = TTNSession(model, batch["camera_conditions"], batch["width"], batch["height"],
                          batch.get("frame_valid_mask"), extras, ablation=ttn_ablation,
-                         diagnostics=state_diagnostics) if hasattr(model, "ttn_system") else None
+                         diagnostics=state_diagnostics, memory_options=memory_options) if hasattr(model, "ttn_system") else None
     from .session import repeat_batch
     cfg_batch = initial.shape[0] * (2 if cfg_scale > 1 else 1)
     camera = repeat_batch(batch["camera_conditions"], cfg_batch).clone()
@@ -292,7 +295,7 @@ def timed_cuda(call):
     }
 
 
-def _dataset_batch(raw, config, args, tokenizer=None, encoder=None, encoder_device=None):
+def _dataset_batch(raw, config, args, tokenizer=None, encoder=None, encoder_device=None, text_encode=None):
     from train_video_scripts.train_sana_wm_stage1 import _extract_batch, _encode_prompts
     clean, y, mask, info, camera, plucker = _extract_batch(
         raw, args.device, torch.float32, config.data.load_text_feat,
@@ -302,7 +305,8 @@ def _dataset_batch(raw, config, args, tokenizer=None, encoder=None, encoder_devi
         unconditional = bool(torch.rand(()).item() < probability) if probability else False
         if unconditional: y = [""] * len(y)
         with torch.no_grad():
-            y, mask = _encode_prompts(y, tokenizer, encoder, config, encoder_device)
+            y, mask = (text_encode(tuple(y)) if text_encode is not None else
+                       _encode_prompts(y, tokenizer, encoder, config, encoder_device))
         y, mask = y.to(args.device), mask.to(args.device)
     if camera is None: raise ValueError("TTN training requires camera_conditions from dataset")
     batch = {"clean_latents": clean, "y": y, "mask": mask,
@@ -450,7 +454,8 @@ def train_command(args):
             raise ValueError("unfreeze requires a separate output directory")
         validate_unfreeze_checkpoint(payload, mode, world, identity)
     if args.resume and payload.get("distributed"):
-        resume_execution = validate_training_checkpoint(payload, mode, world, identity, benchmark=benchmark_run(args))
+        resume_execution = validate_training_checkpoint(payload, mode, world, identity,
+            benchmark=benchmark_run(args), migrate_single_to_ddp=getattr(args, "resume_single_to_ddp", False))
     elif args.resume and mode != "single":
         raise ValueError("multi-GPU resume requires optimizer shards; use --adapter without --resume for initialization")
     if payload:
@@ -479,6 +484,7 @@ def train_command(args):
     stream = None
     tokenizer = encoder = None
     encoder_device = None
+    text_encode = None
     if args.batch_file:
         bundle_path = args.batch_file.replace("{rank}", str(rank))
         batch = load_bundle(bundle_path, args.device)
@@ -497,12 +503,18 @@ def train_command(args):
             if encoder_device == "cuda": encoder_device = args.device
             tokenizer, encoder = get_tokenizer_and_text_encoder(config.text_encoder.text_encoder_name, encoder_device)
             encoder.eval().requires_grad_(False)
+            cache_size = getattr(args, "text_feature_cache_size", 0)
+            if cache_size:
+                from .text_cache import frozen_text_cache
+                from train_video_scripts.train_sana_wm_stage1 import _encode_prompts
+                text_encode = frozen_text_cache(encoder, lambda prompts: _encode_prompts(
+                    prompts, tokenizer, encoder, config, encoder_device), cache_size)
     seed_everything(args.seed + rank)
     if args.resume:
         args._failure_phase = "checkpoint-restore"
         if payload.get("distributed"):
             step, cursor = restore_training_checkpoint(args.adapter, parallel, optimizer, identity,
-                                                      benchmark=benchmark_run(args))
+                benchmark=benchmark_run(args), migrate_single_to_ddp=getattr(args, "resume_single_to_ddp", False))
         else:
             step = load_checkpoint(args.adapter, model, optimizer, resume=True)
     elif unfreeze:
@@ -572,7 +584,9 @@ def train_command(args):
         args._failure_step = step + 1
         args._failure_phase = "training-update"
         iteration_started = time.perf_counter()
-        if stream is not None: batch = _dataset_batch(next(stream), config, args, tokenizer, encoder, encoder_device)
+        if stream is not None:
+            batch = _dataset_batch(next(stream), config, args, tokenizer, encoder, encoder_device, text_encode)
+        data_seconds = time.perf_counter() - iteration_started
         update_probe = FirstUpdateProbe(model) if first_update else None
         from .benchmark import profiler_update
         with profiler_update(getattr(args, "ttn_profiler_trace", None) if first_update else None, rank):
@@ -588,6 +602,9 @@ def train_command(args):
         step += 1
         record = {"step": step, "stage": model.ttn_system.config.stage, "tbptt": k,
                   **_training_record(model, result, timing, parallel)}
+        record["data_seconds"] = data_seconds
+        if text_encode is not None:
+            record["text_feature_cache"] = text_encode.cache_info()._asdict()
         if "parameter_update" in result:
             health = {"step": step, "stage": model.ttn_system.config.stage,
                       "ranks": [{"rank": r["rank"], **r["parameter_update"]} for r in record["ranks"]]}
@@ -655,7 +672,13 @@ def infer_command(args):
     model, config, settings = build(args)
     if args.adapter: load_checkpoint(args.adapter, model)
     batch = load_bundle(args.batch_file, args.device)
-    result, timing = timed_cuda(lambda: rollout(model, config, batch, args.steps, args.cfg_scale, args.cached_blocks))
+    from dataclasses import asdict
+    from .event_memory import EventMemoryOptions
+    options_path = getattr(args, 'event_memory_config', None)
+    memory_options = (EventMemoryOptions(**json.loads(Path(options_path).read_text(encoding='utf-8')))
+                      if options_path else None)
+    result, timing = timed_cuda(lambda: rollout(model, config, batch, args.steps, args.cfg_scale, args.cached_blocks,
+                                               memory_options=memory_options))
     latents, runtime, records = result
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
@@ -670,6 +693,7 @@ def infer_command(args):
         "steps": args.steps,
         "seed": args.seed,
         "cfg_scale": args.cfg_scale,
+        "event_memory": asdict(memory_options) if memory_options else {"mode": "off"},
         "commits": runtime.commit_count,
         "predictions": runtime.predict_count,
         "chunks": records,
@@ -910,6 +934,8 @@ def main():
     parser.add_argument("--vae-cache-dir", help="override the latent cache directory")
     parser.add_argument("--text-encoder-device", choices=("auto", "cpu", "cuda"), default="auto",
                         help="auto keeps the frozen text encoder on CPU for multi-GPU training")
+    parser.add_argument("--text-feature-cache-size", type=int, default=0,
+                        help="run-local exact-prompt LRU for the frozen CPU text encoder; 0 disables")
     parser.add_argument("--config", default=str(DEFAULT_REFERENCE),
                         help="new runs default to C/original SANA camera; legacy linear-camera checkpoints need their explicit config")
     parser.add_argument("--sana-config")
@@ -932,6 +958,8 @@ def main():
     parser.add_argument("--output", default="output/worldttn")
     parser.add_argument("--batch-file", help="precomputed tensor bundle; optional {rank} expands per process")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--resume-single-to-ddp", action="store_true",
+                        help="audited single-GPU Adam/cursor migration to two-rank DDP")
     parser.add_argument("--unfreeze", action="store_true",
                         help="train: initialize DiT from C/sana-camera ttn-new or legacy visual warmup; reset optimizer, restore progress")
     parser.add_argument("--max-steps", type=int, default=1)
@@ -941,11 +969,14 @@ def main():
     parser.add_argument("--steps", type=int, help="default 4 for smoke; evaluate requires an explicit quality schedule")
     parser.add_argument("--cfg-scale", type=float, default=4.5)
     parser.add_argument("--cached-blocks", type=int, default=-1)
+    parser.add_argument("--event-memory-config", help="infer only: runtime EventMemoryOptions JSON; default off")
     parser.add_argument("--stages", nargs="+", choices=("A", "B", "C"), default=["A", "B", "C"])
     parser.add_argument("--frames", type=int, default=13)
     parser.add_argument("--latent-height", type=int, default=22)
     parser.add_argument("--latent-width", type=int, default=40)
     args = parser.parse_args()
+    if args.event_memory_config and args.command != 'infer':
+        parser.error('--event-memory-config is supported only by infer; training is unchanged')
     try:
         resolve_train_scope(args)
     except (ValueError, OSError) as error:
@@ -1011,6 +1042,9 @@ def main():
     else:
         os.environ.pop("TTN_CUDA_TRACE_DIR", None)
     if args.resume and not args.adapter: parser.error("--resume requires --adapter")
+    if args.text_feature_cache_size < 0: parser.error("--text-feature-cache-size must be nonnegative")
+    if args.resume_single_to_ddp and not args.resume:
+        parser.error("--resume-single-to-ddp requires --resume")
     if args.train_precision is not None and args.command != "train":
         parser.error("--train-precision is supported only for train")
     from .distributed import initialize, resolve_launch_environment, check_distributed, rank_world

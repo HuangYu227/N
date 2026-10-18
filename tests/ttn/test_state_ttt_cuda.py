@@ -25,6 +25,8 @@ def test_two_gpu_state_ttt_fullgrad_save_and_resume(sequence_model):
     dist.init_process_group('nccl',device_id=device)
     try:
         assert dist.get_world_size()==2
+        mode = os.environ.get('STATE_TTT_ACCEPTANCE_PARALLEL', 'fsdp2')
+        assert mode in ('ddp', 'fsdp2')
         def build():
             m=adapted_model(copy.deepcopy(sequence_model).to(device))
             m.to(device)
@@ -33,7 +35,7 @@ def test_two_gpu_state_ttt_fullgrad_save_and_resume(sequence_model):
             report=configure_training_precision(m,'fp8')
             assert len(report['modules'])==100
             return m
-        model=build();parallel=ParallelTraining(model,linear_flow_loss,'fsdp2',activation_offload='cpu-pageable')
+        model=build();parallel=ParallelTraining(model,linear_flow_loss,mode,activation_offload='cpu-pageable')
         optimizer=make_optimizer(model)
         clean,noise,times,camera=[x.to(device) for x in inputs()];clean=clean+rank*.01
         def update(m,p,o):
@@ -54,7 +56,7 @@ def test_two_gpu_state_ttt_fullgrad_save_and_resume(sequence_model):
         from worldttn.parallel_checkpoint import save_training_checkpoint,restore_training_checkpoint
         save_training_checkpoint(output/'last.pt',parallel,optimizer,2,{'position':2},identity)
         other=build();load_checkpoint(output/'last.pt',other)
-        resumed=ParallelTraining(other,linear_flow_loss,'fsdp2',activation_offload='cpu-pageable');other_opt=make_optimizer(other)
+        resumed=ParallelTraining(other,linear_flow_loss,mode,activation_offload='cpu-pageable');other_opt=make_optimizer(other)
         assert restore_training_checkpoint(output/'last.pt',resumed,other_opt,identity)==(2,{'position':2})
         a,b=update(model,parallel,optimizer),update(other,resumed,other_opt)
         assert a['loss']==pytest.approx(b['loss'],abs=1e-7)

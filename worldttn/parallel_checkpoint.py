@@ -182,11 +182,14 @@ def _resume_identity(config):
     return config
 
 
-def validate_training_checkpoint(payload, mode, world, training_config, *, benchmark=False):
+def validate_training_checkpoint(payload, mode, world, training_config, *, benchmark=False,
+                                 migrate_single_to_ddp=False):
     meta = payload.get("distributed", {})
     if meta.get("format") != "TTN-parallel-resume-v1":
         raise ValueError("resume requires a distributed training checkpoint")
-    if meta.get("mode") != mode or meta.get("world_size") != world:
+    transition = migrate_single_to_ddp and (meta.get("mode"), meta.get("world_size"), mode, world) == (
+        "single", 1, "ddp", 2)
+    if (meta.get("mode") != mode or meta.get("world_size") != world) and not transition:
         raise ValueError("optimizer resume requires the same backend and world size")
     saved, requested = _resume_identity(meta.get("training_config")), _resume_identity(training_config)
     report = {"saved": saved["execution"], "requested": requested["execution"],
@@ -197,6 +200,7 @@ def validate_training_checkpoint(payload, mode, world, training_config, *, bench
         raise ValueError("resume training configuration mismatch")
     if Path(meta["resume_dir"]).name != meta["resume_dir"]:
         raise ValueError("invalid resume directory")
+    report["single_to_ddp"] = transition
     return report
 
 
@@ -239,7 +243,8 @@ def restore_training_progress(path, parallel, training_config):
     return int(payload["step"]), shard["data"]
 
 
-def restore_training_checkpoint(path, parallel, optimizer, training_config=None, *, benchmark=False):
+def restore_training_checkpoint(path, parallel, optimizer, training_config=None, *, benchmark=False,
+                                migrate_single_to_ddp=False):
     """Restore optimizer/RNG/cursor AFTER loading adapter into the unwrapped model.
 
     Call load_checkpoint before constructing ParallelTraining; loading ordinary
@@ -249,10 +254,16 @@ def restore_training_checkpoint(path, parallel, optimizer, training_config=None,
     reports = _phase(parallel, path, "resume-integrity", lambda: audit_checkpoint(path) if parallel.rank == 0 else None)
     if parallel.rank == 0: print("[TTN resume integrity] " + json.dumps(reports[0]), flush=True)
     payload = read_checkpoint(path, parallel.model, resume=True)
-    execution = validate_training_checkpoint(payload, parallel.mode, parallel.world, training_config, benchmark=benchmark)
+    execution = validate_training_checkpoint(payload, parallel.mode, parallel.world, training_config,
+        benchmark=benchmark, migrate_single_to_ddp=migrate_single_to_ddp)
     if parallel.rank == 0: print("[TTN resume execution] " + json.dumps(execution), flush=True)
     folder = bundle_directory(path, payload["distributed"])
-    shard = _rank_shard(path, payload, parallel)
+    if execution["single_to_ddp"]:
+        shard = torch.load(folder / "rank-00000.pt", map_location="cpu", weights_only=False)
+        source = type("Source", (), {"mode": "single", "world": 1})()
+        _validate_shard(shard, payload, source, 0)
+    else:
+        shard = _rank_shard(path, payload, parallel)
     state = shard["optimizer"]
     if state is None:
         owner = torch.load(folder / "rank-00000.pt", map_location="cpu", weights_only=False)
@@ -270,5 +281,15 @@ def restore_training_checkpoint(path, parallel, optimizer, training_config=None,
     lookup = dict(zip(ids, parameters))
     state["state"] = {i: _unpack(values, lookup[i]) for i, values in state["state"].items()}
     optimizer.load_state_dict(state)
+    if execution["single_to_ddp"]:
+        from .parallel_data import migrate_single_cursor_to_two_ranks
+        cursor, report = migrate_single_cursor_to_two_ranks(shard["data"], parallel.rank)
+        if parallel.rank == 0:
+            print("[TTN resume migration] " + json.dumps({"source_step": payload["step"],
+                "source_mode": "single", "target_mode": "ddp", "target_world": 2,
+                "optimizer": "retained", "rank0_rng": "restored", "rank1_rng": "seeded",
+                **report}), flush=True)
+        if parallel.rank == 0: restore_rng(shard["rng"])
+        return int(payload["step"]), cursor
     restore_rng(shard["rng"])
     return int(payload["step"]), shard["data"]

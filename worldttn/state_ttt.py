@@ -22,12 +22,15 @@ class StateTTT(nn.Module):
         logit=math.log(gain/(2-gain)) if self.policy=='curvature' else math.log(math.expm1(gain))
         self.step_logits=nn.Parameter(torch.full((2,h),logit))
 
-    def forward(self,pred,k,v,w,mask,*,clean,eps,clip):
+    def orthogonal_basis(self, dtype):
+        return torch.linalg.qr(self.raw_basis.to(dtype)).Q
+
+    def forward(self,pred,k,v,w,mask,*,clean,eps,clip,basis=None):
         with torch.autocast(device_type=pred.device.type,enabled=False):
             dtype=torch.float64 if pred.dtype==torch.float64 else torch.float32
             pred,k,v,w=[x.to(dtype) for x in (pred,k,v,w)]
             # QR keeps gradient coverage meaningful as outer training learns A.
-            a=torch.linalg.qr(self.raw_basis.to(dtype)).Q
+            a=self.orthogonal_basis(dtype) if basis is None else basis
             logits=self.step_logits[int(clean)].to(dtype)
             gain=2*logits.sigmoid() if self.policy=='curvature' else F.softplus(logits)
             selected=mask[:,None,:].bool()
@@ -58,9 +61,19 @@ class StateTTT(nn.Module):
 @torch.no_grad()
 def state_stats(values,*,clean,policy):
     """Detach telemetry after the update; replay skips CPU synchronizations."""
-    stats={name:float(value.detach().double().mean()) for name,value in values.items()}
+    names = tuple(values)
+    # One device-to-host synchronization for the entire anchor diagnostic.
+    packed = torch.cat([values[name].detach().reshape(-1).double() for name in names]).cpu()
+    cpu_values = {}
+    start = 0
+    for name in names:
+        value = values[name]
+        cpu_values[name] = packed[start:start+value.numel()].reshape(value.shape)
+        start += value.numel()
+    stats={name:float(value.mean()) for name,value in cpu_values.items()}
     stats.update(branch='clean' if clean else 'local',policy=policy,
-        effective_eta_min=float(values['effective_eta'].min()),effective_eta_max=float(values['effective_eta'].max()),
-        clip_fraction=float((values['clip_scale']<1).float().mean()),
-        per_head={name:value.detach().cpu().tolist() for name,value in values.items()})
+        effective_eta_min=float(cpu_values['effective_eta'].min()),
+        effective_eta_max=float(cpu_values['effective_eta'].max()),
+        clip_fraction=float((cpu_values['clip_scale']<1).double().mean()),
+        per_head={name:value.tolist() for name,value in cpu_values.items()})
     return stats

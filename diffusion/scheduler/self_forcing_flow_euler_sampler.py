@@ -598,8 +598,9 @@ class SelfForcingFlowEulerCamCtrl(SelfForcingFlowEuler):
                 if do_classifier_free_guidance:
                     timestep_tensor_model = torch.cat([timestep_tensor_model, timestep_tensor_model], dim=0)
 
-                if ttn_context is not None and ttn_context.collect_local_stats and (ttn_context.system.config.local_update or
-                                                ttn_context.system.config.persistent_meta):
+                if ttn_context is not None and (ttn_context.memory_bank is not None or
+                        (ttn_context.collect_local_stats and (ttn_context.system.config.local_update or
+                                                            ttn_context.system.config.persistent_meta))):
                     from worldttn.session import record_noise
                     sigma_frames = self.scheduler.sigmas[i].to(device=device, dtype=torch.float32).expand_as(timestep_frames)
                     if condition_frame_mask is not None: sigma_frames = sigma_frames * (1.0 - condition_frame_mask)

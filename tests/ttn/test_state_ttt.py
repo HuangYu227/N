@@ -144,3 +144,47 @@ def test_real_head_dimensions_write_content_from_zero_state():
     assert all(torch.isfinite(value).all() for value in stats.values())
     actual.square().mean().backward()
     assert module.raw_basis.grad.norm() > 0 and module.step_logits.grad.norm() > 0
+
+
+def test_reused_basis_preserves_noisy_clean_outputs_and_gradients():
+    from worldttn.state_ttt import StateTTT
+    config = TTNConfig(heads=2, head_dim=8, stage='C', state_ttt_rank=4,
+                       state_ttt_gain=.5)
+    torch.manual_seed(27)
+    baseline = StateTTT(config, 0).double()
+    reused = copy.deepcopy(baseline)
+    state = torch.randn(1, 2, 8, 8, dtype=torch.float64)
+    keys, values = [torch.randn(1, 2, 6, 8, dtype=torch.float64) for _ in range(2)]
+    weights = torch.rand(1, 2, 6, dtype=torch.float64)
+    mask = torch.ones(1, 6, dtype=torch.bool)
+
+    def two_calls(module, basis=None):
+        local = module(state, keys, values, weights, mask, clean=False,
+                       eps=1e-6, clip=1., basis=basis)[0]
+        clean = module(local, keys, values, weights, mask, clean=True,
+                       eps=1e-6, clip=1., basis=basis)[0]
+        return clean.square().mean()
+
+    old = two_calls(baseline)
+    new = two_calls(reused, reused.orthogonal_basis(torch.float64))
+    torch.testing.assert_close(old, new, rtol=0, atol=0)
+    old.backward(); new.backward()
+    for left, right in zip(baseline.parameters(), reused.parameters()):
+        torch.testing.assert_close(left.grad, right.grad, rtol=1e-12, atol=1e-12)
+
+
+def test_batched_state_telemetry_preserves_values_and_detaches():
+    from worldttn.state_ttt import state_stats
+    values = {
+        "effective_eta": torch.tensor([[.2, .5]], requires_grad=True),
+        "clip_scale": torch.tensor([[[[1.]], [[.25]]]], requires_grad=True),
+        "gradient_norm": torch.tensor([[3., 5.]], requires_grad=True),
+    }
+    report = state_stats(values, clean=True, policy="curvature")
+    assert report["branch"] == "clean"
+    assert report["clip_fraction"] == .5
+    assert report["effective_eta_min"] == pytest.approx(.2)
+    assert report["effective_eta_max"] == pytest.approx(.5)
+    for name, value in values.items():
+        assert report[name] == pytest.approx(float(value.detach().double().mean()))
+        assert report["per_head"][name] == value.detach().tolist()

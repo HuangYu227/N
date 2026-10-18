@@ -7,6 +7,7 @@ from .core import ANCHORS, TTNConfig, Rank2Generators, CayleyFactors, DetachedCa
 from .performance import DEFAULT_EXECUTION, annotation, validate_execution
 from .stability import committed_anchor_stats, matrix_scale, write_direction_stats
 from .controller import TransitionController
+from .event_memory import EventMemoryBank, EventMemoryOptions
 
 
 class TTNSystem(nn.Module):
@@ -55,6 +56,14 @@ class TTNChunkContext:
     checkpoint_cpu_inputs: bool = False
     measure_psi_output: bool = False
     sequence_memory_callback: object = None
+    state_ttt_basis: torch.Tensor | None = None
+    # Runtime-only inference state, never included in the model checkpoint.
+    memory_bank: object = None
+    memory_selections: dict = field(default_factory=dict)
+    memory_pending: dict = field(default_factory=dict)
+    memory_stats: list = field(default_factory=list)
+    memory_sigma: float | None = None
+    memory_call: int = 0
 
     def for_clean(self):
         return TTNChunkContext(self.predicted, self.previous, self.psi, self.cbase, self.system, self.frame_ids,
@@ -62,7 +71,10 @@ class TTNChunkContext:
                                self.prefill_mode, begin_id=self.begin_id, psi_snapshot=self.psi_snapshot,
                                write_history=self.write_history, live_factors=self.live_factors,
                                local_stats=self.local_stats, ablation=self.ablation,
-                               collect_local_stats=self.collect_local_stats, local_trajectory=self.local_trajectory)
+                               collect_local_stats=self.collect_local_stats, local_trajectory=self.local_trajectory,
+                               state_ttt_basis=self.state_ttt_basis,
+                               memory_bank=self.memory_bank, memory_selections=self.memory_selections,
+                               memory_stats=self.memory_stats)
 
     def token_masks(self, n):
         f = self.frame_ids.shape[-1]
@@ -114,15 +126,24 @@ class TTNRuntimeState:
     collect_local_stats: bool = False
     # Diagnostic-only detached writes, never persistent learned state or checkpoint content.
     write_history: tuple = ()
+    memory_options: object = None
+    event_memory: object = None
 
     @classmethod
-    def create(cls, config, batch_size, device, *, ablation="full", diagnostics=False, collect_local_stats=False):
+    def create(cls, config, batch_size, device, *, ablation="full", diagnostics=False,
+               collect_local_stats=False, memory_options=None):
         if ablation not in ("full", "no-ttt", "identity", "no-local", "no-persistent"):
             raise ValueError("unknown TTN runtime ablation")
         if ablation in ("no-local", "no-persistent") and not (config.local_update or config.persistent_meta):
             raise ValueError("Local/Persistent contribution controls require Meta-TTT")
         if ablation != "full" and torch.is_grad_enabled():
             raise ValueError("TTN runtime ablations are inference-only")
+        if memory_options is not None and not isinstance(memory_options, EventMemoryOptions):
+            raise TypeError("memory_options must be EventMemoryOptions or None")
+        active_memory = memory_options is not None and memory_options.active
+        if active_memory and (torch.is_grad_enabled() or config.stage != 'C' or not config.state_ttt_rank
+                              or ablation != 'full'):
+            raise ValueError("event memory requires inference-only Stage C StateTTT with full ablation")
         s = torch.zeros(batch_size,
                         5,
                         config.heads,
@@ -133,7 +154,9 @@ class TTNRuntimeState:
         psi = torch.zeros(batch_size, 5, config.heads, config.generators, device=device, dtype=torch.float32)
         pose = torch.eye(4, device=device).expand(batch_size, 4, 4).clone()
         return cls(config, s, psi, pose, [set() for _ in range(batch_size)],
-                   ablation=ablation, diagnostics=diagnostics, collect_local_stats=collect_local_stats)
+                   ablation=ablation, diagnostics=diagnostics, collect_local_stats=collect_local_stats,
+                   memory_options=memory_options,
+                   event_memory=EventMemoryBank(memory_options, batch_size) if active_memory else None)
 
     def reset(self):
         self.world_state = torch.zeros_like(self.world_state)
@@ -147,6 +170,8 @@ class TTNRuntimeState:
         self.prefilled = False
         self.last_stats = {}
         self.write_history = ()
+        if self.event_memory is not None:
+            self.event_memory = EventMemoryBank(self.memory_options, self.world_state.shape[0])
 
     def begin_chunk(self, system, poses, intrinsics, frame_ids, valid_mask, width, height, prefill=False):
         if system.config != self.config: raise ValueError("runtime/system configurations differ")
@@ -167,6 +192,9 @@ class TTNRuntimeState:
         validate_execution(options, self.config.stage, self.ablation, self.diagnostics, meta=meta)
         snapshot = None
         live_factors = None
+        memory_bank = self.event_memory
+        if memory_bank is not None and (torch.is_grad_enabled() or options.core_backend != 'reference'):
+            raise ValueError("event memory requires no-grad and the reference Correct/Read backend")
         history = self.write_history
         with annotation(options, "Predict"), torch.autocast(device_type=self.world_state.device.type, enabled=False):
             if self.config.stage == "A" or prefill or self.ablation == "identity":
@@ -184,6 +212,9 @@ class TTNRuntimeState:
                     snapshot = DetachedCayleySnapshot.from_live(live_factors, self.transition_fast, cbase,
                                                                (id(self), self.revision, self.predict_count + 1))
         self.predict_count += 1
+        if memory_bank is not None and live_factors is not None:
+            memory_bank = memory_bank.with_transport({anchor: (live_factors.p[i], live_factors.l[:, i])
+                for i, anchor in enumerate(ANCHORS) if anchor in memory_bank.options.anchors})
         return TTNChunkContext(predicted,
                                self.world_state,
                                self.transition_fast,
@@ -197,7 +228,8 @@ class TTNRuntimeState:
                                id(self),
                                prefill_mode=prefill, begin_id=self.predict_count, psi_snapshot=snapshot,
                                write_history=history, live_factors=live_factors if meta else None,
-                               ablation=self.ablation, collect_local_stats=self.collect_local_stats or self.diagnostics)
+                               ablation=self.ablation, collect_local_stats=self.collect_local_stats or self.diagnostics,
+                               memory_bank=memory_bank)
 
     def prefill(self, context):
         if self.prefilled or self.commit_count: raise RuntimeError("initial image can only be prefilled once")
@@ -211,6 +243,14 @@ class TTNRuntimeState:
             context.psi_snapshot.validate(id(self), self.revision, self.predict_count)
         if set(context.candidates) != set(range(5)):
             raise RuntimeError("all five anchors must finish before committing")
+        next_memory = self.event_memory
+        if next_memory is not None:
+            if torch.is_grad_enabled() or context.sequence_mode or context.begin_id != self.predict_count:
+                raise ValueError("event memory cannot commit training, recomputed or stale contexts")
+            if context.memory_bank is None:
+                raise ValueError("missing event memory snapshot")
+            next_memory = context.memory_bank.with_pending(context.memory_pending,
+                self.commit_count, source='observed' if context.prefill_mode else 'generated')
         states = []
         gradients = []
         for i in range(5):
@@ -276,6 +316,7 @@ class TTNRuntimeState:
         self.transition_fast = psi
         self.previous_committed_pose = previous_pose
         self.committed_frame_ids = committed
+        self.event_memory = next_memory
         self.commit_count += 1
         self.revision += 1
         self.last_stats = {
@@ -290,6 +331,8 @@ class TTNRuntimeState:
             "anchors": anchor_stats
         }
         if self.diagnostics or self.ablation != "full": self.last_stats["ablation"] = self.ablation
+        if next_memory is not None:
+            self.last_stats['event_memory'] = {'size': len(next_memory), 'calls': list(context.memory_stats)}
 
     def detach(self):
         self.world_state = self.world_state.detach()

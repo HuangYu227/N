@@ -30,6 +30,10 @@ def validate_clean_output(output, reference):
 def record_noise(context, timestep, noise_sigma=None, sampled_timestep=None):
     """Detached noisy-call metadata shared by training and the native sampler."""
     config = context.system.config
+    if context.memory_bank is not None and not context.clean_mode and not context.prefill_mode:
+        sigma = timestep.float() / 1000 if noise_sigma is None else noise_sigma
+        context.memory_sigma = float(sigma.detach().max())
+        context.memory_call += 1
     if (context.sequence_mode or not context.collect_local_stats or context.clean_mode or context.prefill_mode
             or not (config.local_update or config.persistent_meta)): return
     sigma = timestep.float()/1000 if noise_sigma is None else noise_sigma
@@ -62,7 +66,8 @@ def carry_cache(cache, camera_attention="linear", previous=None):
 class TTNSession:
 
     def __init__(self, model, camera_conditions, width, height, valid_mask=None, extras=None,
-                 *, ablation="full", diagnostics=False, collect_local_stats=False, live_cache=False):
+                 *, ablation="full", diagnostics=False, collect_local_stats=False, live_cache=False,
+                 memory_options=None):
         if camera_conditions.ndim != 3 or camera_conditions.shape[-1] != 20:
             raise ValueError("camera_conditions must contain C2W(16) + intrinsics(4)")
         self.model = model
@@ -75,12 +80,14 @@ class TTNSession:
         self.ablation, self.diagnostics = ablation, diagnostics
         self.collect_local_stats = collect_local_stats
         self.live_cache = live_cache
+        self.memory_options = memory_options
 
     def reset(self, batch_size):
         self.camera_cache_lengths = {index: [] for index in ANCHORS}
         self.runtime = TTNRuntimeState.create(self.model.ttn_system.config, batch_size, self.camera.device,
                                              ablation=self.ablation, diagnostics=self.diagnostics,
-                                             collect_local_stats=self.collect_local_stats)
+                                             collect_local_stats=self.collect_local_stats,
+                                             memory_options=self.memory_options)
         return self.runtime
 
     def begin_chunk(self, start, end, prefill=False):
@@ -151,9 +158,10 @@ class TTNSession:
         self.runtime.prefill(c)
         return c
 
-    def carry_clean_cache(self, current, previous, cached_chunks):
+    def _prepare_clean_cache(self, current, previous, cached_chunks):
+        """Validate/allocate the next cache without publishing session metadata."""
         carried = carry_cache(current, self.model.ttn_system.config.camera_attention, previous=previous)
-        if cached_chunks < 0: return carried
+        if cached_chunks < 0: return carried, self.camera_cache_lengths
         if cached_chunks < 1: raise ValueError("cached_chunks must be positive or -1")
         lengths = {i: list(v) for i, v in self.camera_cache_lengths.items()}
         for anchor in ANCHORS:
@@ -165,6 +173,10 @@ class TTNSession:
             for slot in (2, 3):
                 selected = carried[anchor][slot][:, :, -sum(lengths[anchor]):]
                 carried[anchor][slot] = selected.clone() if self.live_cache else selected.detach().clone()
+        return carried, lengths
+
+    def carry_clean_cache(self, current, previous, cached_chunks):
+        carried, lengths = self._prepare_clean_cache(current, previous, cached_chunks)
         self.camera_cache_lengths = lengths
         return carried
 
@@ -181,8 +193,9 @@ class TTNSession:
                                       data_info,
                                       save=True)
         validate_clean_output(out, clean)
-        carried = self.carry_clean_cache(new_cache, cache, cached_chunks)
+        carried, lengths = self._prepare_clean_cache(new_cache, cache, cached_chunks)
         self.runtime.commit_chunk(c)
+        self.camera_cache_lengths = lengths
         # Detached factors are clean-only; outer predicted/state graphs remain live.
         context.psi_snapshot = c.psi_snapshot = None
         context.live_factors = c.live_factors = None

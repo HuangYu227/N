@@ -95,3 +95,22 @@ class ResumableBatchStream:
         return {"epoch": self.epoch, "batch_in_epoch": self.batch_in_epoch, "seed": self.seed,
                 "rank": self.rank, "world": self.world, "dataset_size": len(self.source_loader.dataset),
                 "batches_per_epoch": len(self.loader)}
+
+
+def migrate_single_cursor_to_two_ranks(cursor, rank):
+    """Align the old single-card permutation to paired DDP samples.
+
+    An odd old position skips one sample; it never repeats an already consumed
+    sample. Both ranks keep the same epoch and paired-batch position.
+    """
+    size = cursor["dataset_size"]
+    if (cursor["world"], cursor["rank"], cursor["batches_per_epoch"]) != (1, 0, size):
+        raise ValueError("migration requires a single-rank, unit-batch cursor")
+    if size % 2 or not 0 <= cursor["batch_in_epoch"] <= size or rank not in (0, 1):
+        raise ValueError("migration requires an even dataset and valid two-rank cursor")
+    old = cursor["batch_in_epoch"]
+    aligned = old + old % 2
+    return ({**cursor, "rank": rank, "world": 2,
+             "batches_per_epoch": size // 2, "batch_in_epoch": aligned // 2},
+            {"source_batch_in_epoch": old, "first_pair_offset": aligned,
+             "skipped_source_samples": aligned - old})

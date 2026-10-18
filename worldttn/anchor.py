@@ -11,6 +11,7 @@ from .stability import clean_anchor_stats, local_anchor_stats, matrix_scale
 from .geometry import apply_complex_rope
 from .runtime import TTNSystem
 from .fullgradient import _RECOMPUTING
+from .event_memory import pooled_descriptor, sufficient_statistics
 
 
 class TTNAnchor(nn.Module):
@@ -48,17 +49,50 @@ class TTNAnchor(nn.Module):
         if config.camera_attention == "sana" and self._sana_camera_forward is None:
             raise ValueError("sana camera requires the original cached SANA camera implementation")
 
-    def visual_features(self, x, rotary_emb):
+    def visual_features(self, x, rotary_emb, *, return_unrotated=False):
         b, n, c = x.shape
         q, k, v = self.qkv(x).chunk(3, -1)
         q = F.silu(self.q_norm(q)).reshape(b, n, self.heads, self.dim).transpose(1, 2)
         k = F.silu(self.k_norm(k)).reshape(b, n, self.heads, self.dim).transpose(1, 2)
         v = F.silu(v).reshape(b, n, self.heads, self.dim).transpose(1, 2)
+        k0 = k
         if rotary_emb is not None:
             rotary_emb = rotary_emb[..., -n:, :]
             q = apply_complex_rope(q, rotary_emb)
             k = apply_complex_rope(k, rotary_emb)
-        return q.float(), k.float(), v.float()
+        values = (q.float(), k.float(), v.float())
+        return (*values, k0.float()) if return_unrotated else values
+
+    def event_memory_read(self, ctx, state, k0, k, v, w, write, grid):
+        """Produce a temporary read; candidate S and StateTTT stay untouched."""
+        anchor = ANCHORS[self.index]
+        bank = ctx.memory_bank
+        # Tiny CPU fixtures have no spatial layout to subdivide; real videos
+        # use a 2x2 pyramid at the unchanged token-grid resolution.
+        descriptor_grid = grid if grid is not None and min(grid[1:]) >= 2 else None
+        if ctx.clean_mode:
+            counts = ctx.write_mask.sum(-1)
+            if not bool((counts > 0).all()) or not bool((counts == counts[0]).all()):
+                raise ValueError('event memory requires equally sized nonempty frame writes in CFG branches')
+            written_ids = torch.stack([ids[mask] for ids, mask in zip(ctx.frame_ids, ctx.write_mask)])
+            gram, rhs, denom = sufficient_statistics(k, v, w, write, self.config.eps)
+            ctx.memory_pending[anchor] = {
+                'descriptor': pooled_descriptor(k0, v, write, grid=descriptor_grid), 'gram': gram,
+                'rhs': rhs, 'denom': denom, 'frame_ids': written_ids,
+            }
+            return state
+        if (ctx.prefill_mode or ctx.begin_id - 1 < bank.options.start_chunk
+                or ctx.memory_sigma is None or ctx.memory_sigma > bank.options.max_read_sigma):
+            return state
+        if anchor not in ctx.memory_selections:
+            query = pooled_descriptor(k0, v, write, grid=descriptor_grid)
+            ctx.memory_selections[anchor] = tuple(bank.select(b, anchor, query[b], ctx.begin_id - 1)
+                for b in range(state.shape[0]))
+        read_state, report = bank.read(state, ctx.memory_selections[anchor], anchor,
+                                      alpha_s=self.config.alpha_s, eps=self.config.eps)
+        ctx.memory_stats.append({'anchor': anchor, 'call': ctx.memory_call,
+                                 'sigma': ctx.memory_sigma, **report})
+        return read_state
 
     def camera_features(self, x, hw, camera_conditions, rotary_emb, prope_fns):
         b, n, c = x.shape
@@ -90,12 +124,19 @@ class TTNAnchor(nn.Module):
         diagnostic = kwargs.get("ttn_diagnostic")
         cfg = self.config
         execution = getattr(self, "ttn_execution", DEFAULT_EXECUTION)
+        memory_baseline_raw = None
         b, n, c = x.shape
         if diagnostic is not None: diagnostic("input", x)
         read, write = ctx.token_masks(n)
         x = (torch.where(read[..., None], x, 0.) if cfg.local_update or cfg.persistent_meta
              else x * read[..., None].to(x.dtype))
-        q, k, v = self.visual_features(x, rotary_emb)
+        use_memory = ctx.memory_bank is not None and ANCHORS[self.index] in ctx.memory_bank.options.anchors
+        if use_memory:
+            if torch.is_grad_enabled() or ctx.sequence_mode or _RECOMPUTING.get() or execution.core_backend != 'reference':
+                raise ValueError('event memory requires inference-only reference anchor calls')
+            q, k, v, k0 = self.visual_features(x, rotary_emb, return_unrotated=True)
+        else:
+            q, k, v = self.visual_features(x, rotary_emb)
         if diagnostic is not None: diagnostic("visual_features", (q, k, v))
         with torch.autocast(device_type=x.device.type, enabled=False):
             beta = self.beta_proj(x.float()).sigmoid().transpose(1, 2)
@@ -127,7 +168,7 @@ class TTNAnchor(nn.Module):
                 selected=write if ctx.clean_mode else support
                 w=write_weights(beta,write,cfg.eps)
                 predicted,state_values=self.state_ttt(predicted,k,v,w,selected,clean=ctx.clean_mode,
-                    eps=cfg.eps,clip=cfg.inner_clip)
+                    eps=cfg.eps,clip=cfg.inner_clip,basis=ctx.state_ttt_basis)
                 if not ctx.clean_mode and not _RECOMPUTING.get():
                     with torch.no_grad():
                         for label,value in (('query_loss_before',state_base),('query_loss_after',predicted)):
@@ -151,6 +192,13 @@ class TTNAnchor(nn.Module):
                     aux = correct_with_aux(predicted, k, v, beta, write, cfg.alpha_s, cfg.eps)
                     state, w = aux.candidate, aux.w
                     raw = q @ state
+            if use_memory:
+                read_state = self.event_memory_read(ctx, state, k0, k, v, w, write, HW)
+                if read_state is not state:
+                    if not any(row.get('output_effect') for row in ctx.memory_stats
+                               if row['anchor'] == ANCHORS[self.index]):
+                        memory_baseline_raw = raw
+                    raw = q @ read_state
             if ((ctx.collect_local_stats or diagnostic is not None) and (cfg.local_update or cfg.persistent_meta)
                     and not ctx.clean_mode and not ctx.prefill_mode):
                 if not local_enabled:
@@ -247,6 +295,17 @@ class TTNAnchor(nn.Module):
         gated = (raw * gate).to(x.dtype)
         if diagnostic is not None: diagnostic("gated_raw", gated)
         out = self.proj(gated) * read[..., None].to(x.dtype)
+        if memory_baseline_raw is not None:
+            baseline_visual = memory_baseline_raw.transpose(1, 2).reshape(b, n, c)
+            reference_raw = baseline_visual + (camera_contribution if camera_conditions is not None else 0.)
+            reference = self.proj((reference_raw * gate).to(x.dtype)) * read[..., None].to(x.dtype)
+            actual, reference = out.detach().float(), reference.detach().float()
+            ctx.memory_stats[-1]['output_effect'] = {
+                'relative_delta': ((actual - reference).flatten(1).norm(dim=-1) /
+                                   reference.flatten(1).norm(dim=-1).clamp_min(cfg.eps)).cpu().tolist(),
+                'changed_fraction': (actual != reference).float().flatten(1).mean(-1).cpu().tolist(),
+                'measurement': 'paired same features/camera after gate/projection/quantization; no quality claim',
+            }
         if ctx.clean_mode and not _RECOMPUTING.get(): stats["anchor_output"] = matrix_scale(out)
         if (state_values is not None and ctx.measure_psi_output and not ctx.clean_mode and not _RECOMPUTING.get()):
             with torch.no_grad(),torch.autocast(device_type=x.device.type,enabled=False):

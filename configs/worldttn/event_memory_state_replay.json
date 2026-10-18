@@ -1,0 +1,13 @@
+{
+  "mode": "state-replay",
+  "anchors": [11, 15, 19],
+  "capacity": 8,
+  "topk": 2,
+  "temperature": 0.1,
+  "gain": 0.1,
+  "max_relative_delta": 0.05,
+  "selector": "content",
+  "retention": "coverage",
+  "start_chunk": 5,
+  "max_read_sigma": 0.5
+}

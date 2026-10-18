@@ -64,6 +64,10 @@ def legacy_sequence_block(block, x, y, t, mask, hw, rope, context, **kwargs):
     def call_chunk(features, conditioning, times, incoming, state, psi, coefficients,
                    options, group_mask, group_rope, start, end, prefill=False):
         local = local_context(state, psi, coefficients, start, end, prefill)
+        if anchor is not None and not prefill and snapshot.system.config.state_ttt_rank:
+            with torch.autocast(device_type=local.predicted.device.type, enabled=False):
+                dtype = torch.float64 if local.predicted.dtype == torch.float64 else torch.float32
+                local.state_ttt_basis = block.attn.state_ttt.orthogonal_basis(dtype)
         group_options = options
         def forward(z, time, ctx):
             return block._forward_chunk(z, conditioning, time, mask=group_mask,
